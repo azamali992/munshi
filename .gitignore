@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+*.db
+*.db-journal
+mlruns/
+eval_report.json
+data/
+.venv/
+node_modules/
+.DS_Store

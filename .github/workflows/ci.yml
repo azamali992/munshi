@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test-and-gate:
+    runs-on: ubuntu-latest
+    env:
+      LLM_PROVIDER: stub
+      MLFLOW_DISABLE_AGENT_HINT: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt pytest httpx
+      - name: Unit + API tests
+        run: python3 -m pytest -q
+      - name: Scripted day (offline demo)
+        run: PYTHONPATH=src python3 demo/run_demo.py
+      - name: Quality + safety gate
+        run: python3 scripts/gate_ci.py
+      - name: Docker image builds
+        run: docker build -t munshi:ci .
