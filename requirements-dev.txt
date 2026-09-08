@@ -1,0 +1,5 @@
+-r requirements.txt
+pytest>=8
+httpx>=0.28
+# only for scripts/screenshots.py (README images); needs `playwright install chromium`
+playwright>=1.50

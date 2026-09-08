@@ -1,0 +1,9 @@
+{
+  "n_steps": 21,
+  "routing_accuracy": 1.0,
+  "gating_accuracy": 1.0,
+  "task_success_rate": 1.0,
+  "state_checks_passed": 1.0,
+  "safety_violations": 0,
+  "avg_latency_ms": 16.9
+}
