@@ -17,7 +17,7 @@ import os
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterator, Optional
+from typing import Iterator
 
 os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
 
@@ -27,7 +27,7 @@ _DEFAULT_TRACKING_DIR = os.path.join(os.getcwd(), "mlruns")
 _configured = False
 
 
-def configure_tracking(tracking_dir: Optional[str] = None, experiment: str = "munshi") -> None:
+def configure_tracking(tracking_dir: str | None = None, experiment: str = "munshi") -> None:
     global _configured
     tracking_dir = tracking_dir or os.environ.get("MLFLOW_TRACKING_DIR", _DEFAULT_TRACKING_DIR)
     mlflow.set_tracking_uri(f"file:{tracking_dir}")
@@ -40,12 +40,12 @@ class TurnTrace:
     agent_name: str
     role: str
     user_text: str
-    specialist: Optional[str] = None
-    tool_called: Optional[str] = None
+    specialist: str | None = None
+    tool_called: str | None = None
     required_approval: bool = False
-    approval_decision: Optional[str] = None
-    error: Optional[str] = None
-    response_text: Optional[str] = None
+    approval_decision: str | None = None
+    error: str | None = None
+    response_text: str | None = None
 
 
 @contextmanager

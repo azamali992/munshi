@@ -1,0 +1,19 @@
+{
+  "name": "munshi-mobile",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Munshi Android shell (Capacitor). Loads a Munshi server of your choice and adds native install, splash and back-button handling.",
+  "scripts": {
+    "sync": "cap sync android",
+    "apk:debug": "cap sync android && cd android && ./gradlew assembleDebug",
+    "apk:release": "cap sync android && cd android && ./gradlew assembleRelease"
+  },
+  "dependencies": {
+    "@capacitor/android": "^7.0.0",
+    "@capacitor/app": "^7.0.0",
+    "@capacitor/core": "^7.0.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^7.0.0"
+  }
+}

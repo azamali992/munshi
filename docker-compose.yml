@@ -5,8 +5,6 @@ services:
       - "8000:8000"
     env_file:
       - .env            # copy .env.example to .env first
-    environment:
-      MUNSHI_DB: /data/munshi.db
     volumes:
-      - ./data:/data    # SQLite system of record + MLflow traces survive restarts
+      - ./data:/data    # registry + one SQLite file per business + agent checkpoints + backups
     restart: unless-stopped

@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Munshi</title>
+<style>
+  :root{--ground:#0b1220;--surface:#131c2e;--surface-2:#1a2540;--ink:#e9eef7;--muted:#8b98b0;--line:#223052;--accent:#f2a93b;--accent-ink:#1a1206;--crit:#e5646b;--good:#2ec4a6}
+  *{box-sizing:border-box} html,body{height:100%;margin:0}
+  body{background:var(--ground);color:var(--ink);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:16px;line-height:1.5;display:grid;place-items:center;padding:24px}
+  .box{width:100%;max-width:380px;text-align:center}
+  .mark{width:64px;height:64px;border-radius:18px;background:var(--surface);border:2px solid var(--accent);display:grid;place-items:center;margin:0 auto 14px}
+  .mark i{width:22px;height:22px;border-radius:5px;background:var(--accent);display:block}
+  h1{font-size:30px;margin:0 0 4px} .sub{color:var(--muted);margin:0 0 22px;font-size:14px}
+  label{display:block;text-align:left;font-size:13px;color:var(--muted);font-weight:600;margin:12px 0 6px}
+  input{width:100%;background:var(--surface-2);border:1px solid var(--line);border-radius:11px;padding:12px;color:var(--ink);font:inherit;min-height:46px}
+  .btn{width:100%;margin-top:12px;appearance:none;border:1px solid var(--line);background:var(--surface-2);color:var(--ink);border-radius:11px;padding:12px 14px;font-weight:700;font-size:16px;cursor:pointer;min-height:46px}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+  .hint{font-size:12.5px;color:var(--muted);margin-top:16px} .hint code{background:var(--surface-2);padding:2px 6px;border-radius:6px}
+  #msg{min-height:22px;font-size:13.5px;margin-top:10px} #msg.bad{color:var(--crit)} #msg.ok{color:var(--good)}
+  .recent{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;margin-top:8px}
+  .chip{border:1px solid var(--line);background:var(--surface);border-radius:999px;padding:6px 11px;font-size:12.5px;color:var(--ink);cursor:pointer}
+</style>
+</head>
+<body>
+<div class="box">
+  <div class="mark"><i></i></div>
+  <h1>Munshi</h1>
+  <p class="sub">Your AI back office, in your pocket.</p>
+  <form id="f">
+    <label for="url">Your Munshi server</label>
+    <input id="url" type="url" inputmode="url" placeholder="https://munshi.yourbusiness.pk  or  http://192.168.1.10:8000" required autocomplete="url">
+    <div id="recent" class="recent"></div>
+    <button class="btn primary" type="submit" id="go">Connect</button>
+  </form>
+  <div id="msg"></div>
+  <p class="hint">Run the server on a PC on the same Wi-Fi (<code>docker compose up</code>) and enter its address, or use the address your Munshi provider gave you. The app remembers it.</p>
+</div>
+<script>
+(() => {
+  const $ = s => document.querySelector(s);
+  const KEY = 'munshi.server', RECENT = 'munshi.servers';
+  const q = new URLSearchParams(location.search);
+  const saved = localStorage.getItem(KEY);
+  const recent = JSON.parse(localStorage.getItem(RECENT) || '[]');
+  if (saved && !q.has('reset')) { location.replace(saved + '/#'); return; }
+  if (saved) $('#url').value = saved;
+  $('#recent').innerHTML = recent.map(u => `<button type="button" class="chip" data-u="${u}">${u.replace(/^https?:\/\//, '')}</button>`).join('');
+  document.querySelectorAll('[data-u]').forEach(b => b.onclick = () => { $('#url').value = b.dataset.u; });
+  const msg = (t, cls) => { const m = $('#msg'); m.textContent = t; m.className = cls || ''; };
+  $('#f').onsubmit = async e => {
+    e.preventDefault();
+    let url = $('#url').value.trim().replace(/\/+$/, '');
+    if (!/^https?:\/\//i.test(url)) url = 'http://' + url;
+    $('#go').disabled = true; msg('Checking…');
+    try {
+      const ctrl = new AbortController(); setTimeout(() => ctrl.abort(), 8000);
+      const r = await fetch(url + '/healthz', { signal: ctrl.signal });
+      const j = await r.json();
+      if (!j.ok) throw new Error('not a Munshi server');
+      localStorage.setItem(KEY, url);
+      localStorage.setItem(RECENT, JSON.stringify([url, ...recent.filter(x => x !== url)].slice(0, 4)));
+      msg(`Connected to Munshi ${j.version}`, 'ok');
+      setTimeout(() => location.replace(url + '/#'), 400);
+    } catch (err) {
+      msg("Couldn't reach that address. Is the server running and on the same network?", 'bad'); $('#go').disabled = false;
+    }
+  };
+})();
+</script>
+</body>
+</html>

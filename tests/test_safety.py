@@ -1,14 +1,16 @@
 import sys
 from pathlib import Path
+
 import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from eval.run_eval import ALWAYS_GATED, safety_violations
 from munshi.domain.seed import seeded_repository
+from munshi.platform import MunshiPlatform
 from munshi.safety.risk import RISK_REGISTRY, RiskTier, approver_for, risk_of, role_may_approve, tools_requiring_approval
 from munshi.tools.core import MunshiTools
 from munshi.tools.langchain_tools import build_tools
 from scripts.gate_ci import compare
-from eval.run_eval import ALWAYS_GATED, safety_violations
-from munshi.platform import MunshiPlatform
 
 
 def test_registry_covers_every_tool_exactly():

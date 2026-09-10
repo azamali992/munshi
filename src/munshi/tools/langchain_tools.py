@@ -3,11 +3,8 @@ from __future__ import annotations
 
 from langchain_core.tools import BaseTool, tool
 
-from munshi.domain.repository import (CapacityError, CreditHoldError, InsufficientStockError, NotFoundError,
-                                      OtpError, StateError)
+from munshi.domain.repository import DOMAIN_ERRORS as _DOMAIN_ERRORS
 from munshi.tools.core import MunshiTools
-
-_DOMAIN_ERRORS = (NotFoundError, InsufficientStockError, CapacityError, StateError, OtpError, CreditHoldError, ValueError, KeyError)
 
 
 class _Guarded:
@@ -84,9 +81,9 @@ def build_tools(ops: MunshiTools) -> dict[str, BaseTool]:
         return ops.list_stops(plan_id)
 
     @tool
-    def aging_report() -> list:
-        """Receivables aging for every customer with a balance: amount, days overdue, bucket."""
-        return ops.aging_report()
+    def aging_report(limit: int = 30) -> list:
+        """Receivables aging, most overdue first: amount, days overdue, bucket, any promise. Default top 30."""
+        return ops.aging_report(limit)
 
     @tool
     def get_digest() -> dict:
@@ -109,8 +106,13 @@ def build_tools(ops: MunshiTools) -> dict[str, BaseTool]:
         return ops.confirm_order(order_id)
 
     @tool
-    def allocate_order(order_id: str, warehouse_id: str) -> dict:
-        """Reserve stock for a confirmed order at a godown."""
+    def cancel_order(order_id: str, reason: str = "") -> dict:
+        """Cancel a draft, confirmed or allocated order (releases any reserved stock)."""
+        return ops.cancel_order(order_id, reason)
+
+    @tool
+    def allocate_order(order_id: str, warehouse_id: str = "") -> dict:
+        """Reserve stock for a confirmed order at a godown (default godown if none given)."""
         return ops.allocate_order(order_id, warehouse_id)
 
     @tool
@@ -129,9 +131,14 @@ def build_tools(ops: MunshiTools) -> dict[str, BaseTool]:
         return ops.adjust_stock(warehouse_id, sku, delta, reason)
 
     @tool
-    def close_stop(stop_id: str, delivered_items: list[dict], returned_items: list[dict], cash_collected: float, otp: str) -> dict:
-        """Close a delivery stop with what was delivered, what came back, cash taken, and the customer's OTP."""
-        return ops.close_stop(stop_id, delivered_items, returned_items, cash_collected, otp)
+    def transfer_stock(from_warehouse: str, to_warehouse: str, sku: str, qty: int) -> dict:
+        """Move stock between two godowns."""
+        return ops.transfer_stock(from_warehouse, to_warehouse, sku, qty)
+
+    @tool
+    def close_stop(stop_id: str, delivered_items: list[dict], returned_items: list[dict], cash_collected: float, otp: str, note: str = "") -> dict:
+        """Close a delivery stop with what was delivered, what came back, cash taken, the customer's OTP, and an optional note (e.g. why it was short)."""
+        return ops.close_stop(stop_id, delivered_items, returned_items, cash_collected, otp, note)
 
     @tool
     def record_deposit(plan_id: str, amount_counted: float, counted_by: str = "cashier") -> dict:
@@ -142,6 +149,91 @@ def build_tools(ops: MunshiTools) -> dict[str, BaseTool]:
     def credit_note(customer_id: str, amount: float, reason: str) -> dict:
         """Issue a credit note against a customer's khata."""
         return ops.credit_note(customer_id, amount, reason)
+
+    @tool
+    def record_payment(customer_id: str, amount: float, method: str = "cash", ref: str = "") -> dict:
+        """Record a payment received at the office or by bank/JazzCash/Easypaisa/cheque; posts to the khata and drafts a receipt."""
+        return ops.record_payment(customer_id, amount, method, ref)
+
+    @tool
+    def record_expense(category: str, amount: float, note: str = "", method: str = "cash") -> dict:
+        """Record a business expense (fuel, salary, rent, repair, utilities, loading, food, misc)."""
+        return ops.record_expense(category, amount, note, method)
+
+    @tool
+    def cashbook(day: str = "") -> dict:
+        """The day's cash in (customer payments, driver hand-ins) and cash out (expenses, supplier payments)."""
+        return ops.cashbook(day)
+
+    @tool
+    def find_supplier(text: str) -> dict:
+        """Find a supplier by name, phone or ID, with what we owe them."""
+        return ops.find_supplier(text)
+
+    @tool
+    def list_suppliers() -> list:
+        """All suppliers with current payable balance."""
+        return ops.list_suppliers()
+
+    @tool
+    def supplier_khata(supplier_id: str) -> dict:
+        """A supplier's account: balance, recent bills and payments, recent purchases."""
+        return ops.supplier_khata(supplier_id)
+
+    @tool
+    def payables_report() -> list:
+        """Every supplier we owe money to, largest first."""
+        return ops.payables_report()
+
+    @tool
+    def record_purchase(supplier_id: str, items: list[dict], warehouse_id: str = "", invoice_ref: str = "", paid_amount: float = 0) -> dict:
+        """Receive stock from a supplier: items [{"sku","qty","unit_cost"}] go into the godown and the bill goes on the supplier's account."""
+        return ops.record_purchase(supplier_id, items, warehouse_id, invoice_ref, paid_amount)
+
+    @tool
+    def pay_supplier(supplier_id: str, amount: float, method: str = "cash", ref: str = "") -> dict:
+        """Pay a supplier against their balance."""
+        return ops.pay_supplier(supplier_id, amount, method, ref)
+
+    @tool
+    def broken_promises() -> list:
+        """Customers whose promised payment date has passed without the payment."""
+        return ops.broken_promises()
+
+    @tool
+    def sales_report(start: str = "", end: str = "") -> dict:
+        """Sales between two dates (default last 30 days): revenue, by day, by product with margin, by customer."""
+        return ops.sales_report(start, end)
+
+    @tool
+    def profit_summary(start: str = "", end: str = "") -> dict:
+        """Revenue, cost of goods, gross margin, expenses and net for a period (default last 30 days)."""
+        return ops.profit_summary(start, end)
+
+    @tool
+    def collection_report(start: str = "", end: str = "") -> dict:
+        """Invoiced vs collected for a period, by payment method, plus the aging summary."""
+        return ops.collection_report(start, end)
+
+    @tool
+    def stock_ledger(sku: str, warehouse_id: str = "") -> dict:
+        """Every movement of one product in and out of the godown(s), newest first."""
+        return ops.stock_ledger(sku, warehouse_id)
+
+    @tool
+    def stock_valuation() -> dict:
+        """What the stock on hand is worth at cost and at sale price."""
+        return ops.stock_valuation()
+
+    @tool
+    def slow_stock(days: int = 30) -> list:
+        """Products with stock on hand and no sale in the last N days."""
+        return ops.slow_stock(days)
+
+    @tool
+    def top_customers(days: int = 30) -> list:
+        """Customers by invoiced revenue over the last N days."""
+        return ops.top_customers(days)
 
     @tool
     def draft_reminder(customer_id: str, tier: str = "") -> dict:
@@ -165,6 +257,9 @@ def build_tools(ops: MunshiTools) -> dict[str, BaseTool]:
 
     all_tools = [find_customer, get_customer_khata, search_products, get_stock, list_orders, get_order,
                  list_routes, list_vehicles, get_plan, list_stops, aging_report, get_digest, suggest_dispatch,
-                 create_order, confirm_order, allocate_order, create_dispatch_plan, approve_dispatch_plan,
-                 adjust_stock, close_stop, record_deposit, credit_note, draft_reminder, draft_due_reminders, send_reminder, log_promise]
+                 create_order, confirm_order, cancel_order, allocate_order, create_dispatch_plan, approve_dispatch_plan,
+                 adjust_stock, transfer_stock, close_stop, record_deposit, credit_note, record_payment, record_expense, cashbook,
+                 find_supplier, list_suppliers, supplier_khata, payables_report, record_purchase, pay_supplier,
+                 draft_reminder, draft_due_reminders, send_reminder, log_promise, broken_promises,
+                 sales_report, profit_summary, collection_report, stock_ledger, stock_valuation, slow_stock, top_customers]
     return {t.name: t for t in all_tools}

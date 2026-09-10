@@ -16,7 +16,7 @@ model via llm/factory.py instead.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
@@ -89,7 +89,7 @@ class StubToolCallingModel(BaseChatModel):
     def _generate(
         self,
         messages: list[BaseMessage],
-        stop: Optional[list[str]] = None,
+        stop: list[str] | None = None,
         run_manager: Any = None,
         **kwargs: Any,
     ) -> ChatResult:
@@ -108,10 +108,13 @@ class StubToolCallingModel(BaseChatModel):
 
         text = self._latest_human_text(messages)
         for rule in self.rules:
-            if rule.tool_name in self._bound_tool_names and rule.match(text):
+            if not rule.match(text):
+                continue
+            if rule.tool_name in self._bound_tool_names:
                 tool_call = {"name": rule.tool_name, "args": rule.args(text), "id": f"call_{rule.tool_name}"}
                 msg = AIMessage(content="", tool_calls=[tool_call])
                 return ChatResult(generations=[ChatGeneration(message=msg)])
+            break   # the intent is clear but this role has no such tool: answer from the role's prompt, like a real model would
 
         system_text = "\n".join(str(m.content) for m in messages if isinstance(m, SystemMessage))
         for predicate, reply in self.prompt_fallbacks:

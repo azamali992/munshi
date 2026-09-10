@@ -14,7 +14,7 @@
     --good:#1f9c84; --good-soft:#dff4ee; --warn:#b98a12; --warn-soft:#fbf1cf; --crit:#c9434b; --crit-soft:#fbe1e3;
   }
 }
-*{box-sizing:border-box} html,body{height:100%}
+*{box-sizing:border-box} html,body{height:100%} [hidden]{display:none!important}
 body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--body);font-size:15.5px;line-height:1.5;-webkit-font-smoothing:antialiased;overscroll-behavior-y:none}
 button,input,select,textarea{font:inherit;color:inherit}
 a{color:inherit;text-decoration:none}
@@ -91,3 +91,55 @@ pre.json{background:var(--surface-2);border-radius:10px;padding:10px;font-size:1
 .stopline{display:grid;grid-template-columns:1fr 84px;gap:8px;align-items:center;font-size:14px}
 .more a.item{display:flex;justify-content:space-between;align-items:center}
 @media (prefers-reduced-motion: reduce){*{transition:none!important;animation:none!important}}
+
+/* ---- v1.0 additions: forms, sheets, banners, charts, RTL ---- */
+.topbar-right{display:flex;align-items:center;gap:10px}
+.bell{position:relative;font-size:18px;text-decoration:none}
+.bell .badge{top:-6px;right:-10px}
+.banner{font-size:13px;font-weight:600;padding:8px 16px;text-align:center;background:var(--warn-soft);color:var(--warn)}
+.banner.crit{background:var(--crit-soft);color:var(--crit)}
+.link{background:none;border:0;padding:0;color:var(--accent);font-weight:700;cursor:pointer;text-decoration:none}
+.dim{font-size:15px;color:var(--muted)} .crit{color:var(--crit)} .muted{color:var(--muted)}
+.card.alert{border-color:var(--accent)}
+.grid2 .tile{min-width:0} .tile .v{white-space:normal;word-break:break-word;font-size:clamp(17px,5.4vw,22px)}
+.chips.center{justify-content:center;flex-wrap:wrap}
+.chip.ok{border-color:var(--good);color:var(--good)}
+a.chip{text-decoration:none}
+.btn.sm{padding:5px 10px;min-height:32px;font-size:12px}
+.btn.big{min-height:52px;font-size:17px}
+.input.big{font-size:22px;min-height:54px;letter-spacing:.2em;text-align:center}
+.input.num{font-family:var(--mono)}
+select.input{appearance:none}
+label.chk{display:flex;align-items:center;gap:10px;font-size:14px;cursor:pointer}
+.item.chk{flex-direction:row;display:flex;align-items:center;gap:10px}
+.item.chk input{width:20px;height:20px}
+.quote{font-size:13.5px;color:var(--ink-2);background:var(--surface-2);border-radius:8px;padding:8px 10px;margin-top:4px;white-space:pre-wrap}
+.buckets{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
+.oline,.pline{gap:6px} .oline select,.pline select{flex:1;min-width:0} .oline .x,.pline .x{background:none;border:0;color:var(--muted);font-size:16px;cursor:pointer}
+.stopline input{text-align:center;font-size:18px}
+/* bar chart */
+.bars{display:grid;gap:6px;margin-top:8px}
+.bar{display:grid;grid-template-columns:minmax(70px,32%) 1fr auto;align-items:center;gap:8px;font-size:12.5px}
+.bar .bl{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink-2)}
+.bar .bt{height:10px;background:var(--surface-2);border-radius:5px;overflow:hidden}
+.bar .bt i{display:block;height:100%;background:var(--accent);border-radius:5px}
+.bar .bv{color:var(--muted);font-size:12px}
+/* bottom sheet */
+.sheet{position:fixed;inset:0;z-index:20;display:flex;align-items:flex-end;justify-content:center}
+.sheet-bg{position:absolute;inset:0;background:rgba(0,0,0,.55)}
+.sheet-panel{position:relative;width:100%;max-width:560px;max-height:92vh;background:var(--surface);border-radius:18px 18px 0 0;display:flex;flex-direction:column;box-shadow:0 -10px 40px rgba(0,0,0,.4)}
+.sheet-h{display:flex;justify-content:space-between;align-items:center;padding:14px 16px 6px} .sheet-h h2{margin:0;font-size:18px}
+.sheet-h .x{background:none;border:0;font-size:18px;color:var(--muted);cursor:pointer;padding:6px}
+.sheet-b{padding:6px 16px 10px;overflow-y:auto;display:grid;gap:10px}
+.sheet-f{display:flex;gap:8px;padding:10px 16px calc(14px + var(--safe-b));border-top:1px solid var(--line)} .sheet-f .btn{flex:1}
+@media (min-width:640px){.sheet{align-items:center}.sheet-panel{border-radius:18px;max-height:86vh}}
+/* Urdu / RTL */
+body.ur{--body:'Noto Nastaliq Urdu','Manrope',system-ui,sans-serif;--display:'Noto Nastaliq Urdu','Outfit',sans-serif;line-height:1.9}
+body.ur h1{font-size:22px;line-height:1.7} body.ur .nav a{font-size:11.5px}
+[dir=rtl] .msg.me{justify-self:start;border-bottom-right-radius:14px;border-bottom-left-radius:4px}
+[dir=rtl] .msg.bot{justify-self:end;border-bottom-left-radius:14px;border-bottom-right-radius:4px}
+[dir=rtl] .badge{right:auto;left:calc(50% - 22px)}
+[dir=rtl] .num,[dir=rtl] .input.num,[dir=rtl] .json{direction:ltr;unicode-bidi:isolate}
+
+.input.bad{border-color:var(--crit)}
+.oline .psel,.pline .psel{flex:1;min-width:0}
