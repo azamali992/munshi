@@ -29,19 +29,39 @@ RISK_REGISTRY: dict[str, RiskTier] = {
     "aging_report": RiskTier.READ_ONLY,
     "get_digest": RiskTier.READ_ONLY,
     "suggest_dispatch": RiskTier.READ_ONLY,
+    "cashbook": RiskTier.READ_ONLY,
+    "find_supplier": RiskTier.READ_ONLY,
+    "list_suppliers": RiskTier.READ_ONLY,
+    "supplier_khata": RiskTier.READ_ONLY,
+    "payables_report": RiskTier.READ_ONLY,
+    "broken_promises": RiskTier.READ_ONLY,
+    "sales_report": RiskTier.READ_ONLY,
+    "profit_summary": RiskTier.READ_ONLY,
+    "collection_report": RiskTier.READ_ONLY,
+    "stock_ledger": RiskTier.READ_ONLY,
+    "stock_valuation": RiskTier.READ_ONLY,
+    "slow_stock": RiskTier.READ_ONLY,
+    "top_customers": RiskTier.READ_ONLY,
     # order desk
     "create_order": RiskTier.LOW_RISK,
     "confirm_order": RiskTier.LOW_RISK,
+    "cancel_order": RiskTier.LOW_RISK,
     # godown
     "allocate_order": RiskTier.LOW_RISK,
     "create_dispatch_plan": RiskTier.LOW_RISK,
     "approve_dispatch_plan": RiskTier.LOW_RISK,
+    "transfer_stock": RiskTier.LOW_RISK,
     "adjust_stock": RiskTier.HIGH_RISK,
     # delivery
     "close_stop": RiskTier.OTP_GATED,
     # hisaab
     "record_deposit": RiskTier.LOW_RISK,
+    "record_payment": RiskTier.LOW_RISK,
+    "record_expense": RiskTier.LOW_RISK,
     "credit_note": RiskTier.HIGH_RISK,
+    # khareed
+    "record_purchase": RiskTier.LOW_RISK,
+    "pay_supplier": RiskTier.HIGH_RISK,
     # wasooli
     "draft_reminder": RiskTier.LOW_RISK,
     "draft_due_reminders": RiskTier.LOW_RISK,
@@ -72,6 +92,8 @@ def approver_for(tool_name: str) -> str:
 
 
 def role_may_approve(role: str, tool_name: str) -> bool:
+    """Only the owner and the clerk approve anything; a salesman or driver
+    can request an action (if their agent has the tool) but never clear it."""
     need = approver_for(tool_name)
     if need == "none": return False
     if role == "owner": return True

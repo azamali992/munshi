@@ -1,7 +1,7 @@
 {
   "name": "Munshi",
   "short_name": "Munshi",
-  "description": "Your AI back office: orders, godown, deliveries, cash and khata, run by a team of approval-gated agents.",
+  "description": "Your AI back office: orders, godown, deliveries, cash, khata, suppliers and collections, run by a team of approval-gated agents.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
@@ -9,6 +9,31 @@
   "background_color": "#0b1220",
   "theme_color": "#0b1220",
   "icons": [
-    { "src": "/static/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+    {
+      "src": "/static/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": [
+    "business",
+    "productivity"
+  ],
+  "lang": "en",
+  "dir": "auto",
+  "shortcuts": [
+    {
+      "name": "Chat",
+      "url": "/#chat"
+    },
+    {
+      "name": "Approvals",
+      "url": "/#approvals"
+    },
+    {
+      "name": "Stops",
+      "url": "/#stops"
+    }
   ]
 }

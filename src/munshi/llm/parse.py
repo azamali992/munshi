@@ -5,6 +5,7 @@ needs it to keep the demo and tests deterministic without a key."""
 from __future__ import annotations
 
 import re
+
 from munshi.domain.repository import MunshiRepository
 
 _QTY_ITEM = re.compile(r"(\d+)\s*(?:bag|bags|bori|boriyan|kg|ltr|litre|liter|units?|x)?\s*(?:of\s+)?([A-Za-z؀-ۿ][A-Za-z0-9؀-ۿ\- ]{1,30}?)(?=\s*(?:,|\baur\b|\band\b|\bor\b|\.|$|\d))", re.IGNORECASE)
@@ -56,3 +57,23 @@ def date_in(text: str) -> str | None:
 
 def int_in(text: str) -> int:
     m = re.search(r"-?\d+", text); return int(m.group(0)) if m else 0
+
+
+def parse_supplier(text: str, repo: MunshiRepository) -> str | None:
+    m = re.search(r"\b(S-\d{3})\b", text)
+    if m: return m.group(1)
+    t = text.lower()
+    for s in repo.list_suppliers():
+        name = s.name.lower()
+        first = name.split()[0].strip("(),")
+        if name in t or (len(first) > 3 and first in t):
+            return s.supplier_id
+    return None
+
+
+def method_in(text: str) -> str:
+    t = text.lower()
+    for m in ("jazzcash", "easypaisa", "cheque", "bank"):
+        if m in t: return m
+    if "check" in t: return "cheque"
+    return "cash"

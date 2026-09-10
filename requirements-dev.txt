@@ -1,5 +1,7 @@
 -r requirements.txt
 pytest>=8
 httpx>=0.28
-# only for scripts/screenshots.py (README images); needs `playwright install chromium`
+ruff>=0.6
+pip-audit>=2.7
+# only for scripts/screenshots.py (README images + browser walkthrough); needs `playwright install chromium`
 playwright>=1.50

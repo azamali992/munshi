@@ -1,0 +1,14 @@
+{
+  "appId": "pk.munshi.app",
+  "appName": "Munshi",
+  "webDir": "www",
+  "server": {
+    "androidScheme": "https",
+    "allowNavigation": ["*"],
+    "cleartext": true
+  },
+  "android": {
+    "allowMixedContent": true,
+    "backgroundColor": "#0b1220"
+  }
+}

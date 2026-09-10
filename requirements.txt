@@ -1,6 +1,7 @@
 # Runtime. Pinned to the versions this was built and tested against (Sept 2026).
 langchain>=1.4,<2
 langgraph>=1.2,<2
+langgraph-checkpoint-sqlite>=3.0
 langchain-groq>=1.1,<2
 groq>=0.37
 fastapi>=0.120
@@ -8,4 +9,5 @@ uvicorn[standard]>=0.40
 pydantic>=2.10
 python-multipart>=0.0.20
 openpyxl>=3.1
+reportlab>=4.2
 mlflow-skinny>=3.10

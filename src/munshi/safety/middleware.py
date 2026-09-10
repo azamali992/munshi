@@ -3,8 +3,7 @@ from __future__ import annotations
 
 from typing import Callable
 
-from langchain.agents.middleware import (HumanInTheLoopMiddleware, ModelRequest, ModelResponse,
-                                         dynamic_prompt, wrap_model_call)
+from langchain.agents.middleware import HumanInTheLoopMiddleware, ModelRequest, ModelResponse, dynamic_prompt, wrap_model_call
 from langchain_core.tools import BaseTool
 
 from munshi.safety.auth import DEFAULT_ROLE

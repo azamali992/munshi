@@ -1,4 +1,5 @@
 import pytest
+
 from munshi.agents.manager import build_manager, classify
 
 M = build_manager()

@@ -1,12 +1,26 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.ruff_cache/
 .env
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 mlruns/
 eval_report.json
 data/
 .venv/
 node_modules/
 .DS_Store
+# android build outputs and signing material
+mobile/android/app/build/
+mobile/android/build/
+mobile/android/.gradle/
+mobile/android/capacitor-cordova-android-plugins/build/
+mobile/android/.idea/
+mobile/android/local.properties
+mobile/android/keystore.properties
+mobile/keys/
+*.apk
+*.aab

@@ -1,243 +1,223 @@
-"""Munshi's HTTP layer: the JSON API the mobile app talks to, plus the app
-itself served as an installable PWA. One process, one SQLite file, no other
-services."""
+"""Munshi's HTTP layer: the JSON API the mobile app talks to, the app itself
+served as an installable PWA, public invoice links, and a small in-process
+scheduler (owner digest, outbox delivery). One process, one data directory,
+no other services.
+
+Security posture (see docs/SECURITY.md):
+- every /api route except config/signup/session requires a session token
+  that maps to one user in one business; permissions are role-based and
+  declared per route;
+- strict security headers and a CSP that allows only this origin plus fonts;
+- sign-in and sign-up are rate-limited per client address;
+- production mode (MUNSHI_ENV=production) refuses to start with the default
+  secret and closes public sign-up unless explicitly opened.
+"""
 from __future__ import annotations
 
-import hashlib
-import hmac
-import io
+import logging
 import os
-from dataclasses import asdict
+import secrets
+import threading
+import time
+import uuid
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
 
-from munshi.domain.repository import (CapacityError, CreditHoldError, InsufficientStockError, MunshiRepository,
-                                      NotFoundError, OtpError, StateError)
-from munshi.domain.seed import seed
+from munshi.auth import AuthError
+from munshi.auth.ratelimit import RateLimiter
+from munshi.domain.repository import CapacityError, CreditHoldError, InsufficientStockError, NotFoundError, OtpError, StateError
 from munshi.llm.factory import build_chat_model
-from munshi.platform import MunshiPlatform
-from munshi.safety.risk import role_may_approve
+from munshi.tenancy.hub import TenantHub
+from munshi.web.routes import auth, money, ops, reports, setup
 
 STATIC = Path(__file__).parent / "static"
-SECRET = os.environ.get("MUNSHI_SECRET", "change-me-in-production").encode()
-PINS = {
-    "owner": os.environ.get("OWNER_PIN", "1111"),
-    "clerk": os.environ.get("CLERK_PIN", "2222"),
-    "driver": os.environ.get("DRIVER_PIN", "3333"),
-}
+VERSION = "1.0.0"
+log = logging.getLogger("munshi.web")
+
+CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+       "font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; media-src 'self' blob:; "
+       "frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
 
 
-class PinIn(BaseModel):
-    pin: str
+class _JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        import json
+        d = {"t": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"), "lvl": record.levelname, "src": record.name, "msg": record.getMessage()}
+        if record.exc_info:
+            d["exc"] = self.formatException(record.exc_info)[-2000:]
+        return json.dumps(d, ensure_ascii=False)
 
 
-class ChatIn(BaseModel):
-    thread_id: str = "main"
-    text: str
+def _configure_logging() -> None:
+    root = logging.getLogger()
+    if getattr(root, "_munshi_configured", False):
+        return
+    h = logging.StreamHandler(); h.setFormatter(_JsonFormatter())
+    root.handlers = [h]; root.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
+    for noisy in ("httpx", "httpcore", "uvicorn.access"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+    root._munshi_configured = True   # type: ignore[attr-defined]
 
 
-class Decision(BaseModel):
-    approve: bool
-    note: str = ""
+def _secret() -> bytes:
+    s = os.environ.get("MUNSHI_SECRET", "")
+    prod = os.environ.get("MUNSHI_ENV", "development") == "production"
+    if not s or s == "change-me":
+        if prod:
+            raise RuntimeError("MUNSHI_ENV=production needs a real MUNSHI_SECRET (python3 -c 'import secrets;print(secrets.token_hex(32))')")
+        s = "dev-" + secrets.token_hex(8)     # dev: invoice links stop working across restarts, and that's fine
+    return s.encode()
 
 
-class CloseIn(BaseModel):
-    delivered_items: list[dict]
-    returned_items: list[dict] = []
-    cash_collected: float = 0
-    otp: str
+def nightly_backup(hub: TenantHub, keep_days: int = 14) -> list[str]:
+    """A consistent copy of every business file under data/backups, pruning copies older than keep_days."""
+    if hub.in_memory: return []
+    out = Path(hub.data_dir) / "backups"; out.mkdir(parents=True, exist_ok=True)
+    today = datetime.now().date().isoformat(); written = []
+    for b in hub.registry.list_businesses():
+        if not b["active"]: continue
+        target = out / f"{b['business_id']}-{today}.db"
+        if target.exists(): target.unlink()
+        repo = hub.platform(b["business_id"]).repo
+        with repo._lock:
+            repo._conn.execute("VACUUM INTO ?", (str(target),))
+        written.append(target.name)
+    cutoff = time.time() - keep_days * 86400
+    for f in out.glob("*.db"):
+        if f.stat().st_mtime < cutoff: f.unlink()
+    return written
 
 
-def _token(role: str) -> str:
-    return role + "." + hmac.new(SECRET, role.encode(), hashlib.sha256).hexdigest()[:24]
+def scheduler_tick(hub: TenantHub, sent_today: dict[str, str], now: datetime | None = None) -> list[str]:
+    """One pass over every business: deliver the outbox; at the business's digest_time, write the
+    owner's digest as a notification and queue it to the owner's WhatsApp; at MUNSHI_BACKUP_TIME,
+    back every business up. Returns the businesses digested."""
+    now = now or datetime.now()
+    hhmm, today = now.strftime("%H:%M"), now.date().isoformat()
+    digested = []
+    if hhmm == os.environ.get("MUNSHI_BACKUP_TIME", "02:30") and sent_today.get("__backup__") != today:
+        sent_today["__backup__"] = today
+        log.info("nightly backup: %s", nightly_backup(hub))
+    for b in hub.registry.list_businesses():
+        if not b["active"]: continue
+        pf = hub.platform(b["business_id"]); repo = pf.repo
+        pf.deliver_messages()
+        if repo.setting("digest_time") == hhmm and sent_today.get(b["business_id"]) != today:
+            d = repo.digest()
+            text = (f"{repo.business_name} — {d['date']}: orders {d['orders']['count']} (Rs {d['orders']['value']:,.0f}), delivered {d['dispatch']['delivered']}/{d['dispatch']['stops']}, "
+                    f"cash collected Rs {d['cash']['collected']:,.0f} / deposited Rs {d['cash']['deposited']:,.0f}, receivables Rs {d['receivables']['total']:,.0f} "
+                    f"(60+ days Rs {d['receivables']['overdue_60']:,.0f}), payables Rs {d['payables']:,.0f}, low stock {len(d['low_stock'])}.")
+            repo.notify("owner", "digest", text)
+            broken = repo.broken_promises()
+            if broken:
+                repo.notify("clerk", "promise", "Broken promises: " + ", ".join(f"{b['name']} Rs {b['amount']:,.0f} (by {b['date']})" for b in broken[:6]))
+            if d["low_stock"]:
+                repo.notify("clerk", "low_stock", "Low stock: " + ", ".join(f"{x['sku']} {x['available']} @ {x['warehouse_id']}" for x in d["low_stock"][:6]))
+            if repo.setting("owner_phone"):
+                repo.queue_message("whatsapp", repo.setting("owner_phone"), text, "digest")
+            sent_today[b["business_id"]] = today
+            digested.append(b["business_id"])
+    hub.registry.purge_expired()
+    return digested
 
 
-def _role_from(token: str | None) -> str:
-    if not token or "." not in token:
-        raise HTTPException(401, "sign in with your PIN")
-    role, sig = token.split(".", 1)
-    if role not in PINS or not hmac.compare_digest(_token(role), token):
-        raise HTTPException(401, "invalid session")
-    return role
-
-
-def current_role(x_session: Optional[str] = Header(default=None)) -> str:
-    return _role_from(x_session)
-
-
-def build_app(db_path: str | None = None, model=None, enable_tracing: bool | None = None) -> FastAPI:
-    db_path = db_path or os.environ.get("MUNSHI_DB", "munshi.db")
-    fresh = db_path == ":memory:" or not Path(db_path).exists()
-    repo = MunshiRepository(db_path)
-    if fresh:
-        seed(repo)
+def build_app(data_dir: str | None = None, model=None, enable_tracing: bool | None = None, demo: bool | None = None,
+              in_memory: bool = False, scheduler: bool | None = None) -> FastAPI:
+    _configure_logging()
+    prod = os.environ.get("MUNSHI_ENV", "development") == "production"
     if model is None:
         model = build_chat_model()
     tracing = enable_tracing if enable_tracing is not None else os.environ.get("MUNSHI_TRACING", "0") == "1"
-    platform = MunshiPlatform(repo, model, enable_tracing=tracing)
+    hub = TenantHub(data_dir, model, enable_tracing=tracing, in_memory=in_memory)
+    want_demo = demo if demo is not None else os.environ.get("MUNSHI_DEMO", "1") == "1"
+    if want_demo:
+        hub.ensure_demo()
 
-    app = FastAPI(title="Munshi", version="0.1.0")
-    app.state.platform = platform
+    app = FastAPI(title="Munshi", version=VERSION, docs_url="/api/docs" if not prod else None, redoc_url=None, openapi_url="/api/openapi.json" if not prod else None)
+    app.state.hub = hub
+    app.state.secret = _secret()
+    # public sign-up: open in development, closed in production unless the operator sets MUNSHI_SIGNUP=1
+    app.state.signup_open = os.environ["MUNSHI_SIGNUP"] == "1" if os.environ.get("MUNSHI_SIGNUP") is not None else not prod
+    app.state.login_limiter = RateLimiter(rate_per_minute=10, burst=10)
+    app.state.signup_limiter = RateLimiter(rate_per_minute=3, burst=3)
     app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
+    for r in (auth.router, setup.router, ops.router, money.router, reports.router):
+        app.include_router(r)
 
-    # ---------------- errors -> clean messages
+    # ---------------- errors -> clean messages, never stack traces
     @app.exception_handler(NotFoundError)
-    async def _nf(_, e): raise HTTPException(404, str(e))
-    for exc, code in ((InsufficientStockError, 409), (CapacityError, 409), (StateError, 409), (OtpError, 403), (CreditHoldError, 409), (ValueError, 400), (PermissionError, 403), (KeyError, 404)):
+    async def _nf(_, e): return JSONResponse({"detail": str(e)}, 404)
+    for exc, code in ((InsufficientStockError, 409), (CapacityError, 409), (StateError, 409), (OtpError, 403), (CreditHoldError, 409),
+                      (ValueError, 400), (PermissionError, 403), (KeyError, 404), (AuthError, 401)):
         def _mk(code):
-            async def h(_, e): raise HTTPException(code, str(e))
+            async def h(_, e): return JSONResponse({"detail": str(e).strip("'")}, code)
             return h
         app.add_exception_handler(exc, _mk(code))
 
+    @app.exception_handler(Exception)
+    async def _boom(request: Request, e: Exception):
+        log.exception("unhandled error on %s %s", request.method, request.url.path)
+        return JSONResponse({"detail": "something went wrong on our side — it has been logged"}, 500)
+
+    # ---------------- security headers + request log
+    @app.middleware("http")
+    async def _headers(request: Request, call_next):
+        rid = uuid.uuid4().hex[:12]; t0 = time.monotonic()
+        response = await call_next(request)
+        response.headers["X-Request-Id"] = rid
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Permissions-Policy"] = "camera=(), geolocation=(), microphone=(self)"
+        response.headers["Content-Security-Policy"] = CSP
+        if request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store"
+        if request.headers.get("x-forwarded-proto") == "https" or prod:
+            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        if request.url.path.startswith("/api/") and request.url.path not in ("/api/badge",):
+            p = getattr(request.state, "principal", None)
+            log.info("%s %s %s %dms user=%s biz=%s rid=%s", request.method, request.url.path, response.status_code, int((time.monotonic() - t0) * 1000),
+                     p.user_id if p else "-", p.business_id if p else "-", rid)
+        return response
+
     # ---------------- app shell
-    @app.get("/")
+    @app.get("/", include_in_schema=False)
     def index(): return FileResponse(STATIC / "index.html")
 
-    @app.get("/manifest.webmanifest")
+    @app.get("/manifest.webmanifest", include_in_schema=False)
     def manifest(): return FileResponse(STATIC / "manifest.webmanifest", media_type="application/manifest+json")
 
-    @app.get("/sw.js")
-    def sw(): return FileResponse(STATIC / "sw.js", media_type="application/javascript")
+    @app.get("/sw.js", include_in_schema=False)
+    def sw(): return FileResponse(STATIC / "sw.js", media_type="application/javascript", headers={"Cache-Control": "no-cache"})
 
-    # ---------------- session
-    @app.post("/api/session")
-    def session(body: PinIn):
-        for role, pin in PINS.items():
-            if hmac.compare_digest(body.pin, pin):
-                return {"role": role, "token": _token(role)}
-        raise HTTPException(401, "wrong PIN")
+    @app.get("/healthz", include_in_schema=False)
+    def healthz():
+        # CORS-open on purpose: the Android shell's connect screen (origin https://localhost) probes this before navigating here
+        return JSONResponse({"ok": True, "version": VERSION, "businesses": len(hub.registry.list_businesses())}, headers={"Access-Control-Allow-Origin": "*"})
 
-    @app.get("/api/me")
-    def me(role: str = Depends(current_role)):
-        return {"role": role, "llm": os.environ.get("LLM_PROVIDER", "stub"), "voice": bool(os.environ.get("GROQ_API_KEY")),
-                "business": "Sultan Traders"}
+    # ---------------- scheduler: owner digest + outbox delivery, once a minute
+    want_sched = scheduler if scheduler is not None else (os.environ.get("MUNSHI_SCHEDULER", "1") == "1" and not in_memory)
+    if want_sched:
+        stop = threading.Event()
+        sent_today: dict[str, str] = {}
 
-    # ---------------- chat + approvals
-    @app.post("/api/chat")
-    def chat(body: ChatIn, role: str = Depends(current_role)):
-        r = platform.handle_message(body.thread_id, role, body.text.strip())
-        return {"text": r.text, "specialist": r.specialist, "pending": (asdict(r.pending) | {"summary": r.pending.describe()}) if r.pending else None}
+        def loop():
+            while not stop.wait(60):
+                try:
+                    scheduler_tick(hub, sent_today)
+                except Exception:
+                    log.exception("scheduler tick failed")
 
-    @app.get("/api/chat/{thread_id}")
-    def history(thread_id: str, role: str = Depends(current_role)):
-        return platform.repo.chat_history(thread_id)
+        t = threading.Thread(target=loop, name="munshi-scheduler", daemon=True); t.start()
+        app.state.scheduler_stop = stop
 
-    @app.get("/api/approvals")
-    def approvals(role: str = Depends(current_role)):
-        return [p | {"can_approve": role_may_approve(role, p["tool"])} for p in platform.list_pending()]
-
-    @app.post("/api/approvals/{approval_id}")
-    def decide(approval_id: str, body: Decision, role: str = Depends(current_role)):
-        r = platform.resolve(approval_id, body.approve, role, body.note)
-        return {"text": r.text, "specialist": r.specialist}
-
-    # ---------------- reads
-    @app.get("/api/digest")
-    def digest(role: str = Depends(current_role)):
-        d = platform.repo.digest(); d["pending_approvals"] = len(platform.pending); return d
-
-    @app.get("/api/orders")
-    def orders(status: str = "", role: str = Depends(current_role)):
-        return platform.ops.list_orders(status)
-
-    @app.get("/api/orders/{order_id}")
-    def order(order_id: str, role: str = Depends(current_role)):
-        return platform.ops.get_order(order_id)
-
-    @app.get("/api/plans")
-    def plans(date: str = "", role: str = Depends(current_role)):
-        out = []
-        for p in platform.repo.list_plans(date or None):
-            d = asdict(p); d["stops"] = [asdict(s) for s in platform.repo.list_stops(p.plan_id)]
-            d["route_name"] = platform.repo.get_route(p.route_id).name; d["plate"] = platform.repo.get_vehicle(p.vehicle_id).plate
-            for s in d["stops"]:
-                s["customer_name"] = platform.repo.get_customer(s["customer_id"]).name
-                o = platform.repo.get_order(s["order_id"]); s["items"] = [i.__dict__ for i in o.items]; s["order_total"] = o.total
-                if role != "driver": pass
-                else: s["otp"] = None  # the driver never sees the OTP; the customer holds it
-            out.append(d)
-        return out
-
-    @app.post("/api/stops/{stop_id}/close")
-    def close_stop(stop_id: str, body: CloseIn, role: str = Depends(current_role)):
-        return platform.ops.close_stop(stop_id, body.delivered_items, body.returned_items, body.cash_collected, body.otp)
-
-    @app.get("/api/khata")
-    def khata(role: str = Depends(current_role)):
-        return platform.repo.aging()
-
-    @app.get("/api/khata/{customer_id}")
-    def khata_one(customer_id: str, role: str = Depends(current_role)):
-        return platform.ops.get_customer_khata(customer_id)
-
-    @app.get("/api/reminders")
-    def reminders(status: str = "", role: str = Depends(current_role)):
-        return [asdict(r) | {"customer_name": platform.repo.get_customer(r.customer_id).name} for r in platform.repo.list_reminders(status or None)]
-
-    @app.post("/api/reminders/{reminder_id}/send")
-    def send_reminder(reminder_id: str, role: str = Depends(current_role)):
-        if not role_may_approve(role, "send_reminder"): raise HTTPException(403, "clerk or owner only")
-        return platform.ops.send_reminder(reminder_id, approved_by=role)
-
-    @app.get("/api/stock")
-    def stock(role: str = Depends(current_role)):
-        names = {p.sku: p.name for p in platform.repo.list_products()}
-        whs = {w.warehouse_id: w.name for w in platform.repo.list_warehouses()}
-        return [asdict(s) | {"available": s.available, "name": names.get(s.sku, s.sku), "warehouse": whs.get(s.warehouse_id)} for s in platform.repo.list_stock()]
-
-    @app.get("/api/customers")
-    def customers(role: str = Depends(current_role)):
-        return [asdict(c) | {"outstanding": platform.repo.outstanding(c.customer_id)} for c in platform.repo.list_customers()]
-
-    @app.get("/api/products")
-    def products(role: str = Depends(current_role)):
-        return [asdict(p) for p in platform.repo.list_products()]
-
-    @app.get("/api/audit")
-    def audit(role: str = Depends(current_role)):
-        if role == "driver": raise HTTPException(403, "owner or clerk only")
-        return platform.repo.audit_log(100)
-
-    # ---------------- export: the business's own data, as a workbook
-    @app.get("/api/export.xlsx")
-    def export(role: str = Depends(current_role)):
-        if role == "driver": raise HTTPException(403, "owner or clerk only")
-        from openpyxl import Workbook
-        wb = Workbook(); wb.remove(wb.active)
-        def sheet(name, rows, header):
-            ws = wb.create_sheet(name); ws.append(header)
-            for r in rows: ws.append([r.get(h, "") if isinstance(r, dict) else r for h in header])
-        sheet("Orders", platform.ops.list_orders(""), ["order_id", "customer_name", "status", "total", "created_at", "channel"])
-        led = []
-        for c in platform.repo.list_customers():
-            for e in platform.repo.ledger_for(c.customer_id): led.append(asdict(e) | {"customer": c.name})
-        sheet("Khata", led, ["entry_id", "customer", "kind", "amount", "ref", "due_date", "created_at"])
-        sheet("Aging", platform.repo.aging(), ["customer_id", "name", "balance", "days_overdue", "bucket"])
-        sheet("Stock", stock(role), ["warehouse", "sku", "name", "on_hand", "reserved", "available"])
-        sheet("Audit", platform.repo.audit_log(1000), ["created_at", "actor", "action", "entity", "entity_id", "approved_by"])
-        buf = io.BytesIO(); wb.save(buf); buf.seek(0)
-        return StreamingResponse(buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                 headers={"Content-Disposition": "attachment; filename=munshi-export.xlsx"})
-
-    # ---------------- voice orders (optional, needs GROQ_API_KEY)
-    @app.post("/api/voice")
-    async def voice(thread_id: str = "main", audio: UploadFile = File(...), role: str = Depends(current_role)):
-        key = os.environ.get("GROQ_API_KEY")
-        if not key: raise HTTPException(503, "Voice needs GROQ_API_KEY (free at console.groq.com)")
-        from groq import Groq
-        data = await audio.read()
-        tr = Groq(api_key=key).audio.transcriptions.create(file=(audio.filename or "note.webm", data), model="whisper-large-v3", language="ur" if os.environ.get("VOICE_LANG", "auto") == "ur" else None)
-        text = tr.text.strip()
-        r = platform.handle_message(thread_id, role, text)
-        return {"transcript": text, "text": r.text, "specialist": r.specialist,
-                "pending": (asdict(r.pending) | {"summary": r.pending.describe()}) if r.pending else None}
-
+    log.info("Munshi %s ready: data=%s demo=%s llm=%s env=%s", VERSION, "memory" if in_memory else hub.data_dir, want_demo, os.environ.get("LLM_PROVIDER", "stub"), "production" if prod else "development")
     return app
 
 
-app = build_app()
+# uvicorn entry point: `uvicorn munshi.web.app:app`. Tests build their own app and set MUNSHI_NO_AUTOAPP=1.
+app = build_app() if os.environ.get("MUNSHI_NO_AUTOAPP") != "1" else None

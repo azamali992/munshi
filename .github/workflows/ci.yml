@@ -11,18 +11,75 @@ jobs:
     env:
       LLM_PROVIDER: stub
       MLFLOW_DISABLE_AGENT_HINT: "1"
+      MUNSHI_NO_AUTOAPP: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-      - run: pip install -r requirements.txt pytest httpx
-      - name: Unit + API tests
+      - run: pip install -r requirements.txt pytest httpx ruff pip-audit
+      - name: Lint
+        run: ruff check src tests eval scripts demo
+      - name: Unit, domain, auth, API and security tests
         run: python3 -m pytest -q
       - name: Scripted day (offline demo)
         run: PYTHONPATH=src python3 demo/run_demo.py
-      - name: Quality + safety gate
+      - name: Quality + safety gate (39-step eval)
         run: python3 scripts/gate_ci.py
+      - name: Dependency audit
+        run: pip-audit -r requirements.txt --progress-spinner off
+        continue-on-error: true
       - name: Docker image builds
         run: docker build -t munshi:ci .
+
+  browser-walkthrough:
+    runs-on: ubuntu-latest
+    needs: test-and-gate
+    env:
+      LLM_PROVIDER: stub
+      MLFLOW_DISABLE_AGENT_HINT: "1"
+      MUNSHI_NO_AUTOAPP: "1"
+      LOG_LEVEL: WARNING
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt playwright && playwright install --with-deps chromium
+      - name: Start server
+        run: |
+          MUNSHI_DATA_DIR=/tmp/mdata PYTHONPATH=src nohup python3 -m uvicorn munshi.web.app:app --port 8765 > /tmp/server.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8765/healthz && break; sleep 1; done
+      - name: Full walkthrough as owner, clerk, salesman and driver
+        run: python3 scripts/screenshots.py http://127.0.0.1:8765 /tmp/screens
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screens
+          path: /tmp/screens
+
+  android-apk:
+    runs-on: ubuntu-latest
+    needs: test-and-gate
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: android-actions/setup-android@v3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build debug APK
+        working-directory: mobile
+        run: |
+          npm ci --no-audit --no-fund
+          npx cap sync android
+          cd android && chmod +x gradlew && ./gradlew assembleDebug --no-daemon -q
+      - uses: actions/upload-artifact@v4
+        with:
+          name: munshi-debug-apk
+          path: mobile/android/app/build/outputs/apk/debug/app-debug.apk

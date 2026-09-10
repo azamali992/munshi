@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Munshi — your AI back office, in your pocket</title>
+<meta name="description" content="Munshi runs a distributor's orders, godown, deliveries, cash, khata, suppliers and collections with seven approval-gated AI agents. Phone app for every role. Nothing moves stock or money without a human saying yes.">
+<meta property="og:title" content="Munshi — your AI back office, in your pocket">
+<meta property="og:description" content="Seven approval-gated agents run a distributor's order-to-cash loop on the phones the business already has.">
+<meta property="og:image" content="img/hero.png">
+<link rel="icon" href="img/icon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Outfit:wght@500;600;700;800&family=Manrope:wght@400;500;600;700&display=swap">
+<style>
+:root{--ground:#0b1220;--surface:#131c2e;--surface-2:#1a2540;--ink:#e9eef7;--ink-2:#c3cbda;--muted:#8b98b0;--line:#223052;--accent:#f2a93b;--accent-2:#ffc76b;--accent-ink:#1a1206;--good:#2ec4a6;--crit:#e5646b;
+  --display:'Outfit',system-ui,sans-serif;--body:'Manrope',system-ui,sans-serif}
+*{box-sizing:border-box} html{scroll-behavior:smooth}
+body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--body);font-size:17px;line-height:1.6;-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
+.wrap{max-width:1080px;margin:0 auto;padding:0 22px}
+header{position:sticky;top:0;z-index:5;background:color-mix(in srgb,var(--ground) 86%,transparent);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+.nav{display:flex;align-items:center;justify-content:space-between;height:62px}
+.brand{display:flex;align-items:center;gap:10px;font-family:var(--display);font-weight:800;font-size:22px;color:var(--ink)}
+.brand i{width:14px;height:14px;border-radius:4px;background:var(--accent);box-shadow:0 0 0 4px color-mix(in srgb,var(--accent) 25%,transparent)}
+.nav .links{display:flex;gap:22px;font-weight:600;font-size:15px} .nav .links a{color:var(--ink-2)} @media(max-width:640px){.nav .links{display:none}}
+.btn{display:inline-flex;align-items:center;gap:8px;border-radius:12px;padding:12px 18px;font-weight:700;border:1px solid var(--line);background:var(--surface-2);color:var(--ink)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)} .btn:hover{text-decoration:none;filter:brightness(1.06)}
+h1{font-family:var(--display);font-size:clamp(38px,6vw,64px);line-height:1.05;letter-spacing:-.025em;margin:0 0 18px;text-wrap:balance}
+h2{font-family:var(--display);font-size:clamp(26px,3.6vw,38px);letter-spacing:-.02em;margin:0 0 12px;text-wrap:balance}
+h3{font-family:var(--display);font-size:19px;margin:0 0 6px}
+.lead{font-size:20px;color:var(--ink-2);max-width:62ch;margin:0 0 26px}
+.eyebrow{color:var(--accent);font-weight:700;letter-spacing:.08em;text-transform:uppercase;font-size:12.5px;margin-bottom:10px}
+section{padding:72px 0} section.alt{background:var(--surface);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.hero{padding:70px 0 40px}
+.hero img{width:100%;border-radius:18px;border:1px solid var(--line);margin-top:34px}
+.grid{display:grid;gap:18px} .g2{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))} .g3{grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:22px} section.alt .card{background:var(--ground)}
+.card p{margin:6px 0 0;color:var(--ink-2);font-size:15.5px}
+.pill{display:inline-block;font-size:11.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;padding:3px 9px;border-radius:999px;background:var(--surface-2);color:var(--muted)}
+.pill.owner{color:var(--crit)} .pill.clerk{color:var(--accent)} .pill.otp{color:var(--good)}
+.team{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+.team .card b{font-family:var(--display);font-size:18px} .team .card small{display:block;color:var(--muted);margin-top:8px;font-size:13.5px}
+.chat{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:18px;font-size:15px;display:grid;gap:10px;max-width:640px}
+.me{justify-self:end;background:var(--accent);color:var(--accent-ink);padding:9px 13px;border-radius:14px 14px 4px 14px;max-width:88%}
+.bot{justify-self:start;background:var(--ground);border:1px solid var(--line);padding:9px 13px;border-radius:14px 14px 14px 4px;max-width:92%;color:var(--ink-2)}
+.bot b{color:var(--muted);font-size:11px;letter-spacing:.06em;text-transform:uppercase;display:block;margin-bottom:3px}
+.approval{border-color:var(--accent);background:var(--ground)} .approval .btns{display:flex;gap:8px;margin-top:8px} .approval .btns span{border-radius:9px;padding:6px 12px;font-weight:700;font-size:13px}
+.approval .ok{background:var(--accent);color:var(--accent-ink)} .approval .no{border:1px solid var(--crit);color:var(--crit)}
+.screens{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px} .screens figure{margin:0} .screens img{width:100%;border-radius:14px;border:1px solid var(--line)} .screens figcaption{font-size:13px;color:var(--muted);margin-top:6px;text-align:center}
+.price{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:16px}
+.price .card{display:flex;flex-direction:column} .price .amt{font-family:var(--display);font-size:34px;font-weight:800;margin:6px 0} .price .amt small{font-size:14px;color:var(--muted);font-weight:600}
+.price ul{margin:10px 0 18px;padding-left:18px;color:var(--ink-2);font-size:15px} .price .card .btn{margin-top:auto;justify-content:center}
+.price .card.hot{border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 18%,transparent)}
+details{border-top:1px solid var(--line);padding:14px 0} details summary{cursor:pointer;font-weight:700;font-family:var(--display);font-size:17px} details p{color:var(--ink-2);margin:8px 0 0}
+footer{border-top:1px solid var(--line);padding:34px 0;color:var(--muted);font-size:14px} footer .wrap{display:flex;flex-wrap:wrap;gap:16px;justify-content:space-between}
+.num{font-variant-numeric:tabular-nums}
+@media(prefers-reduced-motion:no-preference){.card{transition:transform .15s}.card:hover{transform:translateY(-2px)}}
+</style>
+</head>
+<body>
+<header><div class="wrap nav"><a class="brand" href="#"><i></i>Munshi</a><nav class="links"><a href="#how">How it works</a><a href="#team">The team</a><a href="#roles">Roles</a><a href="#pricing">Pricing</a><a href="#faq">FAQ</a><a href="https://github.com/azamali992/munshi">GitHub</a></nav><a class="btn primary" href="https://github.com/azamali992/munshi/releases">Get the app</a></div></header>
+
+<section class="hero"><div class="wrap">
+  <div class="eyebrow">For distributors · Pakistan</div>
+  <h1>Your AI back office,<br>in your pocket.</h1>
+  <p class="lead">Seven munshis — order desk, godown, delivery, cash, purchases, collections and reports — run your whole day on the phones you already have. Nothing moves stock or money until you or your munshi taps <b>yes</b>.</p>
+  <div style="display:flex;gap:10px;flex-wrap:wrap"><a class="btn primary" href="https://github.com/azamali992/munshi/releases">Download for Android</a><a class="btn" href="https://github.com/azamali992/munshi#run-it">Run it on your PC</a><a class="btn" href="https://github.com/azamali992/munshi">Read the code</a></div>
+  <img src="img/hero.png" alt="Munshi on five phones: the owner's Today screen, a chat with an approval card, the driver closing a stop, cash reconciliation, and the app in Urdu">
+</div></section>
+
+<section id="how"><div class="wrap">
+  <div class="eyebrow">How it works</div>
+  <h2>Say it. Approve it. It's done — and written down.</h2>
+  <div class="grid g3" style="margin-top:22px">
+    <div class="card"><h3>1 · Say it, in Urdu or English</h3><p>“Chaudhry Farms ko 20 urea aur 5 dap bhej do.” The Manager sends it to the right munshi; the Order Munshi matches real products, checks stock and the khata, and drafts the order.</p></div>
+    <div class="card"><h3>2 · A card asks for a yes</h3><p>Every action that touches stock, money or a customer pauses as an approval card. Routine ones need the clerk; money and stock adjustments need the owner. Until someone taps, nothing has happened.</p></div>
+    <div class="card"><h3>3 · The record keeps itself</h3><p>Loading takes stock out. Closing a stop — with the customer’s own four-digit code — writes the invoice and the cash. The hand-in reconciles itself and names the stop to look at. The khata is never typed.</p></div>
+  </div>
+  <div class="chat" style="margin-top:28px">
+    <div class="me">Chaudhry Farms ko 20 urea aur 5 dap bhej do</div>
+    <div class="bot approval"><b>Order Munshi · create order <span class="pill clerk">clerk</span></b>Create order for Chaudhry Farms: 20 × Urea 50kg, 5 × DAP 50kg — Rs 108,250<div class="btns"><span class="ok">Approve</span><span class="no">Reject</span></div></div>
+    <div class="me">DSP-8AF62C43 driver handed 45000</div>
+    <div class="bot"><b>Hisaab Munshi</b>Expected Rs 50,000, counted Rs 45,000, variance <span style="color:var(--crit)">Rs −5,000</span>. Look first at: Chaudhry Farms (cash Rs 50,000).</div>
+    <div class="me">pay Fauji 100000 by bank</div>
+    <div class="bot"><b>Khareed Munshi</b>Supplier payments need the owner’s approval.</div>
+  </div>
+</div></section>
+
+<section class="alt" id="team"><div class="wrap">
+  <div class="eyebrow">The team</div>
+  <h2>Seven munshis. One job each. One set of keys each.</h2>
+  <div class="team" style="margin-top:22px">
+    <div class="card"><b>Order Munshi</b><p>Takes orders from chat or voice, matches real SKUs, checks credit, drafts.</p><small><span class="pill clerk">clerk approves</span> big orders escalate to the owner</small></div>
+    <div class="card"><b>Godown Munshi</b><p>Allocates against real stock, plans vans by route and capacity, moves stock between godowns.</p><small><span class="pill clerk">clerk</span> stock adjustments <span class="pill owner">owner</span></small></div>
+    <div class="card"><b>Delivery Munshi</b><p>The driver’s stops, in order; closes each with what was delivered, returned and collected.</p><small><span class="pill otp">customer’s OTP</span> the driver never sees the code</small></div>
+    <div class="card"><b>Hisaab Munshi</b><p>Reconciles the driver’s cash, records office payments (cash, bank, JazzCash, Easypaisa) and expenses.</p><small><span class="pill clerk">clerk</span> credit notes <span class="pill owner">owner</span></small></div>
+    <div class="card"><b>Khareed Munshi</b><p>Receives stock from suppliers with the bill on their account; tracks what you owe.</p><small><span class="pill clerk">receive</span> pay supplier <span class="pill owner">owner</span></small></div>
+    <div class="card"><b>Wasooli Munshi</b><p>Ages the khata, drafts reminders in the right tone, logs promises and flags the broken ones.</p><small><span class="pill clerk">approve & send</span> never free text</small></div>
+    <div class="card"><b>Report Munshi</b><p>Sales, margin, collections, cashbook, stock value, slow stock, top customers.</p><small><span class="pill">read-only</span> cannot change anything</small></div>
+    <div class="card"><b>Manager</b><p>Reads every message and hands it to the right munshi.</p><small><span class="pill">routes only</span> never acts</small></div>
+  </div>
+</div></section>
+
+<section id="roles"><div class="wrap">
+  <div class="eyebrow">Four roles, four apps in one</div>
+  <h2>Everyone gets their own screen. Nobody gets someone else’s keys.</h2>
+  <div class="grid g2" style="margin-top:22px">
+    <div class="card"><h3>Owner</h3><p><b>Today</b> at a glance: orders, deliveries, cash collected vs. handed in, receivables by age, payables, low stock. Approves money and stock. Manages staff, routes, vans, settings. Gets the 8pm digest on WhatsApp. Downloads a backup any time.</p></div>
+    <div class="card"><h3>Clerk (munshi)</h3><p>A <b>desk</b> that shows the work in order — drafts to confirm, confirmed to allocate, allocated to plan, vans to reconcile — plus chat, approvals, khata, purchases, expenses, reminders and reports.</p></div>
+    <div class="card"><h3>Salesman</h3><p><b>Book order</b> at the counter with the customer’s balance and limit in view, log a promise to pay, check stock. Drafts wait for the office; he approves nothing and sees no cost prices.</p></div>
+    <div class="card"><h3>Driver</h3><p><b>Stops</b> in route order with address and phone. Big fields for cash and the customer’s code. Works with no signal and syncs itself. Never sees balances or the code.</p></div>
+  </div>
+  <div class="screens" style="margin-top:26px">
+    <figure><img src="img/18-owner-today.png" alt="Owner Today screen"><figcaption>Owner · Today</figcaption></figure>
+    <figure><img src="img/02-clerk-desk.png" alt="Clerk desk"><figcaption>Clerk · Desk</figcaption></figure>
+    <figure><img src="img/10-salesman-book.png" alt="Salesman book order"><figcaption>Salesman · Book</figcaption></figure>
+    <figure><img src="img/09-driver-offline-queued.png" alt="Driver stops, offline"><figcaption>Driver · offline</figcaption></figure>
+    <figure><img src="img/27-owner-today-urdu.png" alt="Today in Urdu"><figcaption>اردو</figcaption></figure>
+  </div>
+</div></section>
+
+<section class="alt"><div class="wrap">
+  <div class="eyebrow">Why owners trust it</div>
+  <h2>Built for the fear that keeps the phone in your hand.</h2>
+  <div class="grid g3" style="margin-top:22px">
+    <div class="card"><h3>Approval by construction</h3><p>Gating isn’t a prompt asking the AI to be careful. Every stock- or money-changing tool pauses the agent before it runs; a person with the right role resumes it. A test suite proves un-gating one tool fails the build.</p></div>
+    <div class="card"><h3>The customer holds the key</h3><p>Each delivery gets a four-digit code sent to the customer. A stop cannot close without it. The driver never sees it. That’s proof of delivery you don’t have to argue about.</p></div>
+    <div class="card"><h3>Every action has a name</h3><p>Who asked, which munshi did it, who approved, when — in an audit log you can read and export. Nothing is ever deleted.</p></div>
+    <div class="card"><h3>Your data is a file you can hold</h3><p>One SQLite file per business. Download it from Settings, open it anywhere, or run the whole thing on your own PC with one command. No lock-in is the point.</p></div>
+    <div class="card"><h3>Real sign-in</h3><p>Phone + PIN per person, hashed, five wrong tries and you wait. Lost a phone? Sign that person out from yours in one tap.</p></div>
+    <div class="card"><h3>No free text to customers</h3><p>Reminders, codes, invoices and receipts are templates you approve. No AI ever composes a message to your customer.</p></div>
+  </div>
+</div></section>
+
+<section id="pricing"><div class="wrap">
+  <div class="eyebrow">Pricing</div>
+  <h2>Less than a day of a clerk’s salary.</h2>
+  <p class="lead">It pays for itself the first time a driver’s hand-in comes up short.</p>
+  <div class="price">
+    <div class="card"><span class="pill">Dukaan</span><div class="amt">Free</div><ul><li>1 user</li><li>Orders, khata, reports</li><li>Excel export</li><li>Offline rule-based chat</li></ul><a class="btn" href="https://github.com/azamali992/munshi#run-it">Start</a></div>
+    <div class="card hot"><span class="pill clerk">Munshi</span><div class="amt num">Rs 4,000 <small>/ month</small></div><ul><li>Up to 6 users, all roles</li><li>All seven munshis, hosted AI</li><li>WhatsApp codes, invoices, reminders</li><li>Daily backup, 8pm digest</li></ul><a class="btn primary" href="mailto:azamaliafzal992@gmail.com?subject=Munshi">Start free month</a></div>
+    <div class="card"><span class="pill">Distributor</span><div class="amt num">Rs 9,000 <small>/ month</small></div><ul><li>Up to 20 users, 3 godowns</li><li>Priority WhatsApp support</li><li>Monthly Excel pack</li><li>5,000 messages / month</li></ul><a class="btn" href="mailto:azamaliafzal992@gmail.com?subject=Munshi%20Distributor">Talk to us</a></div>
+    <div class="card"><span class="pill">Self-hosted</span><div class="amt num">Rs 25,000 <small>/ year</small></div><ul><li>On your own PC or server</li><li>Unlimited users</li><li>Updates and support</li><li>Open source (MIT)</li></ul><a class="btn" href="https://github.com/azamali992/munshi/blob/main/docs/DEPLOYMENT.md">Deploy guide</a></div>
+  </div>
+</div></section>
+
+<section class="alt" id="faq"><div class="wrap">
+  <div class="eyebrow">FAQ</div>
+  <h2>Questions owners ask</h2>
+  <details open><summary>Will my munshi actually use it?</summary><p>He gets the easiest job in the app: he types what he already hears and taps Approve. He stops re-entering, stops arguing with drivers about cash, and every action carries his name — which protects him too.</p></details>
+  <details><summary>Internet on the route is bad.</summary><p>The driver’s screen is built for that. He closes the stop, it saves on the phone, and it sends itself when the signal comes back. Nothing is entered twice.</p></details>
+  <details><summary>Does it understand Urdu?</summary><p>Orders in Urdu, English or both. The whole app switches to اردو in Settings. Reminders reach customers in Roman Urdu.</p></details>
+  <details><summary>I already use a khata app.</summary><p>A khata app is a ledger you type into. Munshi creates the entries from deliveries and payments, so the khata is always right — and it also runs the godown, the vans, the suppliers and the reminders.</p></details>
+  <details><summary>Where is my data?</summary><p>In a single file that belongs to your business. Download it any time, or run Munshi on your own PC. The code is open source under MIT.</p></details>
+  <details><summary>What if a phone is stolen?</summary><p>The owner signs that person out from his own phone in one tap. PINs are never stored on the phone.</p></details>
+  <details><summary>What does the AI cost me?</summary><p>Nothing extra. The hosted plans include it. The free plan uses a rule-based assistant that understands your catalogue and the common commands, with no AI key at all.</p></details>
+</div></section>
+
+<footer><div class="wrap"><span>© 2026 Munshi · built by <a href="https://github.com/azamali992">Azam Ali Afzal</a> · <a href="https://github.com/azamali992/munshi">source</a> · <a href="https://github.com/azamali992/munshi/blob/main/docs/SECURITY.md">security</a> · <a href="privacy.html">privacy</a></span><span>Sultan Traders and every name in the demo are fictional.</span></div></footer>
+</body>
+</html>

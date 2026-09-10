@@ -1,4 +1,5 @@
 import pytest
+
 from munshi.domain.repository import CapacityError, CreditHoldError, InsufficientStockError, OtpError, StateError
 from munshi.domain.seed import seeded_repository
 
