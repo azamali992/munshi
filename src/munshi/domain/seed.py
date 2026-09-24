@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-from munshi.domain.models import Customer, Product, Route, Supplier, Vehicle, Warehouse
+from munshi.domain.models import Customer, Product, Route, Supplier, Vehicle, Warehouse, to_paisa
 from munshi.domain.repository import MunshiRepository
 
 PRODUCTS = [
@@ -92,24 +92,26 @@ def seed(repo: MunshiRepository) -> MunshiRepository:
     for wh, levels in STOCK.items():
         for sku, qty in levels.items():
             repo.set_stock(wh, sku, qty, 0)
-    # backdated ledger so aging has teeth
-    conn = repo._conn
-    for i, (cust, amt, days_ago, paid) in enumerate(HISTORY):
-        inv_day = date.today() - timedelta(days=days_ago)
-        created = f"{inv_day.isoformat()}T10:00:00+00:00"
-        due = (inv_day + timedelta(days=30)).isoformat()
-        conn.execute("INSERT INTO ledger (entry_id, customer_id, kind, amount, ref, due_date, created_at, method, received_by) VALUES (?,?,?,?,?,?,?,?,?)",
-                     (f"INV-SEED{i:02d}", cust, "invoice", float(amt), f"SEED-{i:02d}", due, created, "", ""))
-        if paid:
-            pay_day = inv_day + timedelta(days=min(max(days_ago - 1, 0), 15))
+    # backdated history (pre-Munshi paper records, so no gapless numbers) so aging has teeth.
+    # Written directly because it is backdated; amounts are integer paisa like every stored amount.
+    with repo._tx() as conn:
+        for i, (cust, amt, days_ago, paid) in enumerate(HISTORY):
+            inv_day = date.today() - timedelta(days=days_ago)
+            created = f"{inv_day.isoformat()}T10:00:00+00:00"
+            due = (inv_day + timedelta(days=30)).isoformat()
             conn.execute("INSERT INTO ledger (entry_id, customer_id, kind, amount, ref, due_date, created_at, method, received_by) VALUES (?,?,?,?,?,?,?,?,?)",
-                         (f"PAY-SEED{i:02d}", cust, "payment", -float(paid), f"SEED-{i:02d}", None, f"{pay_day.isoformat()}T16:00:00+00:00", "bank", "office"))
-    # a supplier bill partly paid, and a few expenses, so payables and the cashbook aren't empty
-    conn.execute("INSERT INTO supplier_ledger VALUES (?,?,?,?,?,?,?)", ("BIL-SEED00", "S-001", "bill", 1_440_000.0, "PUR-SEED00", "", f"{(date.today() - timedelta(days=6)).isoformat()}T11:00:00+00:00"))
-    conn.execute("INSERT INTO supplier_ledger VALUES (?,?,?,?,?,?,?)", ("SPY-SEED00", "S-001", "payment", -900_000.0, "PUR-SEED00", "bank", f"{(date.today() - timedelta(days=3)).isoformat()}T11:00:00+00:00"))
-    for j, (cat, amt, note) in enumerate([("fuel", 8500, "V-01 diesel"), ("loading", 1200, "godown labour"), ("utilities", 6400, "godown electricity")]):
-        conn.execute("INSERT INTO expenses VALUES (?,?,?,?,?,?,?,?)", (f"EXP-SEED{j:02d}", cat, float(amt), note, "cash", "Bilal", (date.today() - timedelta(days=j)).isoformat(), f"{(date.today() - timedelta(days=j)).isoformat()}T09:00:00+00:00"))
-    conn.commit()
+                         (f"INV-SEED{i:02d}", cust, "invoice", to_paisa(amt), f"SEED-{i:02d}", due, created, "", ""))
+            if paid:
+                pay_day = inv_day + timedelta(days=min(max(days_ago - 1, 0), 15))
+                conn.execute("INSERT INTO ledger (entry_id, customer_id, kind, amount, ref, due_date, created_at, method, received_by) VALUES (?,?,?,?,?,?,?,?,?)",
+                             (f"PAY-SEED{i:02d}", cust, "payment", -to_paisa(paid), f"SEED-{i:02d}", None, f"{pay_day.isoformat()}T16:00:00+00:00", "bank", "office"))
+        # a supplier bill partly paid, and a few expenses, so payables and the cashbook aren't empty
+        sup = "INSERT INTO supplier_ledger (entry_id, supplier_id, kind, amount, ref, method, created_at) VALUES (?,?,?,?,?,?,?)"
+        conn.execute(sup, ("BIL-SEED00", "S-001", "bill", to_paisa(1_440_000), "PUR-SEED00", "", f"{(date.today() - timedelta(days=6)).isoformat()}T11:00:00+00:00"))
+        conn.execute(sup, ("SPY-SEED00", "S-001", "payment", -to_paisa(900_000), "PUR-SEED00", "bank", f"{(date.today() - timedelta(days=3)).isoformat()}T11:00:00+00:00"))
+        for j, (cat, amt, note) in enumerate([("fuel", 8500, "V-01 diesel"), ("loading", 1200, "godown labour"), ("utilities", 6400, "godown electricity")]):
+            conn.execute("INSERT INTO expenses (expense_id, category, amount, note, method, paid_by, expense_date, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                         (f"EXP-SEED{j:02d}", cat, to_paisa(amt), note, "cash", "Bilal", (date.today() - timedelta(days=j)).isoformat(), f"{(date.today() - timedelta(days=j)).isoformat()}T09:00:00+00:00"))
     return repo
 
 
