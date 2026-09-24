@@ -59,18 +59,40 @@ class ReportsMixin(CollectionsMixin):
         rows = self._all("SELECT * FROM orders WHERE " + sql_business_date("created_at") + "=? ORDER BY created_at DESC, rowid DESC LIMIT ?", (day, limit))
         return [self._order_from_row(r) for r in rows]
 
+    def _credit_notes(self, start: str, end: str) -> list:
+        """Credit notes POSTED in [start, end] (Pakistan business day of the posting, not of any invoice they
+        relate to: a credit note is effective when issued, never retroactive). Includes reversals of credit
+        notes, which keep kind='credit_note' with the opposite (positive) amount, so a reversed pair nets to
+        zero from the reversal's day on. Khata sign: negative. The one definition of "credit notes in the
+        period" for every report (sales_report, profit_summary, collection_report)."""
+        return self.ledger_between(start, end, "credit_note")
+
     def _sales_paisa(self, start: str, end: str) -> dict:
-        """The sales figures in paisa: revenue from the khata's invoices (net of reversals, which land on
-        the day they are posted), cost of goods from the sale_lines cost snapshots."""
+        """The sales figures in paisa: revenue = invoices - credit notes (both net of reversals, which land on
+        the day they are posted), cost of goods from the sale_lines cost snapshots.
+
+        Accounting treatment of a credit note: a sales allowance, i.e. a reduction of REVENUE only. It
+        reduces gross margin (and net) rupee for rupee and leaves cost of goods sold untouched: the goods
+        were not returned to stock (damaged bags the customer keeps or discards, a price concession). A
+        physical return is a different mechanism (close_stop's returned lines put units back on the shelf
+        at their load cost and are never invoiced), so there is no double count between the two.
+
+        Breakdowns: a credit note is dated and belongs to a customer, so it is netted into by_day (the day it
+        was posted) and by_cust; by_day therefore always sums to revenue. It carries no SKU and no order, so
+        by_sku and by_booker stay gross invoiced figures (what was sold, and who booked it)."""
         invoices = [e for e in self.ledger_between(start, end, "invoice") if e.method != "adjustment"]   # opening balances aren't sales
-        revenue = sum(_p(e) for e in invoices)
+        credit_notes = self._credit_notes(start, end)
+        gross = sum(_p(e) for e in invoices)
+        credits = -sum(_p(e) for e in credit_notes)          # positive = revenue given back
+        revenue = gross - credits
         by_day: dict[str, int] = {}
         by_cust: dict[str, int] = {}
         by_booker: dict[str, int] = {}
-        for e in invoices:
+        for e in invoices + credit_notes:                    # credit notes carry a negative amount: they net in
             d = to_business_date(e.created_at).isoformat()
             by_day[d] = by_day.get(d, 0) + _p(e)
             by_cust[e.customer_id] = by_cust.get(e.customer_id, 0) + _p(e)
+        for e in invoices:
             if e.ref.startswith("ORD-"):
                 try:
                     who = self.get_order(e.ref).created_by or "office"
@@ -84,21 +106,22 @@ class ReportsMixin(CollectionsMixin):
                            + sql_business_date("created_at") + " BETWEEN ? AND ? GROUP BY sku", (start, end)):
             by_sku[r["sku"]] = {"qty": int(r["q"]), "revenue": int(r["rev"]), "cost": int(r["cost"])}
             cost += int(r["cost"])
-        return {"revenue": revenue, "invoices": sum(1 for e in invoices if not e.reversal_of), "cost": cost,
+        return {"revenue": revenue, "gross": gross, "credits": credits, "invoices": sum(1 for e in invoices if not e.reversal_of), "cost": cost,
                 "by_day": by_day, "by_cust": by_cust, "by_booker": by_booker, "by_sku": by_sku}
 
     def sales_report(self, start: str, end: str) -> dict:
-        """Invoiced sales between two dates, by day, product and customer, with gross margin at the cost of the
-        goods when they were sold (moving average, snapshotted), never at today's cost."""
+        """Sales between two dates, net of credit notes, by day, product and customer, with gross margin at the
+        cost of the goods when they were sold (moving average, snapshotted), never at today's cost.
+        revenue = gross_invoiced - credit_notes; by_product / by_booker are gross (see _sales_paisa)."""
         s = self._sales_paisa(start, end)
         revenue, cost = s["revenue"], s["cost"]
         prods = {p.sku: p for p in self.list_products(include_inactive=True)}
         names = {c.customer_id: c.name for c in self.list_customers(include_inactive=True)}
         by_product = [{"sku": k, "name": prods[k].name if k in prods else k, "qty": v["qty"], "revenue": to_rupees(v["revenue"]), "cost": to_rupees(v["cost"]),
                        "margin": to_rupees(v["revenue"] - v["cost"])} for k, v in s["by_sku"].items()]
-        return {"start": start, "end": end, "revenue": to_rupees(revenue), "invoices": s["invoices"],
-                "cost_of_goods": to_rupees(cost), "gross_margin": to_rupees(revenue - cost),
-                "margin_pct": round((revenue - cost) / revenue * 100, 1) if revenue else 0.0,
+        return {"start": start, "end": end, "revenue": to_rupees(revenue), "gross_invoiced": to_rupees(s["gross"]), "credit_notes": to_rupees(s["credits"]),
+                "invoices": s["invoices"], "cost_of_goods": to_rupees(cost), "gross_margin": to_rupees(revenue - cost),
+                "margin_pct": round((revenue - cost) / revenue * 100, 1) if revenue > 0 else 0.0,
                 "by_day": [{"date": d, "revenue": to_rupees(v)} for d, v in sorted(s["by_day"].items())],
                 "by_product": sorted(by_product, key=lambda r: -r["revenue"]),
                 "by_customer": sorted([{"customer_id": k, "name": names.get(k, k), "revenue": to_rupees(v)} for k, v in s["by_cust"].items()], key=lambda r: -r["revenue"])[:20],
@@ -121,7 +144,7 @@ class ReportsMixin(CollectionsMixin):
         by_method: dict[str, int] = {}
         for e in payments:
             m = e.method or "cash"; by_method[m] = by_method.get(m, 0) - _p(e)
-        credits = -sum(_p(e) for e in self.ledger_between(start, end, "credit_note"))
+        credits = -sum(_p(e) for e in self._credit_notes(start, end))
         return {"start": start, "end": end, "invoiced": to_rupees(invoiced), "collected": to_rupees(collected), "credit_notes": to_rupees(credits),
                 "collection_rate_pct": round(collected / invoiced * 100, 1) if invoiced else 0.0,
                 "by_method": {k: to_rupees(v) for k, v in by_method.items()}, "aging": self.aging_summary()}
@@ -186,5 +209,6 @@ class ReportsMixin(CollectionsMixin):
         by_cat: dict[str, int] = {}
         for x in self.expenses_between(start, end): by_cat[x.category] = by_cat.get(x.category, 0) + to_paisa(x.amount)
         exp_total = sum(by_cat.values())
-        return {"start": start, "end": end, "revenue": to_rupees(s["revenue"]), "cost_of_goods": to_rupees(s["cost"]), "gross_margin": to_rupees(margin),
+        return {"start": start, "end": end, "revenue": to_rupees(s["revenue"]), "credit_notes": to_rupees(s["credits"]),
+                "cost_of_goods": to_rupees(s["cost"]), "gross_margin": to_rupees(margin),
                 "expenses": to_rupees(exp_total), "expenses_by_category": {k: to_rupees(v) for k, v in by_cat.items()}, "net": to_rupees(margin - exp_total)}
