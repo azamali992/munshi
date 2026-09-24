@@ -48,6 +48,16 @@ async def approve_last(page):
     await page.locator("[data-aid] [data-act=approve]").last.click(); await page.wait_for_timeout(700)
 
 
+async def approve_last_as_owner(page, back_to):
+    """The current (clerk) session just requested an action it can't approve itself
+    (four-eyes: the demo has one clerk, so the owner is the other eligible approver).
+    Switches to owner, approves via the Approvals list, then signs back in as `back_to`."""
+    await login(page, "owner")
+    await goto(page, "approvals", "#alist")
+    await approve_last(page)
+    await login(page, back_to)
+
+
 async def main():
     async with async_playwright() as p:
         browser = await p.chromium.launch()
@@ -59,11 +69,18 @@ async def main():
         # ---- sign-in screen
         await page.goto(BASE); await page.wait_for_selector("[name=phone]"); await shot(page, "01-login")
 
-        # ---- clerk: desk, order via chat, approve, confirm/allocate via buttons
+        # ---- clerk: desk, order via chat. Four-eyes: whoever REQUESTS an order/plan can no
+        # longer approve, confirm or allocate it themselves, so the owner steps in for those
+        # specific clicks below (the demo has only one clerk). Screenshots stay on whichever
+        # role is actually driving that click, so 04/05/06 now show the owner, not the clerk.
         await login(page, "clerk"); await shot(page, "02-clerk-desk")
         await say(page, "Chaudhry Farms ko 20 urea aur 5 dap bhej do"); await shot(page, "03-chat-order-approval")
-        await approve_last(page)
-        txt = await page.locator("#msgs").inner_text(); oid = re.search(r"ORD-[A-Z0-9]{8}", txt).group(0)
+        # the order doesn't exist yet -- it's still a pending request, no ORD- id until approved
+
+        await login(page, "owner")   # the clerk requested this order: only the owner can approve/confirm/allocate it
+        await goto(page, "approvals", "#alist"); await approve_last(page)
+        await goto(page, "orders", ".item.tap")   # newest first: the one just approved
+        oid = (await page.locator(".item.tap").first.get_attribute("href")).split("/")[-1]
         await goto(page, f"order/{oid}", "#confirm"); await shot(page, "04-order-detail")
         await page.click("#confirm"); await page.wait_for_selector("[data-wh]"); await page.locator("[data-wh]").first.click(); await page.wait_for_timeout(600)
         # second order from a salesman, confirmed by clerk in Approvals later
@@ -100,9 +117,10 @@ async def main():
             await approve_last(page)
         await goto(page, f"plan/{did}", "#dep"); await page.click("#dep"); await page.wait_for_selector("#sheetForm")
         await page.fill("[name=amount_counted]", "45000"); await page.click("#sheetForm button[type=submit]"); await page.wait_for_timeout(800); await shot(page, "13-reconcile-short")
-        await say(page, "Received 100 urea from Fauji at 3600 bill FF-2291"); await approve_last(page)
-        await say(page, "Chaudhry Farms paid 20000 jazzcash"); await approve_last(page); await shot(page, "14-chat-payment")
-        await say(page, "Remind everyone over 30 days"); await approve_last(page)
+        await say(page, "Received 100 urea from Fauji at 3600 bill FF-2291"); await approve_last_as_owner(page, "clerk")
+        await say(page, "Chaudhry Farms paid 20000 jazzcash"); await approve_last_as_owner(page, "clerk")
+        await goto(page, "chat", "#txt"); await shot(page, "14-chat-payment")
+        await say(page, "Remind everyone over 30 days"); await approve_last_as_owner(page, "clerk")
         await goto(page, "reminders", "#rl"); await shot(page, "15-reminders")
         await page.locator("[data-send]").first.click(); await page.wait_for_timeout(600)
         await goto(page, "outbox", "#ol"); await shot(page, "16-outbox")
