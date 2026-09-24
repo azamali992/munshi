@@ -96,10 +96,10 @@ def test_same_phone_two_businesses_and_switch(reg):
     reg.create_user(b2["business_id"], "Ali", "03001234567", "clerk", "2580")
     token, p, others = reg.authenticate("03001234567", "2580")
     assert p.role == "owner" and [o["name"] for o in others] == ["Second Traders"]
-    t2, p2 = reg.switch_business(p, b2["business_id"])
+    t2, p2 = reg.switch_business(p, b2["business_id"], pin="2580")
     assert p2.role == "clerk" and reg.resolve(t2).business_id == b2["business_id"]
     with pytest.raises(AuthError):
-        reg.switch_business(p, "B-NOPE")
+        reg.switch_business(p, "B-NOPE", pin="2580")
 
 
 def test_deactivated_user_and_business(reg):
