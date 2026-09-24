@@ -60,7 +60,7 @@ def test_duplicate_delivered_lines_are_invoiced_once_at_the_combined_quantity(re
     r = repo.close_stop(st.stop_id, [{"sku": "UREA-50", "qty": 12}, {"sku": "UREA-50", "qty": 8}], [], 0, st.otp, "delivery_munshi")
     assert r["status"] == "delivered" and r["invoiced"] == 20 * UREA_PRICE_C002
     inv = _ledger(repo, "invoice", order.order_id)
-    assert len(inv) == 1 and inv[0]["amount"] == 20 * UREA_PRICE_C002
+    assert len(inv) == 1 and inv[0]["amount"] == 20 * UREA_PRICE_C002 * 100      # stored as integer paisa (V5)
     assert repo.get_stop(st.stop_id).delivered_items == [{"sku": "UREA-50", "qty": 20}]
 
 
@@ -75,7 +75,7 @@ def test_repeated_delivered_line_is_never_multiplied_into_the_invoice(repo):
     # the honest close still works afterwards and bills the order exactly once
     r = repo.close_stop(st.stop_id, lines[:2], [], 0, st.otp, "delivery_munshi")
     assert r["invoiced"] == order.total == 20 * UREA_PRICE_C002 + 2 * DAP_PRICE_C002
-    assert [e["amount"] for e in _ledger(repo, "invoice", order.order_id)] == [order.total]
+    assert [e["amount"] for e in _ledger(repo, "invoice", order.order_id)] == [order.total_paisa]     # raw row: integer paisa
 
 
 def test_return_of_product_never_loaded_is_rejected(repo):

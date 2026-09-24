@@ -10,7 +10,11 @@ import html
 import io
 from dataclasses import asdict
 
+from munshi.domain.models import to_paisa, to_rupees
 from munshi.domain.repository import MunshiRepository, NotFoundError
+
+# Plain statement until the FBR e-invoicing integration (NTN/STRN, tax lines, QR code) exists.
+TAX_DISCLAIMER = "Not a tax invoice. For FBR e-invoicing see fbr.gov.pk."
 
 
 def sign(secret: bytes, entry_id: str) -> str:
@@ -21,34 +25,44 @@ def verify(secret: bytes, entry_id: str, sig: str) -> bool:
     return hmac.compare_digest(sign(secret, entry_id), sig)
 
 
+def _kind(e) -> str:
+    if e.reversal_of: return "Reversal"
+    return "Invoice" if e.kind == "invoice" else "Receipt" if e.kind == "payment" else "Credit note"
+
+
 def invoice_data(repo: MunshiRepository, entry_id: str) -> dict:
-    """Everything the document needs, from the ledger entry (invoice or receipt)."""
+    """Everything the document needs, from the ledger entry (invoice, receipt, credit note or reversal).
+    `number` is the printed document number: the gapless doc_no (e.g. INV-2026-000001); documents
+    from before gapless numbering print their original id."""
     e = repo.get_ledger_entry(entry_id)
     cust = repo.get_customer(e.customer_id)
     biz = repo.settings()
     lines: list[dict] = []
     stop = None
-    if e.kind == "invoice" and e.ref.startswith("ORD-"):
+    if e.kind == "invoice" and not e.reversal_of and e.ref.startswith("ORD-"):
         try:
-            order = repo.get_order(e.ref)
-            st = repo._one("SELECT * FROM stops WHERE order_id=? AND status IN ('delivered','short') ORDER BY closed_at DESC", (e.ref,))
-            if st:
-                import json
-                delivered = {d["sku"]: int(d["qty"]) for d in json.loads(st["delivered_items"])}
-                stop = dict(st)
-            else:
-                delivered = {i.sku: i.qty for i in order.items}
-            for it in order.items:
-                q = delivered.get(it.sku, 0)
-                if q:
-                    p = repo.get_product(it.sku)
-                    lines.append({"sku": it.sku, "name": p.name, "unit": p.unit, "qty": q, "unit_price": it.unit_price, "total": round(q * it.unit_price, 2)})
+            sold = repo.invoice_lines(e.entry_id)          # the sale record written when the stop closed
+            if sold:
+                for ln in sold:
+                    p = repo.get_product(ln["sku"])
+                    lines.append(ln | {"name": p.name, "unit": p.unit})
+            else:                                          # invoices from before the sale record existed
+                order = repo.get_order(e.ref)
+                closed = [s for s in repo.list_stops_for_order(e.ref) if s.status in ("delivered", "short")]
+                delivered = {d["sku"]: int(d["qty"]) for d in closed[0].delivered_items} if closed else {i.sku: i.qty for i in order.items}
+                for it in order.items:
+                    q = delivered.get(it.sku, 0)
+                    if q:
+                        p = repo.get_product(it.sku)
+                        lines.append({"sku": it.sku, "name": p.name, "unit": p.unit, "qty": q, "unit_price": it.unit_price, "total": to_rupees(q * to_paisa(it.unit_price))})
+            closed = [s for s in repo.list_stops_for_order(e.ref) if s.status in ("delivered", "short")]
+            stop = closed[0] if closed else None
         except NotFoundError:
             pass
     balance = repo.outstanding(cust.customer_id)
-    return {"entry": asdict(e), "kind": "Invoice" if e.kind == "invoice" else "Receipt" if e.kind == "payment" else "Credit note",
+    return {"entry": asdict(e), "kind": _kind(e), "number": e.doc_no or e.entry_id,
             "customer": asdict(cust), "business": biz, "lines": lines, "amount": abs(e.amount), "balance_after": balance,
-            "paid_on_delivery": (stop or {}).get("cash_collected", 0) if stop else 0}
+            "paid_on_delivery": stop.cash_collected if stop else 0, "disclaimer": TAX_DISCLAIMER}
 
 
 def render_html(d: dict, public_url: str = "") -> str:
@@ -59,7 +73,7 @@ def render_html(d: dict, public_url: str = "") -> str:
     ref = esc(e["ref"] or "")
     method = f"<p><b>Method:</b> {esc(e['method'])}</p>" if e.get("method") and e["kind"] == "payment" else ""
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{esc(d['kind'])} {esc(e['entry_id'])} · {esc(b['business_name'])}</title>
+<title>{esc(d['kind'])} {esc(d['number'])} · {esc(b['business_name'])}</title>
 <style>
 body{{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#f4f2ec;color:#1b1b1b}}
 .sheet{{max-width:680px;margin:0 auto;background:#fff;padding:28px 26px 34px}}
@@ -73,16 +87,17 @@ th,td{{padding:8px 6px;border-bottom:1px solid #e5e5e5;text-align:left;vertical-
 @media print{{body{{background:#fff}}.sheet{{padding:0}}}}
 </style></head><body><div class="sheet">
 <div class="head"><div><h1>{esc(b['business_name'])}</h1><div class="muted">{esc(b.get('city',''))}{' · ' + esc(b['phone']) if b.get('phone') else ''}</div></div>
-<div style="text-align:right"><span class="badge">{esc(d['kind']).upper()}</span><div style="font-weight:700;margin-top:6px">{esc(e['entry_id'])}</div><div class="muted">{esc(e['created_at'][:10])}</div></div></div>
+<div style="text-align:right"><span class="badge">{esc(d['kind']).upper()}</span><div style="font-weight:700;margin-top:6px">{esc(d['number'])}</div><div class="muted">{esc(e['created_at'][:10])}</div></div></div>
 <h2>Customer</h2><div><b>{esc(c['name'])}</b> · {esc(c['customer_id'])}<br><span class="muted">{esc(c.get('address') or '')}{' · ' if c.get('address') else ''}{esc(c['phone'])}</span></div>
 {lines_block}
 <div class="total">{esc(d['kind'])} amount: Rs {d['amount']:,.0f}</div>
 {f"<p class=muted>Paid on delivery: Rs {d['paid_on_delivery']:,.0f}</p>" if d['paid_on_delivery'] else ''}
 {method}
 {f"<p class=muted>Ref: {ref}</p>" if ref else ''}
+{f"<p class=muted>Reverses: {esc(e['reversal_of'])}</p>" if e.get('reversal_of') else ''}
 {f"<p class=muted>Due: {esc(e['due_date'])}</p>" if e.get('due_date') and e['kind'] == 'invoice' else ''}
 <p><b>Balance on account after this {esc(d['kind']).lower()}: Rs {d['balance_after']:,.0f}</b></p>
-<div class="foot">Generated by Munshi for {esc(b['business_name'])}. {('Verify online: ' + esc(public_url)) if public_url else ''}</div>
+<div class="foot">{esc(d.get('disclaimer') or TAX_DISCLAIMER)}<br>Generated by Munshi for {esc(b['business_name'])}. {('Verify online: ' + esc(public_url)) if public_url else ''}</div>
 </div></body></html>"""
 
 
@@ -95,13 +110,13 @@ def render_pdf(d: dict) -> bytes:
 
     b, c, e = d["business"], d["customer"], d["entry"]
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm, topMargin=16 * mm, bottomMargin=16 * mm, title=f"{d['kind']} {e['entry_id']}")
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm, topMargin=16 * mm, bottomMargin=16 * mm, title=f"{d['kind']} {d['number']}")
     ss = getSampleStyleSheet()
     h = ParagraphStyle("h", parent=ss["Title"], fontSize=18, alignment=0, spaceAfter=2)
     muted = ParagraphStyle("m", parent=ss["Normal"], textColor=colors.HexColor("#666666"), fontSize=9)
     body = ss["Normal"]
     story = [Paragraph(html.escape(b["business_name"]), h), Paragraph(html.escape(f"{b.get('city', '')} {b.get('phone', '')}".strip()), muted), Spacer(1, 6),
-             Paragraph(f"<b>{d['kind'].upper()} {html.escape(e['entry_id'])}</b> · {e['created_at'][:10]}", body), Spacer(1, 10),
+             Paragraph(f"<b>{d['kind'].upper()} {html.escape(d['number'])}</b> · {e['created_at'][:10]}", body), Spacer(1, 10),
              Paragraph(f"<b>{html.escape(c['name'])}</b> ({c['customer_id']})", body), Paragraph(html.escape(f"{c.get('address') or ''} {c['phone']}".strip()), muted), Spacer(1, 10)]
     if d["lines"]:
         data = [["Item", "Qty", "Rate", "Amount"]] + [[f"{l['name']} ({l['sku']})", f"{l['qty']} {l['unit']}", f"{l['unit_price']:,.0f}", f"{l['total']:,.0f}"] for l in d["lines"]]
@@ -113,32 +128,35 @@ def render_pdf(d: dict) -> bytes:
     if d["paid_on_delivery"]: story.append(Paragraph(f"Paid on delivery: Rs {d['paid_on_delivery']:,.0f}", muted))
     if e.get("method") and e["kind"] == "payment": story.append(Paragraph(f"Method: {html.escape(e['method'])}", muted))
     if e.get("due_date") and e["kind"] == "invoice": story.append(Paragraph(f"Due: {e['due_date']}", muted))
-    story += [Spacer(1, 6), Paragraph(f"<b>Balance on account: Rs {d['balance_after']:,.0f}</b>", body), Spacer(1, 14), Paragraph("Generated by Munshi.", muted)]
+    story += [Spacer(1, 6), Paragraph(f"<b>Balance on account: Rs {d['balance_after']:,.0f}</b>", body), Spacer(1, 14), Paragraph(html.escape(d.get('disclaimer') or TAX_DISCLAIMER), muted), Paragraph("Generated by Munshi.", muted)]
     doc.build(story)
     return buf.getvalue()
 
 
 def whatsapp_text(d: dict, public_url: str = "") -> str:
     b, c, e = d["business"], d["customer"], d["entry"]
-    if e["kind"] == "invoice":
+    if e.get("reversal_of"):
+        txt = f"{b['business_name']}: {d['number']} reverses {e['reversal_of']} (Rs {d['amount']:,.0f}) on {c['name']}'s account. Balance: Rs {d['balance_after']:,.0f}."
+    elif e["kind"] == "invoice":
         items = ", ".join(f"{l['qty']} {l['name']}" for l in d["lines"][:6])
-        txt = f"{b['business_name']}: Invoice {e['entry_id']} for {c['name']} — Rs {d['amount']:,.0f}" + (f" ({items})" if items else "") + f". Balance: Rs {d['balance_after']:,.0f}."
+        txt = f"{b['business_name']}: Invoice {d['number']} for {c['name']} — Rs {d['amount']:,.0f}" + (f" ({items})" if items else "") + f". Balance: Rs {d['balance_after']:,.0f}."
     elif e["kind"] == "payment":
-        txt = f"{b['business_name']}: Rs {d['amount']:,.0f} received from {c['name']} ({e.get('method') or 'cash'}). Receipt {e['entry_id']}. Balance: Rs {d['balance_after']:,.0f}. Shukriya."
+        txt = f"{b['business_name']}: Rs {d['amount']:,.0f} received from {c['name']} ({e.get('method') or 'cash'}). Receipt {d['number']}. Balance: Rs {d['balance_after']:,.0f}. Shukriya."
     else:
-        txt = f"{b['business_name']}: Credit note {e['entry_id']} of Rs {d['amount']:,.0f} applied to {c['name']}. Balance: Rs {d['balance_after']:,.0f}."
+        txt = f"{b['business_name']}: Credit note {d['number']} of Rs {d['amount']:,.0f} applied to {c['name']}. Balance: Rs {d['balance_after']:,.0f}."
     return txt + (f" {public_url}" if public_url else "")
 
 
 def statement_html(repo: MunshiRepository, customer_id: str) -> str:
     c = repo.get_customer(customer_id); b = repo.settings()
     esc = html.escape
-    bal = 0.0; rows = []
+    bal_p = 0; rows = []
     for e in repo.ledger_for(customer_id):
-        bal += e.amount
-        deb = f"{e.amount:,.0f}" if e.amount > 0 else ""
-        cred = f"{-e.amount:,.0f}" if e.amount < 0 else ""
-        rows.append(f"<tr><td>{esc(e.created_at[:10])}</td><td>{esc(e.kind.replace('_', ' '))}<br><small>{esc(e.entry_id)}</small></td><td class=n>{deb}</td><td class=n>{cred}</td><td class=n>{bal:,.0f}</td></tr>")
+        amt_p = to_paisa(e.amount); bal_p += amt_p          # running balance in exact paisa
+        deb = f"{e.amount:,.0f}" if amt_p > 0 else ""
+        cred = f"{-e.amount:,.0f}" if amt_p < 0 else ""
+        label = ("reversal of " + e.reversal_of) if e.reversal_of else e.kind.replace('_', ' ')
+        rows.append(f"<tr><td>{esc(e.created_at[:10])}</td><td>{esc(label)}<br><small>{esc(e.doc_no or e.entry_id)}</small></td><td class=n>{deb}</td><td class=n>{cred}</td><td class=n>{to_rupees(bal_p):,.0f}</td></tr>")
     return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Statement · {esc(c.name)}</title>
 <style>body{{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#f4f2ec}}.sheet{{max-width:720px;margin:0 auto;background:#fff;padding:26px}}table{{width:100%;border-collapse:collapse;font-size:13px}}th,td{{padding:7px 5px;border-bottom:1px solid #e5e5e5;text-align:left}}.n{{text-align:right;font-variant-numeric:tabular-nums}}th{{font-size:11px;color:#666;text-transform:uppercase}}</style></head>
 <body><div class="sheet"><h1 style="margin:0">{esc(b['business_name'])}</h1><p style="color:#666;margin:2px 0 14px">Statement of account · {esc(c.name)} ({esc(c.customer_id)})</p>
