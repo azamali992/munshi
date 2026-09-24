@@ -64,6 +64,7 @@ def test_nightly_backup_writes_a_readable_copy(tmp_path, monkeypatch):
     assert len(files) == 1 and files[0].startswith("demo-")
     conn = sqlite3.connect(str(tmp_path / "backups" / files[0]))
     assert conn.execute("SELECT COUNT(*) FROM customers").fetchone()[0] == 10
+    conn.close()   # the tick below rewrites today's file; Windows can't unlink a file that is still open
     monkeypatch.setenv("MUNSHI_BACKUP_TIME", "02:30"); sent = {}
     assert scheduler_tick(hub, sent, datetime(2026, 9, 10, 2, 30)) == [] and sent["__backup__"] == "2026-09-10"
     hub.close()
