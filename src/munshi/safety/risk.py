@@ -98,3 +98,39 @@ def role_may_approve(role: str, tool_name: str) -> bool:
     if need == "none": return False
     if role == "owner": return True
     return role == "clerk" and need == "clerk"
+
+
+_RANK = {"none": 0, "clerk": 1, "owner": 2}
+
+
+def stricter_role(a: str, b: str) -> str:
+    """The more senior of two approver requirements. An approval's requirement
+    may be escalated between request and decision, never relaxed."""
+    return a if _RANK.get(a, 2) >= _RANK.get(b, 2) else b
+
+
+def same_person(a: str, b: str) -> bool:
+    return " ".join(a.split()).casefold() == " ".join(b.split()).casefold()
+
+
+def approval_refusal(role: str, tool_name: str, needs_role: str, approver: str, requester: str) -> str | None:
+    """Why this approver may not clear this action, or None if they may.
+
+    Four-eyes rule: whoever asked for a gated action cannot be the one who
+    clears it. The single exception is the owner: the owner is the business's
+    final authority and is always available as the second person for anyone
+    else's request, so a one-clerk shop routes the clerk's requests to the
+    owner, and an owner (often working alone) may clear their own.
+
+    Identity is compared only when the request carries one (web sessions
+    always do). A named request cannot be cleared by an unnamed approver: we
+    could not tell whether it is the same person."""
+    if not (role_may_approve(role, tool_name) and (role == "owner" or needs_role == "clerk")):
+        return f"{tool_name} needs {needs_role} approval; you are {role}"
+    if role == "owner" or not requester.strip():
+        return None
+    if not approver.strip():
+        return "this request was made by a named user; the approver must be signed in so we can tell it's someone else"
+    if same_person(approver, requester):
+        return f"you asked for this action, so someone else must approve it (another {needs_role} or the owner)"
+    return None

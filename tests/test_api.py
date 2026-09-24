@@ -21,7 +21,8 @@ def H(c, role):
 
 def _run_order_to_delivery(c, K):
     r = c.post("/api/chat", json={"thread_id": "m", "text": "Chaudhry Farms ko 20 urea bhej do"}, headers=K).json()
-    c.post(f"/api/approvals/{r['pending']['approval_id']}", json={"approve": True}, headers=K)
+    # four-eyes: the clerk who asked can't clear it; the demo has one clerk, so the owner does
+    assert c.post(f"/api/approvals/{r['pending']['approval_id']}", json={"approve": True}, headers=H(c, "owner")).status_code == 200
     oid = c.get("/api/orders?status=draft", headers=K).json()[0]["order_id"]
     assert c.post(f"/api/orders/{oid}/confirm", headers=K).json()["status"] == "confirmed"
     assert c.post(f"/api/orders/{oid}/allocate", json={}, headers=K).json()["status"] == "allocated"
@@ -66,14 +67,20 @@ def test_role_permissions_on_routes(c):
 
 
 def test_chat_approval_roundtrip_with_user_attribution(c):
-    K = H(c, "clerk")
+    K, O = H(c, "clerk"), H(c, "owner")
     r = c.post("/api/chat", json={"thread_id": "m", "text": "Chaudhry Farms ko 20 urea bhej do"}, headers=K).json()
     aid = r["pending"]["approval_id"]
-    assert r["pending"]["can_approve"] is True and r["pending"]["requested_by"] == "Bilal Hussain"
-    d = c.post(f"/api/approvals/{aid}", json={"approve": True}, headers=K).json()
+    assert r["pending"]["requested_by"] == "Bilal Hussain"
+    # the clerk who asked for it cannot clear it themselves
+    own = c.post(f"/api/approvals/{aid}", json={"approve": True}, headers=K)
+    assert own.status_code == 403 and "someone else" in own.json()["detail"]
+    assert [a["approval_id"] for a in c.get("/api/approvals", headers=K).json()] == [aid]
+    d = c.post(f"/api/approvals/{aid}", json={"approve": True}, headers=O).json()
     assert "ORD-" in d["text"] and c.get("/api/approvals", headers=K).json() == []
     audit = c.get("/api/audit", headers=K).json()
-    assert audit[0]["action"] == "create_order" and audit[0]["user"] == "Bilal Hussain"
+    assert audit[0]["action"] == "create_order" and audit[0]["user"] == "Sultan Ahmed"
+    hist = c.get("/api/approvals/history", headers=K).json()[0]
+    assert hist["requested_by"] == "Bilal Hussain" and hist["resolved_by"] == "Sultan Ahmed"
 
 
 def test_salesman_books_and_clerk_approves(c):

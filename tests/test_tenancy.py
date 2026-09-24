@@ -29,7 +29,7 @@ def test_pending_approval_survives_a_restart(tmp_path):
     hub2 = TenantHub(str(tmp_path)); hub2.ensure_demo()
     p2 = hub2.platform(DEMO_BUSINESS_ID)
     assert [x["approval_id"] for x in p2.list_pending()] == [aid]
-    out = p2.resolve(aid, True, "clerk", user="Bilal")
+    out = p2.resolve(aid, True, "owner", user="Sultan")          # a second person clears it (four-eyes)
     assert "ORD-" in out.text and len(p2.repo.list_orders()) == n + 1
     assert p2.list_pending() == []
     hub2.close()
