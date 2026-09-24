@@ -28,13 +28,19 @@ ACTION_TOOL = {
     "adjust_stock": "adjust_stock", "transfer_stock": "transfer_stock", "record_deposit": "record_deposit", "ledger_credit_note": "credit_note",
     "ledger_payment": "record_payment", "record_expense": "record_expense", "record_purchase": "record_purchase", "pay_supplier": "pay_supplier",
     "draft_reminder": "draft_reminder", "reminder_sent": "send_reminder", "log_promise": "log_promise",
+    "reverse_ledger_entry": "reverse_ledger_entry", "reverse_expense": "reverse_expense",
+    "reverse_purchase": "reverse_purchase", "reverse_supplier_entry": "reverse_supplier_entry",
+    # NOT mapped: "ledger_reversal" -- reverse_ledger_entry writes a second audit row (for the new
+    # reversal entry's own entity_id) alongside "reverse_ledger_entry" for the same approved call;
+    # mapping both would consume two approval_granted rows for one actually-approved action.
 }
 AGENT_ACTORS = {"order_munshi", "godown_munshi", "delivery_munshi", "hisaab_munshi", "khareed_munshi", "wasooli_munshi", "report_munshi"}
 # The invariant is defined by what an action DOES, independent of the risk registry, so a
 # bad registry edit cannot silently exempt a money/stock write from this check.
 ALWAYS_GATED = {"create_order", "confirm_order", "cancel_order", "allocate_order", "create_dispatch_plan", "approve_dispatch_plan",
                 "adjust_stock", "transfer_stock", "record_deposit", "record_payment", "record_expense", "credit_note",
-                "record_purchase", "pay_supplier", "draft_reminder", "send_reminder", "log_promise"}
+                "record_purchase", "pay_supplier", "draft_reminder", "send_reminder", "log_promise",
+                "reverse_ledger_entry", "reverse_expense", "reverse_purchase", "reverse_supplier_entry"}
 # one approval of the batch tool covers every row the batch produces, until the next unrelated write
 BATCH_COVERS = {"draft_due_reminders": "draft_reminder"}
 
