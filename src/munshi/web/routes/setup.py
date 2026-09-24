@@ -85,6 +85,19 @@ def _cust(c: Ctx, x: Customer) -> dict:
     return asdict(x) | {"outstanding": c.repo.outstanding(x.customer_id)}
 
 
+def _credit_ceiling(limit: float) -> float:
+    """A credit limit as a ceiling: 0 means no limit (see repository over_credit), i.e. unlimited."""
+    return float(limit) if limit and limit > 0 else float("inf")
+
+
+def _may_change_limit(c: Ctx, old: float, new: float) -> None:
+    """Extending credit is the owner's decision. A clerk may tighten a limit but not raise or
+    remove it: otherwise a clerk could lift a customer's limit and then confirm an order that
+    the credit hold had sent to the owner (the order-confirm route re-checks the hold too)."""
+    if c.role != "owner" and _credit_ceiling(new) > _credit_ceiling(old):
+        raise HTTPException(403, "raising or removing a customer's credit limit needs the owner")
+
+
 # ---------------------------------------------------------------- customers
 @router.get("/customers")
 def customers(q: str = "", include_inactive: bool = False, c: Ctx = Depends(context("customers:read"))):
@@ -108,6 +121,7 @@ def add_customer(body: CustomerIn, c: Ctx = Depends(context("customers:write")))
 @router.patch("/customers/{customer_id}")
 def edit_customer(customer_id: str, body: CustomerIn, c: Ctx = Depends(context("customers:write"))):
     old = c.repo.get_customer(customer_id)
+    _may_change_limit(c, old.credit_limit, body.credit_limit)
     if body.route_id: c.repo.get_route(body.route_id)
     x = c.repo.upsert_customer(Customer(old.customer_id, body.name, body.phone, body.tier, body.credit_limit, body.route_id, body.language, body.address, body.discount_pct, body.credit_days, body.active))
     changed = {k: v for k, v in asdict(x).items() if asdict(old).get(k) != v}

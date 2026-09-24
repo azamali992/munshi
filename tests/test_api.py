@@ -27,7 +27,8 @@ def _run_order_to_delivery(c, K):
     assert c.post(f"/api/orders/{oid}/confirm", headers=K).json()["status"] == "confirmed"
     assert c.post(f"/api/orders/{oid}/allocate", json={}, headers=K).json()["status"] == "allocated"
     p = c.post("/api/plans", json={"route_id": "R-MULTAN-N", "vehicle_id": "V-01", "order_ids": [oid]}, headers=K).json()
-    p = c.post(f"/api/plans/{p['plan_id']}/approve", headers=K).json()
+    # four-eyes: the clerk who planned it can't also load it; the demo's second person is the owner
+    p = c.post(f"/api/plans/{p['plan_id']}/approve", headers=H(c, "owner")).json()
     return oid, p
 
 
@@ -222,7 +223,9 @@ def test_edit_draft_price_override_and_credit_confirm(c):
     # edit the draft
     e = c.patch(f"/api/orders/{o['order_id']}", json={"items": [{"sku": "UREA-50", "qty": 8}], "notes": "urgent"}, headers=K).json()
     assert e["total"] == 8 * 3850 and e["notes"] == "urgent"
-    c.post(f"/api/orders/{o['order_id']}/confirm", headers=K)
+    # four-eyes: the clerk drafted and edited it, so the clerk can't confirm it; the owner can
+    assert c.post(f"/api/orders/{o['order_id']}/confirm", headers=K).status_code == 403
+    assert c.post(f"/api/orders/{o['order_id']}/confirm", headers=O).json()["status"] == "confirmed"
     assert c.patch(f"/api/orders/{o['order_id']}", json={"notes": "late"}, headers=K).status_code == 409     # not a draft any more
     # over-limit confirmation needs the owner (C-010 limit 150k, seed balance 0)
     big = c.post("/api/orders", json={"customer_id": "C-010", "items": [{"sku": "SEED-MAIZE", "qty": 30}]}, headers=K).json()

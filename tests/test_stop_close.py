@@ -195,29 +195,32 @@ def test_sequential_retry_is_a_noop_and_key_misuse_is_refused(repo):
 
 
 # ---------------------------------------------------------------- HTTP route
-DRIVER, CLERK = ("0300-0000003", "3333"), ("0300-0000002", "2222")
+DRIVER, CLERK, OWNER = ("0300-0000003", "3333"), ("0300-0000002", "2222"), ("0300-0000001", "1111")
 
 
 @pytest.fixture
 def api():
     c = TestClient(build_app(in_memory=True, demo=True, scheduler=False))
     hdr = {}
-    for role, (phone, pin) in (("driver", DRIVER), ("clerk", CLERK)):
+    for role, (phone, pin) in (("driver", DRIVER), ("clerk", CLERK), ("owner", OWNER)):
         hdr[role] = {"X-Session": c.post("/api/session", json={"phone": phone, "pin": pin}).json()["token"]}
     return c, hdr
 
 
-def _api_stop(c, K):
-    o = c.post("/api/orders", json={"customer_id": "C-002", "items": [{"sku": "UREA-50", "qty": 20}]}, headers=K).json()
+def _api_stop(c, H):
+    # four-eyes on direct taps: nobody clears their own draft or plan, so the owner drafts, the clerk
+    # confirms, allocates and plans, and the owner loads the plan
+    K, O = H["clerk"], H["owner"]
+    o = c.post("/api/orders", json={"customer_id": "C-002", "items": [{"sku": "UREA-50", "qty": 20}]}, headers=O).json()
     c.post(f"/api/orders/{o['order_id']}/confirm", headers=K); c.post(f"/api/orders/{o['order_id']}/allocate", json={}, headers=K)
     p = c.post("/api/plans", json={"route_id": "R-MULTAN-N", "vehicle_id": "V-01", "order_ids": [o["order_id"]]}, headers=K).json()
-    p = c.post(f"/api/plans/{p['plan_id']}/approve", headers=K).json()
+    p = c.post(f"/api/plans/{p['plan_id']}/approve", headers=O).json()
     return p["stops"][0], o["order_id"]
 
 
 def test_api_rejects_repeated_lines_and_unloaded_returns(api):
     c, H = api
-    st, oid = _api_stop(c, H["clerk"])
+    st, oid = _api_stop(c, H)
     url = f"/api/stops/{st['stop_id']}/close"
     dup = c.post(url, json={"delivered_items": [{"sku": "UREA-50", "qty": 20}] * 2, "otp": st["otp"]}, headers=H["driver"])
     assert dup.status_code == 400 and "loaded" in dup.json()["detail"]
@@ -231,7 +234,7 @@ def test_api_rejects_repeated_lines_and_unloaded_returns(api):
 
 def test_api_concurrent_close_gives_one_invoice_and_clean_409s(api, monkeypatch):
     c, H = api
-    st, oid = _api_stop(c, H["clerk"])
+    st, oid = _api_stop(c, H)
     # Registry.resolve reads its shared sqlite connection without its lock, so parallel requests can
     # spuriously 401 (a separate bug in munshi/auth/registry.py). Serialise only session lookup here so
     # this test measures the stop-close race and nothing else.
