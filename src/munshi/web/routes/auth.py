@@ -1,7 +1,9 @@
 """Sign-up, sign-in, sessions, the caller's own profile, and staff management."""
 from __future__ import annotations
 
+import ipaddress
 import os
+from functools import lru_cache
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -31,7 +33,8 @@ class SessionIn(BaseModel):
 
 
 class SwitchIn(BaseModel):
-    business_id: str
+    business_id: str = Field(min_length=1, max_length=40)
+    pin: str = Field(min_length=4, max_length=6)       # the PIN for the TARGET business
 
 
 class PinChangeIn(BaseModel):
@@ -56,8 +59,40 @@ class StaffPin(BaseModel):
     pin: str = Field(min_length=4, max_length=6)
 
 
+@lru_cache(maxsize=8)
+def _trusted_networks(raw: str) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    nets = []
+    for part in raw.split(","):
+        part = part.strip()
+        if part:
+            nets.append(ipaddress.ip_network(part, strict=False))    # a typo fails loudly, not open
+    return tuple(nets)
+
+
+def _is_trusted(host: str, nets) -> bool:
+    try:
+        ip = ipaddress.ip_address(host.strip())
+    except ValueError:
+        return False
+    return any(ip in n for n in nets)
+
+
 def _client(request: Request) -> str:
-    return request.headers.get("x-forwarded-for", request.client.host if request.client else "?").split(",")[0].strip()
+    """The address the rate limiters key on.
+
+    X-Forwarded-For is only believed when the connecting peer is one of
+    MUNSHI_TRUSTED_PROXY_IPS (comma-separated IPs/CIDRs; empty = trust nobody).
+    Then the RIGHTMOST hop that is not itself a trusted proxy is the client: every
+    hop to the left of it was written by the client and proves nothing."""
+    peer = request.client.host if request.client else "?"
+    nets = _trusted_networks(os.environ.get("MUNSHI_TRUSTED_PROXY_IPS", ""))
+    if not nets or not _is_trusted(peer, nets):
+        return peer
+    hops = [h.strip() for h in request.headers.get("x-forwarded-for", "").split(",") if h.strip()]
+    for hop in reversed(hops):
+        if not _is_trusted(hop, nets):
+            return hop
+    return hops[0] if hops else peer
 
 
 def _me(request: Request, p: Principal) -> dict:
@@ -113,8 +148,13 @@ def sign_in(body: SessionIn, request: Request):
 @router.post("/session/switch")
 def switch(body: SwitchIn, request: Request, p: Principal = Depends(current), token: str | None = Depends(token_of)):
     hub = hub_of(request)
+    if not request.app.state.login_limiter.allow(f"switch:{p.user_id}"):
+        raise HTTPException(429, "too many attempts — wait a minute")
     try:
-        new_token, np = hub.registry.switch_business(p, body.business_id)
+        new_token, np = hub.registry.switch_business(p, body.business_id, pin=body.pin,
+                                                     device=request.headers.get("user-agent", "")[:80])
+    except LockedError as e:
+        raise HTTPException(423, str(e))
     except AuthError as e:
         raise HTTPException(403, str(e))
     if token: hub.registry.revoke(token)
@@ -136,8 +176,10 @@ def me(request: Request, p: Principal = Depends(current)):
 def change_pin(body: PinChangeIn, request: Request, p: Principal = Depends(current)):
     reg = hub_of(request).registry
     try:
-        reg.authenticate(p.phone, body.old_pin)     # proves the old PIN; issues a throwaway session
-    except AuthError:
+        ok = reg.verify_pin(p.user_id, body.old_pin)     # this user's own PIN, counted toward lockout
+    except LockedError as e:
+        raise HTTPException(423, str(e))
+    if not ok:
         raise HTTPException(401, "current PIN is wrong")
     try:
         reg.set_pin(p.user_id, body.new_pin)        # revokes every session, including this one

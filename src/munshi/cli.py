@@ -30,7 +30,13 @@ def _hub():
 
 def cmd_serve(a):
     import uvicorn
-    uvicorn.run("munshi.web.app:app", host=a.host, port=int(os.environ.get("PORT", a.port)), workers=1, proxy_headers=True, forwarded_allow_ips="*")
+    # X-Forwarded-For / -Proto are only honoured from the reverse proxies named in
+    # MUNSHI_TRUSTED_PROXY_IPS (comma-separated IPs/CIDRs, e.g. "127.0.0.1" for a
+    # Caddy on the same host). Unset: nobody is trusted and the socket peer is used,
+    # so a client cannot pick its own address to dodge the sign-in rate limit.
+    trusted = ",".join(p.strip() for p in os.environ.get("MUNSHI_TRUSTED_PROXY_IPS", "").split(",") if p.strip())
+    uvicorn.run("munshi.web.app:app", host=a.host, port=int(os.environ.get("PORT", a.port)), workers=1,
+                proxy_headers=bool(trusted), forwarded_allow_ips=trusted or "127.0.0.1")
 
 
 def cmd_businesses(a):
