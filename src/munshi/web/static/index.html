@@ -3,11 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#0b1220" media="(prefers-color-scheme: dark)">
-<meta name="theme-color" content="#f6f4ef" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#FBF8F1" id="themeColor">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="description" content="Munshi — your AI back office: orders, godown, deliveries, cash and khata, run by approval-gated agents.">
 <title>Munshi</title>
 <link rel="manifest" href="/manifest.webmanifest">
@@ -16,6 +15,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Outfit:wght@500;600;700;800&family=Manrope:wght@400;500;600;700&family=Noto+Nastaliq+Urdu:wght@400;600&display=swap">
 <link rel="stylesheet" href="/static/styles.css">
+<script src="/static/theme.js"></script>
 </head>
 <body>
 <div id="app" class="app">
@@ -24,10 +24,11 @@
     <div class="topbar-right" id="topRight"></div>
   </header>
   <div id="offline" class="banner crit" hidden>offline — showing what's saved on this phone</div>
+  <a id="attn" class="banner crit" href="#stops" hidden></a>
   <main id="view" class="view"></main>
   <nav id="nav" class="nav" hidden></nav>
   <div id="sheet" class="sheet" hidden></div>
-  <div id="toast" class="toast" hidden></div>
+  <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 </div>
 <script src="/static/i18n.js"></script>
 <script src="/static/core.js"></script>

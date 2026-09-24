@@ -1,33 +1,70 @@
+/* ---- Tokens -------------------------------------------------------------------------------------------
+   Two layers. Raw palette (--p-*) holds every colour value exactly once; semantic tokens (--ground, --ink,
+   --muted, --line, --accent, --good/--warn/--crit + their -soft tints) are what rules consume. Components never
+   use a raw value, so a theme is just a different mapping of the semantic layer.
+
+   LIGHT is the default: it is the only theme that reads outdoors in direct sun on a cheap phone screen.
+   DARK is an explicit opt-in (Settings -> Theme sets <html data-theme="dark">); it is NOT tied to the OS
+   setting, because a phone left in system dark mode would otherwise put drivers back on the low-glare-but-
+   unreadable-in-sun theme without anyone choosing it.
+
+   Measured WCAG 2.x contrast (light): ink/ground 16.2, ink/surface 17.2, muted/ground 7.3, muted/surface 7.7,
+   muted/surface-2 6.6, line/ground 3.45, line/surface 3.66, line/surface-2 3.14, white/accent 9.9,
+   accent/ground 9.3, good/good-soft 5.5, warn/warn-soft 6.3, crit/crit-soft 6.3, white/crit 7.75.
+   Dark: ink/ground 16.1, muted/surface-2 6.7, line/surface-2 3.6, accent-ink/accent 9.3, crit/crit-soft 6.2. */
 :root{
-  --ground:#0b1220; --surface:#131c2e; --surface-2:#1a2540; --ink:#e9eef7; --ink-2:#c3cbda; --muted:#8b98b0;
-  --line:#223052; --line-2:#2c3b63; --accent:#f2a93b; --accent-2:#ffc76b; --accent-ink:#1a1206;
-  --good:#2ec4a6; --good-soft:#123b35; --warn:#f2c14e; --warn-soft:#3d3113; --crit:#e5646b; --crit-soft:#3f1c22;
+  /* raw palette: light */
+  --p-paper:#FBF8F1; --p-white:#FFFFFF; --p-sand:#F2EDE3; --p-navy-950:#141B2D; --p-navy-800:#2A3246; --p-slate-600:#4A5368;
+  --p-stone-500:#8C8577; --p-indigo-800:#263C8F; --p-indigo-50:#E4E8F5;
+  --p-green-800:#1D6B45; --p-green-50:#E1F0E6; --p-amber-900:#7A4B00; --p-amber-50:#FAEBCB; --p-red-800:#A4161A; --p-red-50:#FBE3E1;
+  /* raw palette: dark (desaturated, surfaces lifted by lightness rather than shadow) */
+  --p-night-950:#0B1220; --p-night-900:#131C2E; --p-night-800:#1C2740; --p-mist-100:#E9EEF7; --p-mist-200:#C9D1DF; --p-mist-400:#A3AFC4;
+  --p-night-500:#6E7D9E; --p-saffron-400:#F2A93B; --p-saffron-300:#FFC76B; --p-saffron-950:#1A1206; --p-saffron-900:#3A2E17;
+  --p-teal-300:#4FD1B5; --p-teal-900:#123B35; --p-gold-300:#F2C14E; --p-gold-900:#3D3113; --p-rose-300:#F08A8F; --p-rose-900:#3F1C22; --p-rose-975:#1A0A0B;
+
+  /* semantic: light (default) */
+  color-scheme:light;
+  --ground:var(--p-paper); --surface:var(--p-white); --surface-2:var(--p-sand); --field:var(--p-white);
+  --ink:var(--p-navy-950); --ink-2:var(--p-navy-800); --muted:var(--p-slate-600);
+  --line:var(--p-stone-500); --line-2:var(--p-stone-500);
+  --accent:var(--p-indigo-800); --accent-2:var(--p-indigo-800); --accent-ink:var(--p-white); --accent-soft:var(--p-indigo-50);
+  --focus:var(--p-indigo-800);
+  --good:var(--p-green-800); --good-soft:var(--p-green-50); --warn:var(--p-amber-900); --warn-soft:var(--p-amber-50);
+  --crit:var(--p-red-800); --crit-soft:var(--p-red-50); --on-crit:var(--p-white);
+  --scrim:rgba(20,27,45,.5); --shadow-sheet:0 -8px 30px rgba(20,27,45,.18); --shadow-toast:0 6px 20px rgba(20,27,45,.25);
+
   --display:'Outfit','Manrope',system-ui,-apple-system,'Segoe UI',sans-serif;
   --body:'Manrope',system-ui,-apple-system,'Segoe UI',sans-serif;
   --mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
   --nav-h:64px; --safe-b:env(safe-area-inset-bottom,0px);
+  --tap:48px;                                   /* minimum hit area for anything tappable */
+  --ease-out:cubic-bezier(.2,.7,.2,1); --ease-in:cubic-bezier(.5,0,.8,.3);
 }
-@media (prefers-color-scheme: light){
-  :root:not([data-theme="dark"]){
-    --ground:#f6f4ef; --surface:#ffffff; --surface-2:#efebe3; --ink:#172033; --ink-2:#2f3a52; --muted:#5c6780;
-    --line:#e2ddd3; --line-2:#cfc8bb; --accent:#d98f1c; --accent-2:#f2a93b; --accent-ink:#1a1206;
-    --good:#1f9c84; --good-soft:#dff4ee; --warn:#b98a12; --warn-soft:#fbf1cf; --crit:#c9434b; --crit-soft:#fbe1e3;
-  }
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --ground:var(--p-night-950); --surface:var(--p-night-900); --surface-2:var(--p-night-800); --field:var(--p-night-800);
+  --ink:var(--p-mist-100); --ink-2:var(--p-mist-200); --muted:var(--p-mist-400);
+  --line:var(--p-night-500); --line-2:var(--p-night-500);
+  --accent:var(--p-saffron-400); --accent-2:var(--p-saffron-300); --accent-ink:var(--p-saffron-950); --accent-soft:var(--p-saffron-900);
+  --focus:var(--p-saffron-300);
+  --good:var(--p-teal-300); --good-soft:var(--p-teal-900); --warn:var(--p-gold-300); --warn-soft:var(--p-gold-900);
+  --crit:var(--p-rose-300); --crit-soft:var(--p-rose-900); --on-crit:var(--p-rose-975);
+  --scrim:rgba(0,0,0,.6); --shadow-sheet:none; --shadow-toast:none;
 }
 *{box-sizing:border-box} html,body{height:100%} [hidden]{display:none!important}
 body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--body);font-size:15.5px;line-height:1.5;-webkit-font-smoothing:antialiased;overscroll-behavior-y:none}
 button,input,select,textarea{font:inherit;color:inherit}
 a{color:inherit;text-decoration:none}
 .app{min-height:100%;display:flex;flex-direction:column}
-.topbar{position:sticky;top:0;z-index:5;display:flex;align-items:center;justify-content:space-between;padding:max(10px,env(safe-area-inset-top)) 16px 10px;background:color-mix(in srgb,var(--ground) 88%,transparent);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+.topbar{position:sticky;top:0;z-index:5;display:flex;align-items:center;justify-content:space-between;padding:max(10px,env(safe-area-inset-top)) 16px 10px;background:var(--ground);background:color-mix(in srgb,var(--ground) 92%,transparent);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
 .brand{display:flex;align-items:center;gap:9px;font-family:var(--display);font-weight:700;font-size:19px;letter-spacing:-.01em}
-.brand-mark{width:12px;height:12px;border-radius:3px;background:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 25%,transparent)}
+.brand-mark{width:12px;height:12px;border-radius:3px;background:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
 .view{flex:1;padding:14px 16px calc(var(--nav-h) + var(--safe-b) + 18px);max-width:720px;width:100%;margin:0 auto}
 .nav{position:fixed;left:0;right:0;bottom:0;z-index:5;display:grid;grid-template-columns:repeat(5,1fr);height:calc(var(--nav-h) + var(--safe-b));padding-bottom:var(--safe-b);background:var(--surface);border-top:1px solid var(--line)}
 .nav a{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;font-size:11px;color:var(--muted);position:relative;font-weight:600}
 .nav a .ico{font-size:18px;line-height:1}
-.nav a.active{color:var(--accent)}
-.badge{position:absolute;top:8px;right:calc(50% - 22px);min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:var(--crit);color:#fff;font-size:11px;line-height:18px;text-align:center}
+.nav a.active{color:var(--accent);box-shadow:inset 0 3px 0 var(--accent)}   /* active tab: colour AND a bar, never colour alone */
+.badge{position:absolute;top:8px;right:calc(50% - 22px);min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:var(--crit);color:var(--on-crit);font-size:11px;line-height:18px;text-align:center}
 
 h1{font-family:var(--display);font-size:24px;font-weight:700;letter-spacing:-.02em;margin:6px 0 4px}
 h2{font-family:var(--display);font-size:15px;font-weight:700;margin:18px 0 8px;color:var(--ink-2);letter-spacing:.01em}
@@ -45,23 +82,36 @@ h2{font-family:var(--display);font-size:15px;font-weight:700;margin:18px 0 8px;c
 .item.tap{cursor:pointer} .item.tap:active{background:var(--surface-2)}
 .pill{display:inline-block;font-size:11px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;padding:3px 8px;border-radius:999px;background:var(--surface-2);color:var(--muted);white-space:nowrap}
 .pill.good{background:var(--good-soft);color:var(--good)} .pill.warn{background:var(--warn-soft);color:var(--warn)} .pill.crit{background:var(--crit-soft);color:var(--crit)}
-.pill.acc{background:color-mix(in srgb,var(--accent) 18%,transparent);color:var(--accent)} .pill.role{background:color-mix(in srgb,var(--accent) 18%,transparent);color:var(--accent)}
+.pill.acc{background:var(--accent-soft);color:var(--accent)} .pill.role{background:var(--accent-soft);color:var(--accent)}
 .num{font-variant-numeric:tabular-nums;font-family:var(--mono);font-size:.94em}
-.btn{appearance:none;border:1px solid var(--line-2);background:var(--surface-2);color:var(--ink);border-radius:11px;padding:10px 14px;font-weight:700;cursor:pointer;min-height:42px}
+.btn{appearance:none;border:1px solid var(--line-2);background:var(--surface-2);color:var(--ink);border-radius:11px;padding:10px 14px;font-weight:700;cursor:pointer;min-height:var(--tap)}
 .btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
 .btn.danger{background:transparent;border-color:var(--crit);color:var(--crit)}
 .btn.ghost{background:transparent}
 .btn:disabled{opacity:.45;cursor:not-allowed}
-.btn:focus-visible,input:focus-visible,a:focus-visible{outline:2px solid var(--accent-2);outline-offset:2px}
+a.btn{display:inline-flex;align-items:center;justify-content:center}
+@media (hover:hover){
+  .btn:not(:disabled):hover{box-shadow:inset 0 0 0 1px currentColor}      /* hover thickens the edge: a shape cue, not just a colour shift */
+  .btn.primary:not(:disabled):hover{box-shadow:inset 0 0 0 2px var(--accent-ink)}
+  .link:hover,.back:hover{text-decoration:underline;text-underline-offset:3px}
+  .item.tap:hover,.chip:hover{border-color:var(--ink-2)}
+}
+:focus-visible{outline:3px solid var(--focus);outline-offset:2px}
 .btnrow{display:flex;gap:8px;flex-wrap:wrap}
-.input{width:100%;background:var(--surface-2);border:1px solid var(--line-2);border-radius:11px;padding:11px 12px;min-height:44px}
+.input{width:100%;color:var(--ink);background:var(--field);border:1px solid var(--line-2);border-radius:11px;padding:11px 12px;min-height:var(--tap)}
 .input.num{font-family:var(--mono)}
 label.f{display:grid;gap:5px;font-size:13px;color:var(--muted);font-weight:600}
 .chips{display:flex;gap:8px;overflow-x:auto;padding:4px 0 10px;scrollbar-width:none} .chips::-webkit-scrollbar{display:none}
 .chip{flex:0 0 auto;border:1px solid var(--line-2);background:var(--surface);border-radius:999px;padding:7px 12px;font-size:13px;font-weight:600;cursor:pointer;color:var(--ink-2)}
 .empty{color:var(--muted);text-align:center;padding:26px 10px;font-size:14px}
-.toast{position:fixed;left:50%;bottom:calc(var(--nav-h) + var(--safe-b) + 14px);transform:translateX(-50%);background:var(--ink);color:var(--ground);padding:10px 14px;border-radius:10px;font-weight:600;font-size:14px;z-index:9;max-width:92vw}
-.back{display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:14px;margin:2px 0 8px;cursor:pointer}
+/* Toast: an always-present polite live region (role=status in index.html). Never display:none, so screen readers
+   keep it in the tree and announce each new message. pointer-events:none means it can never swallow a tap, and
+   core.js moves it to the top of the screen whenever it would sit over a primary action (Close stop, sheet
+   Save, the chat composer). It sits above sheets (z 30 > 20) so errors from a sheet form are visible. */
+.toast{position:fixed;left:50%;bottom:calc(var(--nav-h) + var(--safe-b) + 14px);transform:translate(-50%,8px);opacity:0;pointer-events:none;background:var(--ink);color:var(--ground);padding:10px 14px;border-radius:10px;font-weight:600;font-size:14px;z-index:30;max-width:92vw;width:max-content;box-shadow:var(--shadow-toast);transition:opacity .15s var(--ease-in),transform .15s var(--ease-in)}
+.toast.top{bottom:auto;transform:translate(-50%,-8px)}
+.toast.show{opacity:1;transform:translate(-50%,0);transition:opacity .2s var(--ease-out),transform .2s var(--ease-out)}
+.back{display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:14px;margin:-6px 0 2px;min-height:var(--tap);cursor:pointer}
 
 /* login */
 .login{min-height:70vh;display:grid;place-items:center;text-align:center}
@@ -79,43 +129,51 @@ label.f{display:grid;gap:5px;font-size:13px;color:var(--muted);font-weight:600}
 .msg.me{justify-self:end;background:var(--accent);color:var(--accent-ink);border-bottom-right-radius:4px}
 .msg.bot{justify-self:start;background:var(--surface);border:1px solid var(--line);border-bottom-left-radius:4px}
 .msg .who{display:block;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:4px}
+.msg.me .who{color:var(--accent-ink);margin:4px 0 0}
 .approval{justify-self:start;max-width:92%;background:var(--surface);border:1px solid var(--accent);border-radius:14px;padding:12px 14px;display:grid;gap:8px}
 .approval .h{display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:12px;color:var(--muted);font-weight:700;letter-spacing:.05em;text-transform:uppercase}
 .approval .s{font-weight:700;font-size:15px}
 .composer{position:sticky;bottom:calc(var(--nav-h) + var(--safe-b) + 6px);display:flex;gap:8px;padding:10px 0 0;background:var(--ground)}
 .composer .input{flex:1}
-.mic{width:44px;height:44px;border-radius:11px;display:grid;place-items:center}
-.mic.rec{background:var(--crit);border-color:var(--crit);color:#fff}
+.mic{width:var(--tap);height:var(--tap);border-radius:11px;display:grid;place-items:center}
+.mic.rec{background:var(--crit);border-color:var(--crit);color:var(--on-crit)}
 pre.json{background:var(--surface-2);border-radius:10px;padding:10px;font-size:12px;overflow-x:auto;margin:6px 0 0;color:var(--ink-2)}
 .kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:13.5px} .kv b{color:var(--muted);font-weight:600}
 .stopline{display:grid;grid-template-columns:1fr 84px;gap:8px;align-items:center;font-size:14px}
 .more a.item{display:flex;justify-content:space-between;align-items:center}
-@media (prefers-reduced-motion: reduce){*{transition:none!important;animation:none!important}}
 
 /* ---- v1.0 additions: forms, sheets, banners, charts, RTL ---- */
-.topbar-right{display:flex;align-items:center;gap:10px}
-.bell{position:relative;font-size:18px;text-decoration:none}
-.bell .badge{top:-6px;right:-10px}
+.topbar-right{display:flex;align-items:center;gap:6px}
+/* bell: 48x48 hit area; the negative block margin keeps the topbar the same height (the extra hit area sits in its padding) */
+.bell{position:relative;font-size:18px;text-decoration:none;display:inline-grid;place-items:center;min-width:var(--tap);min-height:var(--tap);margin-block:-10px;border-radius:12px}
+.bell .badge{top:2px;right:0}
 .banner{font-size:13px;font-weight:600;padding:8px 16px;text-align:center;background:var(--warn-soft);color:var(--warn)}
 .banner.crit{background:var(--crit-soft);color:var(--crit)}
+a.banner{display:flex;align-items:center;justify-content:center;gap:6px;min-height:var(--tap);border-bottom:1px solid var(--crit)}
 .link{background:none;border:0;padding:0;color:var(--accent);font-weight:700;cursor:pointer;text-decoration:none}
+/* .hit: give a small inline control (text link, language switch, Sync now) a full 48x48 hit area without changing its look */
+.hit{display:inline-flex;align-items:center;justify-content:center;min-height:var(--tap);min-width:var(--tap);padding:0 10px;border-radius:10px}
+.call{display:inline-flex;align-items:center;gap:6px;min-height:var(--tap);padding:0 14px;margin-top:4px;border:1px solid var(--line);border-radius:11px;background:var(--surface);color:var(--accent);font-weight:700;font-size:14px;justify-self:start}
 .dim{font-size:15px;color:var(--muted)} .crit{color:var(--crit)} .muted{color:var(--muted)}
 .card.alert{border-color:var(--accent)}
 .grid2 .tile{min-width:0} .tile .v{white-space:normal;word-break:break-word;font-size:clamp(17px,5.4vw,22px)}
 .chips.center{justify-content:center;flex-wrap:wrap}
 .chip.ok{border-color:var(--good);color:var(--good)}
 a.chip{text-decoration:none}
-.btn.sm{padding:5px 10px;min-height:32px;font-size:12px}
+/* small buttons keep their compact look; an invisible ::after extends the hit area to 48px. The inset is measured
+   from the padding box (30px inside the 1px border), so 30 + 2x9 = 48. */
+.btn.sm{padding:5px 10px;min-height:32px;min-width:32px;font-size:12px;position:relative}
+.btn.sm::after{content:'';position:absolute;inset:-9px}
 .btn.big{min-height:52px;font-size:17px}
 .input.big{font-size:22px;min-height:54px;letter-spacing:.2em;text-align:center}
-.input.num{font-family:var(--mono)}
 select.input{appearance:none}
-label.chk{display:flex;align-items:center;gap:10px;font-size:14px;cursor:pointer}
+label.chk{display:flex;align-items:center;gap:10px;font-size:14px;cursor:pointer;min-height:var(--tap)}
 .item.chk{flex-direction:row;display:flex;align-items:center;gap:10px}
 .item.chk input{width:20px;height:20px}
 .quote{font-size:13.5px;color:var(--ink-2);background:var(--surface-2);border-radius:8px;padding:8px 10px;margin-top:4px;white-space:pre-wrap}
 .buckets{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
-.oline,.pline{gap:6px} .oline select,.pline select{flex:1;min-width:0} .oline .x,.pline .x{background:none;border:0;color:var(--muted);font-size:16px;cursor:pointer}
+.oline,.pline{gap:6px} .oline select,.pline select{flex:1;min-width:0}
+.oline .x,.pline .x{background:none;border:0;color:var(--muted);font-size:16px;cursor:pointer;min-width:var(--tap);min-height:var(--tap);flex:0 0 auto;border-radius:10px}
 .stopline input{text-align:center;font-size:18px}
 /* bar chart */
 .bars{display:grid;gap:6px;margin-top:8px}
@@ -126,10 +184,10 @@ label.chk{display:flex;align-items:center;gap:10px;font-size:14px;cursor:pointer
 .bar .bv{color:var(--muted);font-size:12px}
 /* bottom sheet */
 .sheet{position:fixed;inset:0;z-index:20;display:flex;align-items:flex-end;justify-content:center}
-.sheet-bg{position:absolute;inset:0;background:rgba(0,0,0,.55)}
-.sheet-panel{position:relative;width:100%;max-width:560px;max-height:92vh;background:var(--surface);border-radius:18px 18px 0 0;display:flex;flex-direction:column;box-shadow:0 -10px 40px rgba(0,0,0,.4)}
-.sheet-h{display:flex;justify-content:space-between;align-items:center;padding:14px 16px 6px} .sheet-h h2{margin:0;font-size:18px}
-.sheet-h .x{background:none;border:0;font-size:18px;color:var(--muted);cursor:pointer;padding:6px}
+.sheet-bg{position:absolute;inset:0;background:var(--scrim)}
+.sheet-panel{position:relative;width:100%;max-width:560px;max-height:92vh;background:var(--surface);border-radius:18px 18px 0 0;display:flex;flex-direction:column;box-shadow:var(--shadow-sheet)}
+.sheet-h{display:flex;justify-content:space-between;align-items:center;padding:10px 8px 2px 16px} .sheet-h h2{margin:0;font-size:18px}
+.sheet-h .x{background:none;border:0;font-size:18px;color:var(--muted);cursor:pointer;min-width:var(--tap);min-height:var(--tap);border-radius:12px}
 .sheet-b{padding:6px 16px 10px;overflow-y:auto;display:grid;gap:10px}
 .sheet-f{display:flex;gap:8px;padding:10px 16px calc(14px + var(--safe-b));border-top:1px solid var(--line)} .sheet-f .btn{flex:1}
 @media (min-width:640px){.sheet{align-items:center}.sheet-panel{border-radius:18px;max-height:86vh}}
@@ -139,7 +197,20 @@ body.ur h1{font-size:22px;line-height:1.7} body.ur .nav a{font-size:11.5px}
 [dir=rtl] .msg.me{justify-self:start;border-bottom-right-radius:14px;border-bottom-left-radius:4px}
 [dir=rtl] .msg.bot{justify-self:end;border-bottom-left-radius:14px;border-bottom-right-radius:4px}
 [dir=rtl] .badge{right:auto;left:calc(50% - 22px)}
+[dir=rtl] .bell .badge{left:0}
 [dir=rtl] .num,[dir=rtl] .input.num,[dir=rtl] .json{direction:ltr;unicode-bidi:isolate}
 
-.input.bad{border-color:var(--crit)}
+.input.bad{border-color:var(--crit);box-shadow:inset 0 0 0 1px var(--crit)}
 .oline .psel,.pline .psel{flex:1;min-width:0}
+
+/* ---- offline deliveries the office refused ("needs attention") ---- */
+/* The 6px left rule is the signature: it is the one place the app uses a heavy stroke, so a refused delivery
+   reads as different from every other card even in glare or greyscale. */
+.card.attn{border:2px solid var(--crit);border-inline-start-width:6px;display:grid;gap:10px}
+.attn-why{margin:0;font-weight:700;color:var(--crit);font-size:14.5px}
+.attn .kv{font-size:14px} .attn .kv span{color:var(--ink)}
+.attn .btnrow .btn{flex:1 1 auto}
+.attn-intro{margin:0 0 10px;font-size:13.5px;color:var(--ink-2)}
+.formerr{margin:0;color:var(--crit);font-weight:700;font-size:14px}
+.formerr:not(:empty){padding:10px 12px;background:var(--crit-soft);border-radius:10px;border:1px solid var(--crit)}
+@media (prefers-reduced-motion: reduce){*{transition:none!important;animation:none!important}}
