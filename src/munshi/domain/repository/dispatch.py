@@ -4,13 +4,58 @@ invoice and any cash to the khata and puts returns back on the shelf."""
 from __future__ import annotations
 
 import json
+import math
 import secrets
 import sqlite3
 from datetime import date, timedelta
 
-from munshi.domain.models import DeliveryStop, DispatchPlan, now_iso
+from munshi.domain.models import DeliveryStop, DispatchPlan, OrderItem, now_iso
 from munshi.domain.repository.base import CapacityError, NotFoundError, OtpError, StateError, new_id
+from munshi.domain.repository.guarded import ensure_stop_closes, immediate_tx, request_hash
 from munshi.domain.repository.orders import OrdersMixin
+
+MAX_LINE_QTY = 100_000
+
+
+def _stop_lines(lines, what: str) -> dict[str, int]:
+    """Typed view of a stop's delivered/returned lines: {sku: qty}, one entry per product.
+
+    Each line must be {"sku": non-empty str, "qty": whole number >= 0}. Repeated lines for the same product
+    are summed (never multiplied into the invoice); the sum is then capped by the load check in close_stop.
+    """
+    if lines is None: return {}
+    if not isinstance(lines, (list, tuple)): raise ValueError(f"{what} must be a list of {{sku, qty}} lines")
+    out: dict[str, int] = {}
+    for ln in lines:
+        if not isinstance(ln, dict) or "sku" not in ln or "qty" not in ln:
+            raise ValueError(f"every line in {what} needs a sku and a qty")
+        sku, qty = ln["sku"], ln["qty"]
+        if not isinstance(sku, str) or not sku.strip(): raise ValueError(f"{what}: sku must be a non-empty string")
+        if isinstance(qty, bool) or not isinstance(qty, (int, float, str)): raise ValueError(f"{what}: qty for {sku} must be a whole number")
+        try:
+            q = float(qty)
+        except ValueError:
+            raise ValueError(f"{what}: qty for {sku} must be a whole number") from None
+        if not math.isfinite(q) or not q.is_integer(): raise ValueError(f"{what}: qty for {sku} must be a whole number")
+        if q < 0: raise ValueError(f"{what}: qty for {sku} cannot be negative")
+        sku = sku.strip()
+        out[sku] = out.get(sku, 0) + int(q)
+        if out[sku] > MAX_LINE_QTY: raise ValueError(f"{what}: qty for {sku} is too large")
+    return out
+
+
+def _value_of(items: list[OrderItem], sku: str, qty: int) -> float:
+    """Invoice value of `qty` units of `sku`, priced off the order's lines for it in order (an order may split a sku over lines)."""
+    total, left = 0.0, qty
+    for it in items:
+        if it.sku != sku or left <= 0: continue
+        take = min(left, it.qty); total += take * it.unit_price; left -= take
+    return total
+
+
+def _check_otp(otp, issued) -> None:
+    if not otp or not secrets.compare_digest(str(otp), str(issued or "")):
+        raise OtpError("OTP does not match the one issued for this stop")
 
 
 class DispatchMixin(OrdersMixin):
@@ -101,46 +146,100 @@ class DispatchMixin(OrdersMixin):
         if not r: raise NotFoundError(f"no such stop: {stop_id}")
         return self._stop_from_row(r)
 
-    def close_stop(self, stop_id: str, delivered_items: list[dict], returned_items: list[dict], cash_collected: float, otp: str, actor: str, note: str = "") -> dict:
-        st = self.get_stop(stop_id); plan = self.get_plan(st.plan_id)
-        if plan.status not in ("approved", "loaded"): raise StateError(f"plan {plan.plan_id} is {plan.status}; stops can only close on an approved plan")
-        if st.status != "pending": raise StateError(f"stop {stop_id} already {st.status}")
-        if not otp or not secrets.compare_digest(str(otp), str(st.otp or "")): raise OtpError("OTP does not match the one issued for this stop")
-        if float(cash_collected) < 0: raise ValueError("cash collected cannot be negative")
-        order = self.get_order(st.order_id); cust = self.get_customer(st.customer_id)
-        ordered = {i.sku: i for i in order.items}
-        delivered_value = 0.0; short = False
-        for d in delivered_items:
-            it = ordered.get(d["sku"])
-            if not it: raise ValueError(f"{d['sku']} was not on order {order.order_id}")
-            if int(d["qty"]) < 0: raise ValueError("delivered quantity cannot be negative")
-            if int(d["qty"]) > it.qty: raise ValueError(f"delivered more {d['sku']} than ordered")
-            if int(d["qty"]) < it.qty: short = True
-            delivered_value += int(d["qty"]) * it.unit_price
-        delivered_skus = {d["sku"] for d in delivered_items}
-        if any(s not in delivered_skus for s in ordered): short = True
-        status = "short" if short else "delivered"
-        inv_id = None
-        with self._tx() as c:
-            c.execute("UPDATE stops SET status=?, delivered_items=?, returned_items=?, cash_collected=?, otp_verified=1, closed_at=?, note=? WHERE stop_id=?",
-                      (status, json.dumps(delivered_items), json.dumps(returned_items), float(cash_collected), now_iso(), (note or "")[:200], stop_id))
+    def close_stop(self, stop_id: str, delivered_items: list[dict], returned_items: list[dict], cash_collected: float, otp: str, actor: str,
+                   note: str = "", client_ref: str = "") -> dict:
+        """Close a delivery stop against the customer's OTP: invoice what was delivered, record cash, restock returns.
+
+        Lines are reconciled against what was loaded for this stop (the order's lines): repeated lines for a
+        product are summed into one, and for every product delivered + returned must not exceed what was loaded;
+        returns are only accepted for products that were loaded. Any shortfall (loaded - delivered - returned)
+        is reported as `unaccounted`, never silently dropped.
+
+        The whole check-then-write runs in one write-locked transaction, and the stop is claimed with a guarded
+        UPDATE (status must still be 'pending'), so parallel closes post exactly once and the rest get a
+        StateError "already ...". An exact retry carrying the same `client_ref` replays the recorded result
+        instead of posting again.
+        """
+        client_ref = (client_ref or "").strip() or None
+        if client_ref is not None and len(client_ref) > 64: raise ValueError("client_ref is too long (max 64)")
+        delivered = _stop_lines(delivered_items, "delivered_items")
+        returned = _stop_lines(returned_items, "returned_items")
+        try:
+            cash = float(cash_collected)
+        except (TypeError, ValueError):
+            raise ValueError("cash collected must be a number") from None
+        if not math.isfinite(cash) or cash < 0: raise ValueError("cash collected cannot be negative")
+        cash = round(cash, 2)
+        fingerprint = request_hash(delivered, returned, cash)
+        ensure_stop_closes(self)
+
+        with immediate_tx(self) as c:
+            st = self.get_stop(stop_id)
+            if st.status != "pending":
+                prior = self._one("SELECT client_ref, request_hash, result FROM stop_closes WHERE stop_id=?", (stop_id,))
+                if client_ref and prior and prior["client_ref"] == client_ref:
+                    _check_otp(otp, st.otp)
+                    if prior["request_hash"] != fingerprint:
+                        raise StateError(f"client_ref {client_ref} was already used for a different close of stop {stop_id}")
+                    return json.loads(prior["result"]) | {"replayed": True}
+                raise StateError(f"stop {stop_id} already {st.status}")
+            plan = self.get_plan(st.plan_id)
+            if plan.status not in ("approved", "loaded"): raise StateError(f"plan {plan.plan_id} is {plan.status}; stops can only close on an approved plan")
+            _check_otp(otp, st.otp)
+            if client_ref:
+                other = self._one("SELECT stop_id FROM stop_closes WHERE client_ref=?", (client_ref,))
+                if other: raise StateError(f"client_ref {client_ref} was already used to close stop {other['stop_id']}")
+            order = self.get_order(st.order_id); cust = self.get_customer(st.customer_id)
+
+            # ---- reconcile against the load: what went out on the vehicle for this stop is the order's lines
+            loaded: dict[str, int] = {}
+            for it in order.items: loaded[it.sku] = loaded.get(it.sku, 0) + it.qty
+            for sku in delivered:
+                if sku not in loaded: raise ValueError(f"{sku} was not loaded for stop {stop_id} (order {order.order_id})")
+            for sku in returned:
+                if sku not in loaded: raise ValueError(f"cannot return {sku}: it was not loaded for stop {stop_id} (order {order.order_id})")
+            for sku, n in loaded.items():
+                d, r = delivered.get(sku, 0), returned.get(sku, 0)
+                if d + r > n:
+                    raise ValueError(f"{sku}: delivered {d} + returned {r} = {d + r} is more than the {n} loaded for stop {stop_id}")
+            unaccounted = {sku: n - delivered.get(sku, 0) - returned.get(sku, 0) for sku, n in loaded.items() if n - delivered.get(sku, 0) - returned.get(sku, 0) > 0}
+            short = any(delivered.get(sku, 0) < n for sku, n in loaded.items())
+            status = "short" if short else "delivered"
+            delivered_value = round(sum(_value_of(order.items, sku, q) for sku, q in delivered.items()), 2)
+            d_lines = [{"sku": s, "qty": q} for s, q in delivered.items() if q > 0]
+            r_lines = [{"sku": s, "qty": q} for s, q in returned.items() if q > 0]
+
+            # ---- claim the stop: only one request can move it off 'pending'
+            claimed = c.execute("UPDATE stops SET status=?, delivered_items=?, returned_items=?, cash_collected=?, otp_verified=1, closed_at=?, note=? WHERE stop_id=? AND status='pending'",
+                                (status, json.dumps(d_lines), json.dumps(r_lines), cash, now_iso(), (note or "")[:200], stop_id)).rowcount
+            if claimed != 1: raise StateError(f"stop {stop_id} already closed")
             c.execute("UPDATE orders SET status=? WHERE order_id=?", (status, order.order_id))
-            for ret in returned_items:   # returns go back on the shelf at the plan's warehouse
-                if int(ret["qty"]) > 0:
-                    self.move_stock(plan.warehouse_id, ret["sku"], int(ret["qty"]), "return", stop_id)
+            for ln in r_lines:   # returns go back on the shelf at the plan's warehouse
+                self.move_stock(plan.warehouse_id, ln["sku"], ln["qty"], "return", stop_id)
+            inv_id = None
             if delivered_value > 0:
                 inv_id = new_id(self.setting("invoice_prefix") or "INV")
                 due = (date.today() + timedelta(days=cust.credit_days or int(self.setting("credit_days")))).isoformat()
                 c.execute("INSERT INTO ledger (entry_id, customer_id, kind, amount, ref, due_date, created_at, method, received_by) VALUES (?,?,?,?,?,?,?,?,?)",
-                          (inv_id, st.customer_id, "invoice", round(delivered_value, 2), order.order_id, due, now_iso(), "", ""))
-            if float(cash_collected) > 0:
+                          (inv_id, st.customer_id, "invoice", delivered_value, order.order_id, due, now_iso(), "", ""))
+            if cash > 0:
                 c.execute("INSERT INTO ledger (entry_id, customer_id, kind, amount, ref, due_date, created_at, method, received_by) VALUES (?,?,?,?,?,?,?,?,?)",
-                          (new_id("PAY"), st.customer_id, "payment", -round(float(cash_collected), 2), stop_id, None, now_iso(), "cash", "driver"))
-        self.audit(actor, "close_stop", "stop", stop_id, {"status": status, "value": round(delivered_value, 2), "cash": cash_collected, "invoice": inv_id, "note": (note or "")[:200]}, approved_by=f"otp:{otp}")
-        if short:
-            self.notify("clerk", "delivery", f"Short delivery at {cust.name} on {plan.plan_id}: invoiced Rs {delivered_value:,.0f} of Rs {order.total:,.0f}" + (f" — {note}" if note else ""), stop_id)
-        return {"stop_id": stop_id, "status": status, "invoiced": round(delivered_value, 2), "cash_collected": float(cash_collected), "invoice_id": inv_id,
-                "customer_id": st.customer_id}
+                          (new_id("PAY"), st.customer_id, "payment", -cash, stop_id, None, now_iso(), "cash", "driver"))
+            result = {"stop_id": stop_id, "status": status, "invoiced": delivered_value, "cash_collected": cash, "invoice_id": inv_id,
+                      "customer_id": st.customer_id, "unaccounted": unaccounted}
+            try:
+                c.execute("INSERT INTO stop_closes (stop_id, client_ref, request_hash, result, created_at) VALUES (?,?,?,?,?)",
+                          (stop_id, client_ref, fingerprint, json.dumps(result), now_iso()))
+            except sqlite3.IntegrityError:
+                raise StateError(f"stop {stop_id} already closed (or client_ref {client_ref} already used)") from None
+            self.audit(actor, "close_stop", "stop", stop_id, {"status": status, "value": delivered_value, "cash": cash, "invoice": inv_id,
+                                                              "delivered": d_lines, "returned": r_lines, "unaccounted": unaccounted,
+                                                              "client_ref": client_ref, "note": (note or "")[:200]}, approved_by=f"otp:{otp}")
+            if short:
+                gap = ", ".join(f"{n} x {s}" for s, n in unaccounted.items())
+                self.notify("clerk", "delivery", f"Short delivery at {cust.name} on {plan.plan_id}: invoiced Rs {delivered_value:,.0f} of Rs {order.total:,.0f}"
+                            + (f"; {gap} unaccounted (neither delivered nor returned)" if gap else "") + (f" — {note}" if note else ""), stop_id)
+        return result | {"replayed": False}
 
     def complete_plan(self, plan_id: str, actor: str) -> DispatchPlan:
         with self._tx() as c:
