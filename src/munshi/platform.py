@@ -159,8 +159,8 @@ class MunshiPlatform:
         return content or "Done."
 
     def handle_message(self, thread_id: str, role: str, text: str, user: str = "") -> Reply:
-        with self._lock:
-            self.repo.set_current_user(user)
+        # Every write this turn makes -- including any tool the agent runs on a worker thread -- is `user`'s.
+        with self._lock, self.repo.acting_as(user):
             self.repo.add_chat(thread_id, role, text, {"user": user})
             with self._trace("manager", role, text) as tr:
                 specialist = classify(self.manager, text, role)
@@ -281,8 +281,11 @@ class MunshiPlatform:
                 return
 
     def resolve(self, approval_id: str, approve: bool, role: str, note: str = "", user: str = "") -> Reply:
-        with self._lock:
-            self.repo.set_current_user(user)
+        # The decision is the approver's act; the action it releases is the requester's. So the approval
+        # record is written as `user`, and the resumed turn runs as `pa.requested_by` with the approver
+        # alongside (audit approved_by) -- never as the approver, or the requester would vanish from
+        # created_by / the audit trail and could later clear their own request on the direct routes.
+        with self._lock, self.repo.acting_as(user):
             pa = self.pending.get(approval_id)
             if not pa:
                 raise KeyError(f"no pending approval {approval_id}")
@@ -300,17 +303,21 @@ class MunshiPlatform:
                 self.repo.resolve_approval(approval_id, approve, user or role, note)
                 self.repo.audit(role, "approval_" + ("granted" if approve else "rejected"), "approval", approval_id,
                                 {"tool": pa.tool, "args": pa.args, "specialist": pa.specialist, "note": note}, approved_by=role)
+                signature = (f"{role}:{user}" if user.strip() else role) if approve else ""
                 try:
-                    result = bundle.agent.invoke(Command(resume={"decisions": [decision]}), config=self._cfg(pa.thread_id, pa.requested_by_role, pa.specialist))
+                    with self.repo.acting_as(pa.requested_by, approved_by=signature):
+                        result = bundle.agent.invoke(Command(resume={"decisions": [decision]}), config=self._cfg(pa.thread_id, pa.requested_by_role, pa.specialist))
                 except Exception as e:      # the graph state is gone (e.g. checkpoints wiped); the approval stays resolved but unexecuted
                     log.exception("resume failed for %s", approval_id)
                     txt = f"Couldn't resume that action ({type(e).__name__}); please ask the munshi again."
                     self.repo.add_chat(pa.thread_id, "munshi", txt, {"specialist": pa.specialist, "resolved": approval_id, "approved": approve, "error": True})
                     return Reply(txt, pa.specialist, None, pa.thread_id)
                 # The resumed turn may go on to ask for another gated action ("confirm A, then B"): that gets its
-                # own card, on the requester's behalf, instead of a bare "Done." over a paused graph.
-                reply = self._settle(bundle, pa.specialist, pa.thread_id, pa.requested_by_role, pa.requested_by, result, tr,
-                                     lead="Approved. " if approve else "Rejected. ")
+                # own card, on the requester's behalf, instead of a bare "Done." over a paused graph. Anything the
+                # agent does while settling is the requester's too, but no longer covered by this approval.
+                with self.repo.acting_as(pa.requested_by):
+                    reply = self._settle(bundle, pa.specialist, pa.thread_id, pa.requested_by_role, pa.requested_by, result, tr,
+                                         lead="Approved. " if approve else "Rejected. ")
                 meta = {"specialist": pa.specialist, "resolved": approval_id, "approved": approve}
                 self.repo.add_chat(pa.thread_id, "munshi", reply.text, meta | ({"approval_id": reply.pending.approval_id} if reply.pending else {}))
                 if approve: self.deliver_messages()

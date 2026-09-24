@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from fastapi import Depends, Header, HTTPException, Request
+from starlette.concurrency import run_in_threadpool
 
 from munshi.auth import AuthError, Principal
 from munshi.domain.repository import MunshiRepository
@@ -64,9 +65,15 @@ class Ctx:
 
 
 def context(permission: str):
-    """Dependency: a Ctx for the caller's business, after the permission check."""
-    def dep(request: Request, p: Principal = Depends(require(permission))) -> Ctx:
-        platform = hub_of(request).platform(p.business_id)
-        platform.repo.set_current_user(p.name)
+    """Dependency: a Ctx for the caller's business, after the permission check.
+
+    Also names the caller as the acting user for every write this request makes. That identity
+    is a ContextVar, so it must be set in the request's own asyncio task: this dependency is
+    deliberately `async`. (A sync dependency runs on a worker thread in a COPY of the request's
+    context, so a value set there would silently never reach the endpoint -- whose own worker
+    thread gets a fresh copy of the task's context, with this caller's name in it.)"""
+    async def dep(request: Request, p: Principal = Depends(require(permission))) -> Ctx:
+        platform = await run_in_threadpool(hub_of(request).platform, p.business_id)   # may open/seed a database
+        platform.repo.set_current_user(p.name)          # this request's task only; never another request's
         return Ctx(p, platform)
     return dep
