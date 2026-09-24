@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from munshi.domain.models import Order, OrderItem
+from munshi.domain.models import Order, OrderItem, sql_business_date
 from munshi.domain.repository.base import CreditHoldError, InsufficientStockError, NotFoundError, StateError, new_id
 from munshi.domain.repository.master import MasterDataMixin
 
@@ -27,7 +27,7 @@ class OrdersMixin(MasterDataMixin):
         conds = []
         if status: conds.append("status=?"); a.append(status)
         if customer_id: conds.append("customer_id=?"); a.append(customer_id)
-        if day: conds.append("substr(created_at,1,10)=?"); a.append(day)
+        if day: conds.append(f"{sql_business_date('created_at')}=?"); a.append(day)
         if conds: q += " WHERE " + " AND ".join(conds)
         q += " ORDER BY created_at DESC, rowid DESC LIMIT ?"; a.append(limit)
         return [self._order_from_row(r) for r in self._all(q, tuple(a))]

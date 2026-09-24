@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import date
 
-from munshi.domain.models import Promise, Reminder, today_iso
+from munshi.domain.models import Promise, Reminder, business_today, today_iso
 from munshi.domain.repository.base import NotFoundError, new_id
 from munshi.domain.repository.cash import CashMixin
 
@@ -89,7 +89,7 @@ class CollectionsMixin(CashMixin):
         p = max(ps, key=lambda x: x.created_at)
         paid_since = -sum(e.amount for e in self.ledger_for(customer_id) if e.kind == "payment" and e.created_at >= p.created_at)
         kept = paid_since >= p.amount
-        broken = (not kept) and date.fromisoformat(p.promised_date) < date.today()
+        broken = (not kept) and date.fromisoformat(p.promised_date) < business_today()
         return {"promise_id": p.promise_id, "amount": p.amount, "date": p.promised_date, "kept": kept, "broken": broken}
 
     def broken_promises(self) -> list[dict]:

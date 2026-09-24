@@ -7,11 +7,11 @@ import json
 import math
 import secrets
 import sqlite3
-from datetime import date, timedelta
+from datetime import timedelta
 
-from munshi.domain.models import DeliveryStop, DispatchPlan, OrderItem, now_iso
+from munshi.domain.models import DeliveryStop, DispatchPlan, OrderItem, business_today, now_iso
 from munshi.domain.repository.base import CapacityError, NotFoundError, OtpError, StateError, new_id
-from munshi.domain.repository.guarded import ensure_stop_closes, immediate_tx, request_hash
+from munshi.domain.repository.guarded import immediate_tx, request_hash
 from munshi.domain.repository.orders import OrdersMixin
 
 MAX_LINE_QTY = 100_000
@@ -171,7 +171,6 @@ class DispatchMixin(OrdersMixin):
         if not math.isfinite(cash) or cash < 0: raise ValueError("cash collected cannot be negative")
         cash = round(cash, 2)
         fingerprint = request_hash(delivered, returned, cash)
-        ensure_stop_closes(self)
 
         with immediate_tx(self) as c:
             st = self.get_stop(stop_id)
@@ -219,7 +218,7 @@ class DispatchMixin(OrdersMixin):
             inv_id = None
             if delivered_value > 0:
                 inv_id = new_id(self.setting("invoice_prefix") or "INV")
-                due = (date.today() + timedelta(days=cust.credit_days or int(self.setting("credit_days")))).isoformat()
+                due = (business_today() + timedelta(days=cust.credit_days or int(self.setting("credit_days")))).isoformat()
                 c.execute("INSERT INTO ledger (entry_id, customer_id, kind, amount, ref, due_date, created_at, method, received_by) VALUES (?,?,?,?,?,?,?,?,?)",
                           (inv_id, st.customer_id, "invoice", delivered_value, order.order_id, due, now_iso(), "", ""))
             if cash > 0:
