@@ -29,6 +29,7 @@ from fastapi.staticfiles import StaticFiles
 
 from munshi.auth import AuthError
 from munshi.auth.ratelimit import RateLimiter
+from munshi.domain.models import business_now, business_today
 from munshi.domain.repository import CapacityError, CreditHoldError, InsufficientStockError, NotFoundError, OtpError, StateError
 from munshi.llm.factory import build_chat_model
 from munshi.tenancy.hub import TenantHub
@@ -77,7 +78,7 @@ def nightly_backup(hub: TenantHub, keep_days: int = 14) -> list[str]:
     """A consistent copy of every business file under data/backups, pruning copies older than keep_days."""
     if hub.in_memory: return []
     out = Path(hub.data_dir) / "backups"; out.mkdir(parents=True, exist_ok=True)
-    today = datetime.now().date().isoformat(); written = []
+    today = business_today().isoformat(); written = []
     for b in hub.registry.list_businesses():
         if not b["active"]: continue
         target = out / f"{b['business_id']}-{today}.db"
@@ -95,8 +96,10 @@ def nightly_backup(hub: TenantHub, keep_days: int = 14) -> list[str]:
 def scheduler_tick(hub: TenantHub, sent_today: dict[str, str], now: datetime | None = None) -> list[str]:
     """One pass over every business: deliver the outbox; at the business's digest_time, write the
     owner's digest as a notification and queue it to the owner's WhatsApp; at MUNSHI_BACKUP_TIME,
-    back every business up. Returns the businesses digested."""
-    now = now or datetime.now()
+    back every business up. digest_time and MUNSHI_BACKUP_TIME are business-local (Asia/Karachi)
+    wall-clock times, so `now` is evaluated in that zone regardless of the server's own timezone.
+    Returns the businesses digested."""
+    now = now or business_now()
     hhmm, today = now.strftime("%H:%M"), now.date().isoformat()
     digested = []
     if hhmm == os.environ.get("MUNSHI_BACKUP_TIME", "02:30") and sent_today.get("__backup__") != today:

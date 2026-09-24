@@ -1,17 +1,22 @@
 """Read-only views the owner runs the business on: the daily digest, sales,
-margin, stock ledger, collection rate, top customers, slow stock."""
+margin, stock ledger, collection rate, top customers, slow stock.
+
+Every "day" here is a Pakistan business day (Asia/Karachi): stored UTC
+timestamps are converted with sql_business_date / to_business_date, and
+"today" comes from today_iso(), never from the server's OS clock."""
 from __future__ import annotations
 
-from datetime import date, timedelta
+import json
+from datetime import timedelta
 
-from munshi.domain.models import today_iso
+from munshi.domain.models import Order, business_today, sql_business_date, to_business_date, today_iso
 from munshi.domain.repository.collections import CollectionsMixin
 
 
 class ReportsMixin(CollectionsMixin):
     def digest(self, day: str | None = None) -> dict:
         day = day or today_iso()
-        orders_today = self.list_orders(limit=500, day=day)
+        orders_today = self._orders_on(day)
         plans = self.list_plans(day)
         stops = [s for p in plans for s in self.list_stops(p.plan_id)]
         cash = round(sum(s.cash_collected for s in stops), 2)
@@ -40,20 +45,26 @@ class ReportsMixin(CollectionsMixin):
             "broken_promises": len(self.broken_promises()),
         }
 
+    def _orders_on(self, day: str, limit: int = 500) -> list[Order]:
+        """Orders booked on a Pakistan business day. (OrdersMixin.list_orders(day=...)
+        filters on the UTC date prefix, which is a day behind between 00:00 and 05:00 PKT.)"""
+        rows = self._all("SELECT * FROM orders WHERE " + sql_business_date("created_at") + "=? ORDER BY created_at DESC, rowid DESC LIMIT ?", (day, limit))
+        return [self._order_from_row(r) for r in rows]
+
     def sales_report(self, start: str, end: str) -> dict:
         """Invoiced sales between two dates, by day, product and customer, with gross margin at current cost."""
         invoices = [e for e in self.ledger_between(start, end, "invoice") if e.method != "adjustment"]   # opening balances aren't sales
         by_day: dict[str, float] = {}
         by_cust: dict[str, float] = {}
         for e in invoices:
-            by_day[e.created_at[:10]] = round(by_day.get(e.created_at[:10], 0) + e.amount, 2)
+            d = to_business_date(e.created_at).isoformat()
+            by_day[d] = round(by_day.get(d, 0) + e.amount, 2)
             by_cust[e.customer_id] = round(by_cust.get(e.customer_id, 0) + e.amount, 2)
         # product mix from what was actually delivered
         by_sku: dict[str, dict] = {}
         cost_total = 0.0
         prods = {p.sku: p for p in self.list_products(include_inactive=True)}
-        for r in self._all("SELECT s.delivered_items, o.items FROM stops s JOIN orders o ON o.order_id=s.order_id WHERE s.status IN ('delivered','short') AND substr(s.closed_at,1,10) BETWEEN ? AND ?", (start, end)):
-            import json
+        for r in self._all("SELECT s.delivered_items, o.items FROM stops s JOIN orders o ON o.order_id=s.order_id WHERE s.status IN ('delivered','short') AND " + sql_business_date("s.closed_at") + " BETWEEN ? AND ?", (start, end)):
             prices = {i["sku"]: i["unit_price"] for i in json.loads(r["items"])}
             for d in json.loads(r["delivered_items"]):
                 q = int(d["qty"]); sku = d["sku"]
@@ -108,8 +119,8 @@ class ReportsMixin(CollectionsMixin):
         return {"at_cost": round(total_cost, 2), "at_sale": round(total_sale, 2), "rows": sorted(rows, key=lambda r: -r["at_cost"])}
 
     def slow_stock(self, days: int = 30) -> list[dict]:
-        since = (date.today() - timedelta(days=days)).isoformat()
-        sold = {r["sku"] for r in self._all("SELECT DISTINCT sku FROM stock_moves WHERE kind='sale' AND substr(created_at,1,10)>=?", (since,))}
+        since = (business_today() - timedelta(days=days)).isoformat()
+        sold = {r["sku"] for r in self._all("SELECT DISTINCT sku FROM stock_moves WHERE kind='sale' AND " + sql_business_date("created_at") + ">=?", (since,))}
         prods = {p.sku: p for p in self.list_products()}
         out: dict[str, int] = {}
         for s in self.list_stock():
@@ -118,7 +129,7 @@ class ReportsMixin(CollectionsMixin):
         return sorted([{"sku": k, "name": prods[k].name, "on_hand": v, "value_at_cost": round(v * prods[k].cost_price, 2), "days_without_sale": days} for k, v in out.items()], key=lambda r: -r["value_at_cost"])
 
     def top_customers(self, days: int = 30, limit: int = 10) -> list[dict]:
-        start = (date.today() - timedelta(days=days)).isoformat()
+        start = (business_today() - timedelta(days=days)).isoformat()
         return self.sales_report(start, today_iso())["by_customer"][:limit]
 
     def profit_summary(self, start: str, end: str) -> dict:

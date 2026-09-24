@@ -8,7 +8,7 @@ import os
 from dataclasses import asdict
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from munshi.domain.models import today_iso
 from munshi.safety.risk import role_may_approve
@@ -59,10 +59,17 @@ class PlanIn(BaseModel):
     plan_date: str = ""
 
 
+class StopLineIn(BaseModel):
+    """One product on a stop. Repeats of a sku are summed by the repository and capped by what was loaded."""
+    model_config = ConfigDict(extra="forbid")
+    sku: str = Field(min_length=1, max_length=40)
+    qty: int = Field(ge=0, le=100000, strict=True)
+
+
 class CloseIn(BaseModel):
-    delivered_items: list[dict]
-    returned_items: list[dict] = []
-    cash_collected: float = Field(default=0, ge=0)
+    delivered_items: list[StopLineIn] = Field(max_length=200)
+    returned_items: list[StopLineIn] = Field(default_factory=list, max_length=200)
+    cash_collected: float = Field(default=0, ge=0, allow_inf_nan=False)
     otp: str = Field(min_length=4, max_length=4, pattern="^\\d{4}$")
     client_ref: str = Field(default="", max_length=40)     # idempotency key from the offline queue
     note: str = Field(default="", max_length=200)
@@ -259,15 +266,12 @@ def driver_today(c: Ctx = Depends(context("stops:close"))):
 
 @router.post("/stops/{stop_id}/close")
 def close_stop(stop_id: str, body: CloseIn, c: Ctx = Depends(context("stops:close"))):
-    # idempotent for the offline queue: a replayed close of an already-closed stop returns the recorded result
-    st = c.repo.get_stop(stop_id)
-    if st.status != "pending" and body.client_ref:
-        rows = c.repo.audit_log(5, stop_id)
-        if rows:
-            p = rows[0]["payload"]
-            return {"stop_id": stop_id, "status": st.status, "invoiced": p.get("value", 0), "cash_collected": st.cash_collected, "invoice_id": p.get("invoice"), "replayed": True}
-    r = c.repo.close_stop(stop_id, body.delivered_items, body.returned_items, body.cash_collected, body.otp, c.role, body.note)
-    if r.get("invoice_id"):
+    # Idempotency and the race guard live in the repository (one write-locked transaction, guarded UPDATE,
+    # client_ref stored UNIQUE): an exact replay from the offline queue returns the recorded result with
+    # replayed=True; any other close of an already-closed stop is a 409 "already ...".
+    r = c.repo.close_stop(stop_id, [ln.model_dump() for ln in body.delivered_items], [ln.model_dump() for ln in body.returned_items],
+                          body.cash_collected, body.otp, c.role, body.note, client_ref=body.client_ref)
+    if r.get("invoice_id") and not r.get("replayed"):     # a replay must not message the customer again
         cust = c.repo.get_customer(r["customer_id"])
         c.repo.queue_message("whatsapp", cust.phone, f"{c.repo.business_name}: delivered. Invoice {r['invoice_id']} Rs {r['invoiced']:,.0f}, cash received Rs {r['cash_collected']:,.0f}. Balance Rs {c.repo.outstanding(r['customer_id']):,.0f}.", r["invoice_id"])
         c.platform.deliver_messages()

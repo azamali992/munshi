@@ -6,7 +6,16 @@ from __future__ import annotations
 import json
 from datetime import date
 
-from munshi.domain.models import CashDeposit, Expense, LedgerEntry, Purchase, SupplierLedgerEntry, today_iso
+from munshi.domain.models import (
+    CashDeposit,
+    Expense,
+    LedgerEntry,
+    Purchase,
+    SupplierLedgerEntry,
+    business_today,
+    sql_business_date,
+    today_iso,
+)
 from munshi.domain.repository.base import NotFoundError, StateError, new_id
 from munshi.domain.repository.dispatch import DispatchMixin
 
@@ -53,7 +62,8 @@ class CashMixin(DispatchMixin):
         return self._ledger(r)
 
     def ledger_between(self, start: str, end: str, kind: str | None = None) -> list[LedgerEntry]:
-        q, a = "SELECT * FROM ledger WHERE substr(created_at,1,10) BETWEEN ? AND ?", [start, end]
+        """Entries whose Pakistan business day falls in [start, end] (inclusive, YYYY-MM-DD)."""
+        q, a = f"SELECT * FROM ledger WHERE {sql_business_date('created_at')} BETWEEN ? AND ?", [start, end]
         if kind: q += " AND kind=?"; a.append(kind)
         return [self._ledger(r) for r in self._all(q + " ORDER BY created_at, rowid", tuple(a))]
 
@@ -75,7 +85,7 @@ class CashMixin(DispatchMixin):
         return self.add_ledger(customer_id, "payment", -abs(float(amount)), ref or method, None, actor, approved_by, method, received_by or self._current_user())
 
     def opening_balance(self, customer_id: str, amount: float, actor: str, approved_by: str | None = None) -> LedgerEntry:
-        """Bring a customer's paper khata in: one invoice-like entry dated today."""
+        """Bring a customer's paper khata in: one invoice-like entry dated today (Pakistan business day)."""
         due = today_iso()
         return self.add_ledger(customer_id, "invoice", abs(float(amount)), "opening balance", due, actor, approved_by, "adjustment")
 
@@ -154,7 +164,7 @@ class CashMixin(DispatchMixin):
 
     # ------------------------------------------------------------ cashbook
     def cashbook(self, day: str | None = None) -> dict:
-        """Everything that touched physical cash on a day, in and out."""
+        """Everything that touched physical cash on a Pakistan business day, in and out."""
         day = day or today_iso()
         ins, outs = [], []
         for e in self.ledger_between(day, day, "payment"):
@@ -163,10 +173,10 @@ class CashMixin(DispatchMixin):
                 ins.append({"kind": "customer payment", "who": who, "amount": abs(e.amount), "ref": e.entry_id, "by": e.received_by, "at": e.created_at})
         for x in self.expenses_between(day, day):
             if x.method == "cash": outs.append({"kind": f"expense · {x.category}", "who": x.note or x.category, "amount": x.amount, "ref": x.expense_id, "by": x.paid_by, "at": x.created_at})
-        for r in self._all("SELECT * FROM supplier_ledger WHERE kind='payment' AND method='cash' AND substr(created_at,1,10)=?", (day,)):
+        for r in self._all("SELECT * FROM supplier_ledger WHERE kind='payment' AND method='cash' AND " + sql_business_date("created_at") + "=?", (day,)):
             outs.append({"kind": "supplier payment", "who": self.get_supplier(r["supplier_id"]).name, "amount": abs(r["amount"]), "ref": r["entry_id"], "by": "", "at": r["created_at"]})
         deposits = [{"kind": "driver hand-in", "who": self.get_vehicle(self.get_plan(r["plan_id"]).vehicle_id).plate, "amount": r["amount_counted"], "ref": r["deposit_id"], "by": r["counted_by"], "at": r["deposited_at"]}
-                    for r in self._all("SELECT * FROM deposits WHERE substr(deposited_at,1,10)=?", (day,))]
+                    for r in self._all("SELECT * FROM deposits WHERE " + sql_business_date("deposited_at") + "=?", (day,))]
         total_in = round(sum(i["amount"] for i in ins), 2); total_out = round(sum(o["amount"] for o in outs), 2)
         return {"date": day, "cash_in": ins, "driver_handins": deposits, "cash_out": outs,
                 "total_in": total_in, "total_handins": round(sum(d["amount"] for d in deposits), 2), "total_out": total_out,
@@ -174,4 +184,4 @@ class CashMixin(DispatchMixin):
 
     @staticmethod
     def _today() -> date:
-        return date.today()
+        return business_today()
