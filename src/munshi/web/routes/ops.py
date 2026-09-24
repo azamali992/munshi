@@ -1,7 +1,13 @@
 """Operations: chat with the munshis, approvals, notifications, orders,
 dispatch plans and the driver's stops. Form-based writes (a clerk tapping
 'Confirm' instead of asking the agent) go straight to the repository with
-the human recorded as both actor and approver."""
+the human recorded as both actor and approver.
+
+Four-eyes on direct taps: a draft order or a planned dispatch is a request
+made by a named person. Confirming, allocating or loading it is the approval,
+and it goes through the same policy the chat approval cards use
+(safety.risk.approval_refusal). Whoever drafted or edited the request can't
+clear it; the owner may clear anything, including their own."""
 from __future__ import annotations
 
 import os
@@ -10,8 +16,8 @@ from dataclasses import asdict
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, ConfigDict, Field
 
-from munshi.domain.models import today_iso
-from munshi.safety.risk import role_may_approve
+from munshi.domain.models import Order, today_iso
+from munshi.safety.risk import approval_refusal, approver_for, role_may_approve, stricter_role
 from munshi.web.deps import Ctx, context
 
 router = APIRouter(prefix="/api", tags=["operations"])
@@ -81,6 +87,52 @@ class DepositIn(BaseModel):
 
 def _pending_out(c: Ctx, p: dict) -> dict:
     return p | {"can_approve": role_may_approve(c.role, p["tool"]) and (c.role == "owner" or p["needs_role"] == "clerk")}
+
+
+# ---------------------------------------------------------------- four-eyes for direct taps
+def _authors(c: Ctx, entity_id: str, actions: set[str], *also: str) -> list[str]:
+    """Everyone who put their name to this request: whoever created it, and anyone who edited it since.
+    Taken from the audit trail, which records the signed-in user on every write."""
+    names = list(also) + [a.get("user") or "" for a in c.repo.audit_log(1000, entity_id) if a["action"] in actions]
+    return list(dict.fromkeys(n for n in names if n.strip()))
+
+
+def _order_authors(c: Ctx, o: Order) -> list[str]:
+    # editing a draft rewrites what is being asked for, so an editor is a requester too
+    return _authors(c, o.order_id, {"create_order", "order_edited"}, o.created_by)
+
+
+def _four_eyes(c: Ctx, tool: str, needs_role: str, requesters: list[str]) -> None:
+    """The chat approval cards' policy (safety.risk.approval_refusal), applied to a form tap:
+    403 unless the caller's role may clear `tool` at `needs_role`, and -- unless they're the
+    owner -- they are none of the people who asked for it."""
+    for who in requesters or [""]:
+        why = approval_refusal(c.role, tool, needs_role, approver=c.who, requester=who)
+        if why:
+            raise HTTPException(403, why)
+
+
+def _held_when_drafted(c: Ctx, order_id: str) -> bool:
+    """Was this order put on credit hold (routed to the owner) when it was drafted? The hold
+    notification is that record; nothing deletes notifications, only marks them read."""
+    return c.repo._one("SELECT 1 FROM notifications WHERE kind='credit_hold' AND ref=? LIMIT 1", (order_id,)) is not None
+
+
+def _confirm_needs(c: Ctx, o: Order) -> tuple[str, str]:
+    """(who must confirm this order, why the owner if it's the owner). Like the chat path's
+    re-check at decision time, this only ever gets stricter: an order that went on credit hold
+    when it was drafted stays the owner's to confirm even if its customer's limit is raised later."""
+    need, why = approver_for("confirm_order"), []
+    limit = float(c.repo.setting("big_order_limit") or 0)
+    if limit and o.total > limit:
+        need = stricter_role(need, "owner"); why.append(f"orders above Rs {limit:,.0f} need the owner")
+    hold = c.repo.over_credit(o)
+    if hold:
+        need = stricter_role(need, "owner"); why.append(hold + " — the owner must confirm")
+    elif _held_when_drafted(c, o.order_id):
+        need = stricter_role(need, "owner")
+        why.append(f"order {o.order_id} went on credit hold when it was drafted — the owner must confirm it, even if the credit limit has since been raised")
+    return need, "; ".join(why)
 
 
 # ---------------------------------------------------------------- chat + approvals
@@ -173,12 +225,10 @@ def edit_order(order_id: str, body: OrderPatch, c: Ctx = Depends(context("orders
 @router.post("/orders/{order_id}/confirm")
 def confirm(order_id: str, c: Ctx = Depends(context("dispatch:write"))):
     o = c.repo.get_order(order_id)
-    limit = float(c.repo.setting("big_order_limit") or 0)
-    if limit and o.total > limit and c.role != "owner":
-        raise HTTPException(403, f"orders above Rs {limit:,.0f} need the owner")
-    hold = c.repo.over_credit(o)
-    if hold and c.role != "owner":
-        raise HTTPException(403, hold + " — the owner must confirm")
+    need, why_owner = _confirm_needs(c, o)
+    if need == "owner" and c.role != "owner":
+        raise HTTPException(403, why_owner)
+    _four_eyes(c, "confirm_order", need, _order_authors(c, o))
     return c.platform.ops._order(c.repo.confirm_order(order_id, c.role, c.signature, override_credit=c.role == "owner"))
 
 
@@ -189,6 +239,7 @@ def cancel(order_id: str, body: CancelIn, c: Ctx = Depends(context("dispatch:wri
 
 @router.post("/orders/{order_id}/allocate")
 def allocate(order_id: str, body: AllocateIn, c: Ctx = Depends(context("dispatch:write"))):
+    _four_eyes(c, "allocate_order", approver_for("allocate_order"), _order_authors(c, c.repo.get_order(order_id)))
     return c.repo.allocate_order(order_id, body.warehouse_id or c.repo.default_warehouse_id(), c.role, c.signature)
 
 
@@ -239,6 +290,8 @@ def create_plan(body: PlanIn, c: Ctx = Depends(context("dispatch:write"))):
 
 @router.post("/plans/{plan_id}/approve")
 def approve_plan(plan_id: str, c: Ctx = Depends(context("dispatch:write"))):
+    c.repo.get_plan(plan_id)       # 404 before anything else
+    _four_eyes(c, "approve_dispatch_plan", approver_for("approve_dispatch_plan"), _authors(c, plan_id, {"create_dispatch_plan"}))
     p = c.repo.approve_dispatch_plan(plan_id, c.role, c.signature)
     c.platform.deliver_messages()
     return _plan_out(c, p)
