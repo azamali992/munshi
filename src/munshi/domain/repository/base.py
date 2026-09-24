@@ -9,6 +9,8 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any, Iterator
 
 from munshi.domain.migrations import migrate
@@ -38,6 +40,22 @@ DEFAULT_SETTINGS = {
     "default_warehouse": "",
     "big_order_limit": "500000",   # orders above this need the owner even for a clerk
 }
+
+
+@dataclass(frozen=True)
+class Acting:
+    """Who the current operation is for, and (for a resumed approved action) who approved it."""
+    user: str = ""
+    approved_by: str = ""
+
+
+_NOBODY = Acting()
+_ACTING: ContextVar[Acting | None] = ContextVar("munshi_acting", default=None)
+_BARE_ROLES = frozenset({"owner", "clerk", "salesman", "driver"})
+
+
+def _acting() -> Acting:
+    return _ACTING.get() or _NOBODY
 
 
 def new_id(prefix: str) -> str:
@@ -109,6 +127,7 @@ class RepositoryBase:
     # ------------------------------------------------------------ audit
     def audit(self, actor: str, action: str, entity: str, entity_id: str, payload: dict,
               approved_by: str | None = None, user: str = "") -> AuditRow:
+        approved_by = self._approval_signature(approved_by)
         row = AuditRow(new_id("AUD"), actor, action, entity, entity_id, approved_by, payload, user=user or self._current_user())
         with self._tx() as c:
             c.execute("INSERT INTO audit (audit_id, actor, action, entity, entity_id, approved_by, payload, created_at, user) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -122,18 +141,47 @@ class RepositoryBase:
             rows = self._all("SELECT * FROM audit ORDER BY created_at DESC LIMIT ?", (limit,))
         return [dict(r) | {"payload": json.loads(r["payload"])} for r in rows]
 
-    # The signed-in human behind the current operation, set by the platform /
-    # web layer before each unit of work (the platform lock serialises work per
-    # business, and agent tool calls may run on worker threads, so this is an
-    # instance attribute rather than a thread-local). Every audit row written
-    # during that work carries their name.
-    _user: str = ""
+    # ------------------------------------------------------------ who is acting
+    # The signed-in human behind the current operation lives in a ContextVar,
+    # NOT on the repository: one repository is shared by every request and chat
+    # turn for a business, and the direct API routes don't take the platform
+    # lock, so a shared slot let concurrent requests stamp each other's names.
+    # A ContextVar is private to the thread / asyncio task that set it, and is
+    # carried into LangGraph's and anyio's worker threads (both run work via
+    # contextvars.copy_context()), so an agent's tool call sees its caller's
+    # identity and nobody else's.
+    #
+    # `user` is who the write is done FOR (the requester, even when a gated
+    # tool resumes after someone else approved it); `approved_by` is the named
+    # approver of the action now running, if any -- two different facts.
+    @contextmanager
+    def acting_as(self, user: str | None, approved_by: str = "") -> Iterator[None]:
+        """Attribute every write inside this block to `user` (and, for a resumed approved
+        action, to approver `approved_by`); the previous identity is restored on exit."""
+        token = _ACTING.set(Acting(user or "", approved_by or ""))
+        try:
+            yield
+        finally:
+            _ACTING.reset(token)
 
     def set_current_user(self, user: str | None) -> None:
-        self._user = user or ""
+        """Set the acting user for the rest of the CURRENT context (this thread, or this
+        asyncio task) only. Prefer acting_as(); this is for a request-scoped dependency
+        whose context ends with the request."""
+        _ACTING.set(Acting(user or ""))
 
     def _current_user(self) -> str:
-        return self._user
+        return _acting().user
+
+    @staticmethod
+    def _approval_signature(approved_by: str | None) -> str | None:
+        """Inside a resumed, approved action the named approver replaces a missing or bare-role
+        approved_by (the tools' defaults, e.g. "clerk"); anything more specific (otp:NNNN,
+        role:Name) is the caller's own record and is kept."""
+        ctx = _acting().approved_by
+        if ctx and (approved_by is None or approved_by in _BARE_ROLES):
+            return ctx
+        return approved_by
 
     # ------------------------------------------------------------ notifications
     def notify(self, for_role: str, kind: str, text: str, ref: str = "") -> Notification:
