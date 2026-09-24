@@ -22,10 +22,15 @@ def H(c, role):
 def _run_order_to_delivery(c, K):
     r = c.post("/api/chat", json={"thread_id": "m", "text": "Chaudhry Farms ko 20 urea bhej do"}, headers=K).json()
     # four-eyes: the clerk who asked can't clear it; the demo has one clerk, so the owner does
-    assert c.post(f"/api/approvals/{r['pending']['approval_id']}", json={"approve": True}, headers=H(c, "owner")).status_code == 200
+    O = H(c, "owner")
+    assert c.post(f"/api/approvals/{r['pending']['approval_id']}", json={"approve": True}, headers=O).status_code == 200
     oid = c.get("/api/orders?status=draft", headers=K).json()[0]["order_id"]
-    assert c.post(f"/api/orders/{oid}/confirm", headers=K).json()["status"] == "confirmed"
-    assert c.post(f"/api/orders/{oid}/allocate", json={}, headers=K).json()["status"] == "allocated"
+    # the order is still the clerk's request (created_by is the requester, not the owner who approved the card),
+    # so the clerk can't confirm or allocate it himself either; the owner is the demo's second person again
+    assert c.post(f"/api/orders/{oid}/confirm", headers=K).status_code == 403
+    assert c.post(f"/api/orders/{oid}/confirm", headers=O).json()["status"] == "confirmed"
+    assert c.post(f"/api/orders/{oid}/allocate", json={}, headers=K).status_code == 403
+    assert c.post(f"/api/orders/{oid}/allocate", json={}, headers=O).json()["status"] == "allocated"
     p = c.post("/api/plans", json={"route_id": "R-MULTAN-N", "vehicle_id": "V-01", "order_ids": [oid]}, headers=K).json()
     # four-eyes: the clerk who planned it can't also load it; the demo's second person is the owner
     p = c.post(f"/api/plans/{p['plan_id']}/approve", headers=H(c, "owner")).json()
@@ -79,7 +84,8 @@ def test_chat_approval_roundtrip_with_user_attribution(c):
     d = c.post(f"/api/approvals/{aid}", json={"approve": True}, headers=O).json()
     assert "ORD-" in d["text"] and c.get("/api/approvals", headers=K).json() == []
     audit = c.get("/api/audit", headers=K).json()
-    assert audit[0]["action"] == "create_order" and audit[0]["user"] == "Sultan Ahmed"
+    # the order is the clerk's request; the owner's approval is recorded next to it, not instead of it
+    assert audit[0]["action"] == "create_order" and audit[0]["user"] == "Bilal Hussain" and audit[0]["approved_by"] == "owner:Sultan Ahmed"
     hist = c.get("/api/approvals/history", headers=K).json()[0]
     assert hist["requested_by"] == "Bilal Hussain" and hist["resolved_by"] == "Sultan Ahmed"
 
