@@ -187,10 +187,13 @@ def test_a_month_of_books_reconciles_to_the_paisa(clock, capsys):
     assert repo.cost_of_goods_sold_paisa() == cogs == 46_342_910
     assert opening + purchases - returned_purchase - cogs - write_off == to_paisa(val["at_cost"]) == 130_055_965
     assert repo._one("SELECT SUM(value_paisa) v FROM stock_moves")["v"] == to_paisa(val["at_cost"])     # the value ledger replays too
-    # profit for the month: revenue 115,500 + 203,580 + 125,000 + 38,500 = 482,580.00 (opening balance is not a sale)
+    # profit for the month: invoiced 115,500 + 203,580 + 125,000 + 38,500 = 482,580.00 (opening balance is not a sale),
+    # less the Sep 28 credit note 5,000 = revenue 477,580.00.  COGS 463,429.10 is untouched (the damaged bags weren't
+    # returned to stock), so margin 477,580 - 463,429.10 = 14,150.90;  net 14,150.90 - 5,500 = 8,650.90
     month = repo.profit_summary("2026-09-01", "2026-09-30")
-    assert (month["revenue"], month["cost_of_goods"], month["gross_margin"], month["expenses"], month["net"]) == \
-           (482_580.0, 463_429.10, 19_150.90, 5_500.0, 13_650.90)
+    assert (month["revenue"], month["credit_notes"], month["cost_of_goods"], month["gross_margin"], month["expenses"], month["net"]) == \
+           (477_580.0, 5_000.0, 463_429.10, 14_150.90, 5_500.0, 8_650.90)
+    assert repo.collection_report("2026-09-01", "2026-09-30")["credit_notes"] == month["credit_notes"]
     assert repo.sales_report("2026-09-03", "2026-09-03") == sep3
     # gapless, per series, in the order the documents were raised
     ids = lambda kind: [r["entry_id"] for r in repo._all("SELECT entry_id FROM ledger WHERE doc_no IS NOT NULL AND entry_id LIKE ? ORDER BY rowid", (kind + "-%",))]  # noqa: E731
