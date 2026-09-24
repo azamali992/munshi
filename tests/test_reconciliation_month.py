@@ -189,10 +189,14 @@ def test_a_month_of_books_reconciles_to_the_paisa(clock, capsys):
     assert repo._one("SELECT SUM(value_paisa) v FROM stock_moves")["v"] == to_paisa(val["at_cost"])     # the value ledger replays too
     # profit for the month: invoiced 115,500 + 203,580 + 125,000 + 38,500 = 482,580.00 (opening balance is not a sale),
     # less the Sep 28 credit note 5,000 = revenue 477,580.00.  COGS 463,429.10 is untouched (the damaged bags weren't
-    # returned to stock), so margin 477,580 - 463,429.10 = 14,150.90;  net 14,150.90 - 5,500 = 8,650.90
+    # returned to stock), so margin 477,580 - 463,429.10 = 14,150.90.  Expenses: fuel 55,000 - 55,000 + 5,500, plus the
+    # Sep 3 driver shortfall (collected 50,000, handed in 49,500) booked as a 500 cash_shortage = 6,000;
+    # net 14,150.90 - 6,000 = 8,150.90.  (The shortfall is not a cash-out: the cashbook totals above are unchanged.)
     month = repo.profit_summary("2026-09-01", "2026-09-30")
     assert (month["revenue"], month["credit_notes"], month["cost_of_goods"], month["gross_margin"], month["expenses"], month["net"]) == \
-           (477_580.0, 5_000.0, 463_429.10, 14_150.90, 5_500.0, 8_650.90)
+           (477_580.0, 5_000.0, 463_429.10, 14_150.90, 6_000.0, 8_150.90)
+    assert month["expenses_by_category"] == {"fuel": 5_500.0, "cash_shortage": 500.0}
+    assert repo.cashbook("2026-09-03")["total_shortfall"] == 500.0
     assert repo.collection_report("2026-09-01", "2026-09-30")["credit_notes"] == month["credit_notes"]
     assert repo.sales_report("2026-09-03", "2026-09-03") == sep3
     # gapless, per series, in the order the documents were raised
