@@ -60,7 +60,20 @@ V3 = """
 ALTER TABLE stops ADD COLUMN note TEXT DEFAULT '';
 """
 
-MIGRATIONS: list[tuple[int, str]] = [(1, V1), (2, V2), (3, V3)]
+# Durable idempotency record for delivery-stop closes: one row per closed stop
+# (PRIMARY KEY stop_id — a second close of the same stop cannot be recorded even
+# if the status guard were bypassed) plus the client's idempotency key (UNIQUE
+# client_ref — a key belongs to one close).
+V4 = """
+CREATE TABLE IF NOT EXISTS stop_closes (
+ stop_id TEXT PRIMARY KEY REFERENCES stops(stop_id),
+ client_ref TEXT UNIQUE CHECK (client_ref IS NULL OR length(client_ref) BETWEEN 1 AND 64),
+ request_hash TEXT NOT NULL,
+ result TEXT NOT NULL,
+ created_at TEXT NOT NULL);
+"""
+
+MIGRATIONS: list[tuple[int, str]] = [(1, V1), (2, V2), (3, V3), (4, V4)]
 
 
 def current_version(conn: sqlite3.Connection) -> int:

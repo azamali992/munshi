@@ -10,10 +10,8 @@ it (audit, move_stock, notify) join the same transaction.
 one row per closed stop (PRIMARY KEY stop_id — a second close of the same
 stop cannot be recorded even if the status guard were bypassed) and the
 client's idempotency key (UNIQUE client_ref — a key belongs to one close).
-
-NOTE for the migrations owner: this table is created lazily here because
-this change was scoped away from migrations.py. It is safe to fold the DDL
-below into the next numbered migration verbatim (it is IF NOT EXISTS).
+The table itself is created by migration V4 (domain/migrations.py), which
+every repository connection applies on construction.
 """
 from __future__ import annotations
 
@@ -22,23 +20,6 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from typing import Iterator
-
-STOP_CLOSES_DDL = (
-    "CREATE TABLE IF NOT EXISTS stop_closes ("
-    " stop_id TEXT PRIMARY KEY REFERENCES stops(stop_id),"
-    " client_ref TEXT UNIQUE CHECK (client_ref IS NULL OR length(client_ref) BETWEEN 1 AND 64),"
-    " request_hash TEXT NOT NULL,"
-    " result TEXT NOT NULL,"
-    " created_at TEXT NOT NULL)"
-)
-
-
-def ensure_stop_closes(repo) -> None:
-    if getattr(repo, "_stop_closes_ready", False):
-        return
-    with repo._lock:
-        repo._conn.execute(STOP_CLOSES_DDL)
-        repo._stop_closes_ready = True
 
 
 @contextmanager

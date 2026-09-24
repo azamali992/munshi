@@ -19,8 +19,9 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import date
 from pathlib import Path
+
+from munshi.domain.models import business_today
 
 
 def _hub():
@@ -73,7 +74,7 @@ def cmd_reset_pin(a):
 def cmd_backup(a):
     hub = _hub(); hub.registry.get_business(a.business_id)
     out = Path(a.out or (hub.data_dir / "backups")); out.mkdir(parents=True, exist_ok=True)
-    target = out / f"{a.business_id}-{date.today().isoformat()}.db"
+    target = out / f"{a.business_id}-{business_today().isoformat()}.db"
     if target.exists(): target.unlink()
     repo = hub.platform(a.business_id).repo
     with repo._lock:
