@@ -3,6 +3,7 @@ from datetime import date, timedelta
 
 import pytest
 
+from munshi.domain.models import today_iso  # the Pakistan business day, not the host OS date
 from munshi.domain.repository import InsufficientStockError, NotFoundError, StateError
 from munshi.domain.seed import seeded_repository
 
@@ -15,7 +16,7 @@ def repo():
 def _deliver(repo, cust="C-002", qty=10, cash=0.0):
     o = repo.create_order(cust, [{"sku": "UREA-50", "qty": qty}], "t", "", "order_munshi")
     repo.confirm_order(o.order_id, "order_munshi", "clerk"); repo.allocate_order(o.order_id, "WH-MULTAN", "godown_munshi")
-    p = repo.create_dispatch_plan(date.today().isoformat(), "R-MULTAN-N", "V-01", [o.order_id], "godown_munshi")
+    p = repo.create_dispatch_plan(today_iso(), "R-MULTAN-N", "V-01", [o.order_id], "godown_munshi")
     repo.approve_dispatch_plan(p.plan_id, "godown_munshi", "clerk")
     st = repo.list_stops(p.plan_id)[0]
     return repo.close_stop(st.stop_id, [{"sku": "UREA-50", "qty": qty}], [], cash, st.otp, "delivery_munshi"), p
@@ -61,7 +62,7 @@ def test_aging_applies_payments_fifo(repo):
 
 
 def test_expenses_and_cashbook(repo):
-    today = date.today().isoformat()
+    today = today_iso()
     x = repo.record_expense("fuel", 3000, "diesel", "cash", "Bilal", "hisaab_munshi")
     repo.record_expense("rent", 20000, "shop", "bank", "owner", "hisaab_munshi")
     repo.record_payment("C-001", 5000, "cash", "", "h", received_by="office")
@@ -84,7 +85,7 @@ def test_deposit_variance_over_two_handins(repo):
     assert d2["variance"] == 0 and d2["previously_deposited"] == 25000
     with pytest.raises(StateError):
         o = repo.create_order("C-002", [{"sku": "DAP-50", "qty": 1}], "t", "", "o"); repo.confirm_order(o.order_id, "o", "c"); repo.allocate_order(o.order_id, "WH-MULTAN", "g")
-        plan = repo.create_dispatch_plan(date.today().isoformat(), "R-MULTAN-N", "V-01", [o.order_id], "g")
+        plan = repo.create_dispatch_plan(today_iso(), "R-MULTAN-N", "V-01", [o.order_id], "g")
         repo.record_deposit(plan.plan_id, 1, "c", "h")   # not loaded yet
 
 
@@ -130,7 +131,7 @@ def test_customer_discount_applies_to_price(repo):
 def test_returns_restock_and_short_delivery(repo):
     o = repo.create_order("C-002", [{"sku": "UREA-50", "qty": 10}, {"sku": "DAP-50", "qty": 2}], "t", "", "o")
     repo.confirm_order(o.order_id, "o", "c"); repo.allocate_order(o.order_id, "WH-MULTAN", "g")
-    p = repo.create_dispatch_plan(date.today().isoformat(), "R-MULTAN-N", "V-01", [o.order_id], "g"); repo.approve_dispatch_plan(p.plan_id, "g", "c")
+    p = repo.create_dispatch_plan(today_iso(), "R-MULTAN-N", "V-01", [o.order_id], "g"); repo.approve_dispatch_plan(p.plan_id, "g", "c")
     on_hand = repo.get_stock("WH-MULTAN", "DAP-50").on_hand
     st = repo.list_stops(p.plan_id)[0]
     r = repo.close_stop(st.stop_id, [{"sku": "UREA-50", "qty": 10}], [{"sku": "DAP-50", "qty": 2}], 0, st.otp, "d")
@@ -143,7 +144,7 @@ def test_returns_restock_and_short_delivery(repo):
 def test_reports_add_up(repo):
     _deliver(repo, qty=10, cash=1000)
     repo.record_expense("fuel", 2000, "", "cash", "", "h")
-    today = date.today().isoformat()
+    today = today_iso()
     sales = repo.sales_report(today, today)
     assert sales["revenue"] == 38500 and sales["by_product"][0]["qty"] == 10 and sales["cost_of_goods"] == 36000
     prof = repo.profit_summary(today, today)
@@ -182,7 +183,6 @@ def test_notifications_and_outbox(repo):
 
 
 def test_opening_balances_are_not_sales(repo):
-    from munshi.domain.models import today_iso
     before = repo.sales_report(today_iso(), today_iso())["revenue"]
     repo.opening_balance("C-002", 15000, "owner")
     assert repo.sales_report(today_iso(), today_iso())["revenue"] == before
