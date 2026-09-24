@@ -29,7 +29,7 @@
         <button class="btn primary" type="submit">${esc(t('signin'))}</button></form>
       ${cfg.demo ? `<p class="hint" style="margin-top:16px">${esc(t('demo_accounts'))}</p><div class="chips center">${cfg.demo_users.map(u => `<button class="chip" data-phone="${esc(u.phone)}" data-pin="${esc(u.pin)}">${esc(u.role)} · ${esc(u.name.split(' ')[0])}</button>`).join('')}</div>` : ''}
       ${cfg.signup_open ? `<p style="margin-top:18px"><a class="link" href="#signup">${esc(t('create_business'))} ›</a></p>` : ''}
-      <p class="hint" style="margin-top:10px"><button class="link" data-lang="en">English</button> · <button class="link" data-lang="ur">اردو</button></p>
+      <p class="hint" style="margin-top:6px"><button class="link hit" data-lang="en" lang="en" aria-pressed="${state.lang === 'en'}">English</button> · <button class="link hit" data-lang="ur" lang="ur" aria-pressed="${state.lang === 'ur'}">اردو</button></p>
     </div></div>`;
     $$('[data-lang]').forEach(b => b.onclick = () => setLang(b.dataset.lang));
     $$('[data-phone]').forEach(b => b.onclick = () => { $('[name=phone]').value = b.dataset.phone; $('[name=pin]').value = b.dataset.pin; $('#lf').requestSubmit(); });
@@ -149,7 +149,7 @@
     const lines = $('#lines', form); const totalEl = $('#ototal', form);
     const dl = document.createElement('datalist'); dl.id = 'prods'; dl.innerHTML = products.map(p => `<option value="${esc(p.name)} (${esc(p.sku)})">`).join(''); form.appendChild(dl);
     const findProd = v => { const m = v.match(/\(([^)]+)\)\s*$/); const sku = m ? m[1] : v.trim().toUpperCase(); return products.find(p => p.sku === sku) || products.find(p => p.name.toLowerCase() === v.trim().toLowerCase()) || products.find(p => (p.aliases || []).some(a => a.toLowerCase() === v.trim().toLowerCase())); };
-    const addLine = (pre) => { const d = document.createElement('div'); d.className = 'oline row'; d.innerHTML = `<input class="input psel" list="prods" placeholder="${esc(t('products'))}…" autocomplete="off"><input class="input num qty" type="number" min="1" value="${pre ? pre.qty : 1}" style="width:72px">${canPrice ? `<input class="input num price" type="number" min="0" placeholder="${esc(t('rate'))}" style="width:88px" title="negotiated price (blank = list)">` : ''}<button type="button" class="x">✕</button>`; d.querySelector('.x').onclick = () => { d.remove(); recalc(); }; d.addEventListener('input', recalc); lines.appendChild(d); if (pre) { const p = products.find(x => x.sku === pre.sku); d.querySelector('.psel').value = p ? `${p.name} (${p.sku})` : pre.sku; if (canPrice) d.querySelector('.price').value = pre.unit_price; } else if (products.length <= 12 && lines.children.length === 1) d.querySelector('.psel').value = `${products[0].name} (${products[0].sku})`; recalc(); };
+    const addLine = (pre) => { const d = document.createElement('div'); d.className = 'oline row'; d.innerHTML = `<input class="input psel" list="prods" placeholder="${esc(t('products'))}…" autocomplete="off"><input class="input num qty" type="number" min="1" value="${pre ? pre.qty : 1}" style="width:72px">${canPrice ? `<input class="input num price" type="number" min="0" placeholder="${esc(t('rate'))}" style="width:88px" title="negotiated price (blank = list)">` : ''}<button type="button" class="x" aria-label="Remove line">✕</button>`; d.querySelector('.x').onclick = () => { d.remove(); recalc(); }; d.addEventListener('input', recalc); lines.appendChild(d); if (pre) { const p = products.find(x => x.sku === pre.sku); d.querySelector('.psel').value = p ? `${p.name} (${p.sku})` : pre.sku; if (canPrice) d.querySelector('.price').value = pre.unit_price; } else if (products.length <= 12 && lines.children.length === 1) d.querySelector('.psel').value = `${products[0].name} (${products[0].sku})`; recalc(); };
     const lineItems = () => $$('.oline', form).map(l => ({ p: findProd(l.querySelector('.psel').value), qty: Number(l.querySelector('.qty').value || 0), price: canPrice && l.querySelector('.price').value !== '' ? Number(l.querySelector('.price').value) : null }));
     const recalc = () => { const cust = customers.find(c => c.name === form.customer.value); const disc = cust ? cust.discount_pct || 0 : 0; totalEl.textContent = fmt(lineItems().reduce((s, x) => s + (x.p ? (x.price !== null ? x.price : x.p.unit_price * (1 - disc / 100)) * x.qty : 0), 0)); $$('.oline .psel', form).forEach(i => i.classList.toggle('bad', !!i.value && !findProd(i.value))); };
     $('#addLine', form).onclick = () => addLine(); if (existing) existing.items.forEach(addLine); else addLine();
@@ -158,34 +158,87 @@
   }
 
   // ================================================================ driver: Stops
+  // A close the office refused after an offline sync ("needs attention"): what the driver entered, why it was
+  // refused in plain words, and what to do next. Lives in localStorage (core.js) until fixed or deliberately removed.
+  const stamp = iso => { const d = new Date(iso); return isNaN(d) ? when(iso) : d.toLocaleString('en-PK', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }); };
+  const lineList = ls => (ls || []).map(i => `${i.qty} × ${esc(i.sku)}`).join(', ') || '—';
+  function attnCard(a, { open = true } = {}) {
+    const b = a.body || {};
+    const action = a.kind === 'code' ? t('fix_code') : a.kind === 'fix' ? t('fix_retry') : t('try_again');
+    return `<div class="card attn" data-attn="${esc(a.id)}">
+      <div class="row"><b>${esc(a.label || a.stop_id)}</b><span class="pill crit">${esc(a.kind === 'supervisor' ? t('see_supervisor') : t('needs_attention'))}</span></div>
+      <p class="attn-why">${esc(t(a.why))}</p>
+      <div class="kv"><b>${esc(t('delivered_qty'))}</b><span>${lineList(b.delivered_items)}</span><b>${esc(t('returned'))}</b><span>${lineList(b.returned_items)}</span>
+        <b>${esc(t('cash_collected'))}</b><span class="num">${fmt(b.cash_collected)}</span><b>${esc(t('code_entered'))}</b><span class="num">${esc(b.otp || '—')}</span>
+        ${b.note ? `<b>${esc(t('note'))}</b><span>${esc(b.note)}</span>` : ''}<b>${esc(t('saved_at'))}</b><span>${esc(stamp(a.queued_at))}</span>
+        <b>${esc(t('server_said'))}</b><span class="hint">${esc(a.detail || '')}${a.attempts > 1 ? ` · ${esc(t('attempts'))} ${a.attempts}` : ''}</span></div>
+      <div class="btnrow">${open ? `<a class="btn ${a.kind === 'supervisor' ? '' : 'primary'}" href="#stop/${esc(a.stop_id)}">${esc(action)}</a>` : ''}<button type="button" class="btn danger" data-attn-del="${esc(a.id)}">${esc(t('attn_remove'))}</button></div></div>`;
+  }
+  const onAttnRemove = e => {
+    const b = e.target.closest('[data-attn-del]'); if (!b) return;
+    confirmSheet(t('attn_remove_title'), t('attn_remove_q'), async () => { M.removeAttention(b.dataset.attnDel); render(); }, t('attn_remove'));
+  };
   V.stops = async () => {
-    view.innerHTML = h1(t('stops'), t('your_stops')) + `<div id="queue" class="banner" hidden></div><div id="dl" class="list"></div>`;
+    const attn = state.attention;
+    view.innerHTML = h1(t('stops'), t('your_stops')) +
+      (attn.length ? `<h2 class="crit">⚠ ${esc(t('needs_attention'))} (${attn.length})</h2><p class="attn-intro">${esc(t('attn_intro'))}</p><div id="attnList" class="list">${attn.map(a => attnCard(a)).join('')}</div>` : '') +
+      `<div id="queue" class="banner" hidden></div><div id="dl" class="list"></div>`;
+    $('#attnList')?.addEventListener('click', onAttnRemove);
     let plans = [];
-    try { plans = await api('/api/driver/today'); M.store.set('stops_cache', plans); } catch (e) { plans = M.store.get('stops_cache', []); if (!plans.length) throw e; toast(t('offline')); }
-    const queued = new Set(state.queue.map(q => q.stop_id));
+    try { plans = await api('/api/driver/today'); M.store.set('stops_cache', plans); } catch (e) { plans = M.store.get('stops_cache', []); if (!plans.length && !attn.length) throw e; toast(t('offline')); }
+    const queued = new Set(state.queue.map(q => q.stop_id)); const refused = new Set(attn.map(a => a.stop_id));
     $('#dl').innerHTML = plans.map(p => `<h2>${esc(p.route_name)} · ${esc(p.plate)} · ${esc(p.plan_date)}</h2>` + p.stops.map(s => {
-      const q = queued.has(s.stop_id); const open = s.status === 'pending' && !q;
-      return `<div class="item ${open ? 'tap' : ''}" data-stop="${esc(s.stop_id)}" ${!open ? 'style="opacity:.65"' : ''}>${row(`#${s.sequence} ${esc(s.customer_name)}`, `<span class="pill ${q ? 'warn' : statusPill(s.status)}">${q ? esc(t('queued')) : esc(t(s.status))}</span>`)}${meta(`${esc(s.address || '')}${s.address ? ' · ' : ''}${s.items.map(i => `${i.qty}×${i.sku}`).join(', ')} · ${fmt(s.order_total)}`)}${s.phone ? `<span class="m"><a class="link" href="tel:${esc(s.phone)}">📞 ${esc(s.phone)}</a></span>` : ''}</div>`;
+      const q = queued.has(s.stop_id), r = refused.has(s.stop_id); const open = (s.status === 'pending' && !q) || r;
+      const pillHtml = r ? `<span class="pill crit">${esc(t('needs_attention'))}</span>` : `<span class="pill ${q ? 'warn' : statusPill(s.status)}">${q ? esc(t('queued')) : esc(t(s.status))}</span>`;
+      return `<div class="item ${open ? 'tap' : ''}" data-stop="${esc(s.stop_id)}" ${!open ? 'style="opacity:.65"' : ''}>${row(`#${s.sequence} ${esc(s.customer_name)}`, pillHtml)}${meta(`${esc(s.address || '')}${s.address ? ' · ' : ''}${s.items.map(i => `${i.qty}×${i.sku}`).join(', ')} · ${fmt(s.order_total)}`)}${s.phone ? `<a class="call" href="tel:${esc(s.phone)}"><span aria-hidden="true">📞</span> ${esc(s.phone)}</a>` : ''}</div>`;
     }).join('')).join('') || empty(t('no_stops'));
-    M.store.set('stops_index', Object.fromEntries(plans.flatMap(p => p.stops.map(s => [s.stop_id, s]))));
-    $('#dl').onclick = e => { const it = e.target.closest('.item.tap'); if (it) go('#stop/' + it.dataset.stop); };
+    // today's stops, plus any older stop that still has a refused entry (so its form can still be reopened and resent)
+    const oldIndex = M.store.get('stops_index', {}) || {};
+    M.store.set('stops_index', Object.assign(Object.fromEntries([...refused].filter(k => oldIndex[k]).map(k => [k, oldIndex[k]])), Object.fromEntries(plans.flatMap(p => p.stops.map(s => [s.stop_id, s])))));
+    // a tap on the phone number calls; it must not also open the stop
+    $('#dl').onclick = e => { if (e.target.closest('a[href^="tel:"]')) return; const it = e.target.closest('.item.tap'); if (it) go('#stop/' + it.dataset.stop); };
   };
   V.stop = async id => {
-    const s = (M.store.get('stops_index', {}) || {})[id]; if (!s) { go('#stops'); return; }
+    const s = (M.store.get('stops_index', {}) || {})[id]; let a = M.attentionFor(id);
+    if (!s && !a) { go('#stops'); return; }
+    if (!s) {   // the stop is no longer on today's plans (plan closed/cancelled): show what was entered, nothing to resend against
+      view.innerHTML = h1(a.label || id, esc(id), 'stops') + `<div id="attnList" class="list">${attnCard(a, { open: false })}</div>`;
+      $('#attnList').addEventListener('click', onAttnRemove); return;
+    }
+    // Prefill from a refused entry so the driver never re-types what they already entered; only the code starts empty when it was the problem.
+    let pre = a ? a.body : null;
+    const qtyOf = (ls, sku) => (ls || []).filter(x => x.sku === sku).reduce((n, x) => n + x.qty, 0);
+    const dVal = i => pre ? qtyOf(pre.delivered_items, i.sku) : i.qty, rVal = i => pre ? qtyOf(pre.returned_items, i.sku) : 0;
     view.innerHTML = h1(s.customer_name, `${esc(id)} · ${fmt(s.order_total)}${s.address ? ' · ' + esc(s.address) : ''}`, 'stops') +
-      `<form id="cf" class="stack"><div class="card stack"><b>${esc(t('delivered_qty'))}</b>${s.items.map(i => `<div class="stopline"><span>${esc(i.sku)} <span class="hint">(${i.qty})</span></span><input class="input num" type="number" inputmode="numeric" name="d_${esc(i.sku)}" value="${i.qty}" min="0" max="${i.qty}"></div>`).join('')}</div>
-      <div class="card stack"><b>${esc(t('returned'))}</b>${s.items.map(i => `<div class="stopline"><span>${esc(i.sku)}</span><input class="input num" type="number" inputmode="numeric" name="r_${esc(i.sku)}" value="0" min="0"></div>`).join('')}</div>
-      <label class="f">${esc(t('cash_collected'))} (Rs)<input class="input num big" type="number" inputmode="numeric" name="cash" value="0" min="0"></label>
-      <label class="f">${esc(t('customer_code'))}<input class="input num big" inputmode="numeric" name="otp" maxlength="4" pattern="\\d{4}" placeholder="• • • •" required autocomplete="one-time-code"></label>
-      ${field(t('note'), 'note', 'maxlength="200" placeholder="e.g. 2 bags refused, torn"')}
+      (a ? `<div class="list" id="attnList" style="margin-bottom:12px">${attnCard(a, { open: false })}</div>` : '') +
+      `<form id="cf" class="stack"><div class="card stack"><b>${esc(t('delivered_qty'))}</b>${s.items.map(i => `<div class="stopline"><span>${esc(i.sku)} <span class="hint">(${i.qty})</span></span><input class="input num" type="number" inputmode="numeric" name="d_${esc(i.sku)}" value="${dVal(i)}" min="0" max="${i.qty}"></div>`).join('')}</div>
+      <div class="card stack"><b>${esc(t('returned'))}</b>${s.items.map(i => `<div class="stopline"><span>${esc(i.sku)}</span><input class="input num" type="number" inputmode="numeric" name="r_${esc(i.sku)}" value="${rVal(i)}" min="0"></div>`).join('')}</div>
+      <label class="f">${esc(t('cash_collected'))} (Rs)<input class="input num big" type="number" inputmode="numeric" name="cash" value="${pre ? Number(pre.cash_collected) || 0 : 0}" min="0"></label>
+      <label class="f">${esc(t('customer_code'))}<input class="input num big${a && a.kind === 'code' ? ' bad' : ''}" inputmode="numeric" name="otp" maxlength="4" pattern="\\d{4}" placeholder="• • • •" required autocomplete="one-time-code" value="${pre && a.kind !== 'code' ? esc(pre.otp || '') : ''}"></label>
+      ${field(t('note'), 'note', 'maxlength="200" placeholder="e.g. 2 bags refused, torn"', 'text', pre ? pre.note || '' : '')}
+      <p id="cfErr" class="formerr" role="alert"></p>
       <button class="btn primary big" type="submit">${esc(t('close_stop'))}</button></form>`;
+    $('#attnList')?.addEventListener('click', onAttnRemove);
+    if (a && a.kind === 'code') setTimeout(() => $('[name=otp]')?.focus(), 50);
     $('#cf').onsubmit = async e => {
-      e.preventDefault(); const f = new FormData(e.target);
+      e.preventDefault(); const f = new FormData(e.target); const submitBtn = e.target.querySelector('button[type=submit]');
       const delivered = s.items.map(i => ({ sku: i.sku, qty: Number(f.get('d_' + i.sku)) })).filter(x => x.qty > 0);
       const returned = s.items.map(i => ({ sku: i.sku, qty: Number(f.get('r_' + i.sku)) })).filter(x => x.qty > 0);
-      const body = { delivered_items: delivered, returned_items: returned, cash_collected: Number(f.get('cash')), otp: String(f.get('otp')), client_ref: id + ':' + Date.now(), note: String(f.get('note') || '') };
-      try { const r = await post(`/api/stops/${id}/close`, body); toast(`${t('done')}: ${t(r.status)}, ${fmt(r.invoiced)}`); go('#stops'); }
-      catch (err) { if (err.status === 0) { enqueue({ path: `/api/stops/${id}/close`, body, stop_id: id, label: s.customer_name }); toast(t('queued_offline'), 4000); go('#stops'); } else toast(err.message, 4000); }
+      const cash = Number(f.get('cash'));
+      // Resending a refused entry unchanged keeps its client_ref (the server replays, never double-posts); changed numbers get a new one.
+      const same = pre && JSON.stringify([pre.delivered_items, pre.returned_items, Number(pre.cash_collected)]) === JSON.stringify([delivered, returned, cash]);
+      const body = { delivered_items: delivered, returned_items: returned, cash_collected: cash, otp: String(f.get('otp')), client_ref: same && pre.client_ref ? pre.client_ref : id + ':' + Date.now(), note: String(f.get('note') || '') };
+      const item = { path: `/api/stops/${id}/close`, body, stop_id: id, label: s.customer_name };
+      $('#cfErr').textContent = ''; submitBtn.disabled = true; submitBtn.textContent = t('closing');
+      try { const r = await post(item.path, body); M.clearAttention(id); toast(`${t('done')}: ${t(r.status)}, ${fmt(r.invoiced)}`); go('#stops'); }
+      catch (err) {
+        submitBtn.disabled = false; submitBtn.textContent = t('close_stop');
+        if (err.status === 0 || err.status === 401) { enqueue(item); M.clearAttention(id); toast(t('queued_offline'), 4000); go('#stops'); return; }   // no signal / session expired: keep it on the phone, it sends itself later
+        if (a && !M.retryLater(err.status)) {   // a retry of a refused entry was refused again: keep the latest attempt, with the new reason
+          a = M.addAttention(item, err, a.id); pre = a.body; $('#attnList').innerHTML = attnCard(a, { open: false });
+        }
+        $('#cfErr').textContent = err.message; toast(err.message, 4000);
+      }
     };
   };
   V.driver = V.stops;
@@ -566,7 +619,7 @@
       `<div class="card stack"><b>${esc(t('business'))}</b>${btn(t('edit'), 'id="biz"')}</div>
       <h2>${esc(t('godown'))}</h2><div class="list">${whs.map(w => item(row(esc(w.name), w.default ? '<span class="pill acc">default</span>' : `<button class="btn sm" data-def="${esc(w.warehouse_id)}">make default</button>`) + meta(esc(w.warehouse_id)))).join('')}</div><div class="btnrow" style="margin-top:8px">${btn(t('add_godown'), 'id="addW"')}</div>
       <h2>${esc(t('route'))}</h2><div class="list">${routes.map(r => item(row(esc(r.name), `<button class="btn sm" data-route="${esc(r.route_id)}">${esc(t('edit'))}</button>`) + meta(`${esc(r.route_id)} · ${esc(r.warehouse_id)} · ${r.stop_customer_ids.length} stops: ${r.stop_customer_ids.map(id => esc(customers.find(c => c.customer_id === id)?.name || id)).join(' → ')}`))).join('') || empty()}</div><div class="btnrow" style="margin-top:8px">${btn(t('add_route'), 'id="addR"')}</div>
-      <h2>${esc(t('vehicle'))}</h2><div class="list">${vehicles.map(v => item(row(esc(v.plate), `<button class="btn sm danger" data-delv="${esc(v.vehicle_id)}">✕</button>`) + meta(`${esc(v.vehicle_id)} · ${esc(v.capacity_class)} · ${v.capacity_units} units`))).join('') || empty()}</div><div class="btnrow" style="margin-top:8px">${btn(t('add_vehicle'), 'id="addV"')}</div>
+      <h2>${esc(t('vehicle'))}</h2><div class="list">${vehicles.map(v => item(row(esc(v.plate), `<button class="btn sm danger" data-delv="${esc(v.vehicle_id)}" aria-label="Remove vehicle ${esc(v.plate)}">✕</button>`) + meta(`${esc(v.vehicle_id)} · ${esc(v.capacity_class)} · ${v.capacity_units} units`))).join('') || empty()}</div><div class="btnrow" style="margin-top:8px">${btn(t('add_vehicle'), 'id="addV"')}</div>
       <h2>${esc(t('import_excel'))}</h2><div class="card stack"><p class="hint" style="margin:0">Customers, products, stock and opening balances in one workbook.</p><div class="btnrow">${btn(t('download_template'), 'id="tpl"')}<label class="btn primary">${esc(t('import_excel'))}<input type="file" id="imp" accept=".xlsx" hidden></label></div><div id="impRes" class="hint"></div></div>`;
     $('#biz').onclick = () => sheet(t('business'), field(t('business_name'), 'business_name', 'required', 'text', settings.business_name) + field(t('city'), 'city', '', 'text', settings.city) + field(t('phone'), 'phone', '', 'tel', settings.phone) + field("Owner's WhatsApp (for the 8pm digest)", 'owner_phone', '', 'tel', settings.owner_phone) + field('Digest time', 'digest_time', 'pattern="[0-2][0-9]:[0-5][0-9]"', 'time', settings.digest_time) + field('Default credit days', 'credit_days', 'min="0"', 'number', settings.credit_days) + field('Invoice prefix', 'invoice_prefix', 'maxlength="6"', 'text', settings.invoice_prefix) + field('Orders above this need the owner (Rs)', 'big_order_limit', 'min="0"', 'number', settings.big_order_limit),
       async d => { await patch('/api/settings', { ...d, credit_days: Number(d.credit_days), big_order_limit: Number(d.big_order_limit) }); state.me = await api('/api/me'); M.store.set('me', state.me); toast(t('saved')); render(); });
@@ -585,7 +638,8 @@
     const me = state.me;
     view.innerHTML = h1(t('settings')) + `<div class="stack">
       <div class="card kv"><b>${esc(t('signed_in_as'))}</b><span>${esc(me.name)} · ${esc(me.role_title)}</span><b>${esc(t('business'))}</b><span>${esc(me.business.name)}${me.business.demo ? ' <span class="pill">demo</span>' : ''}</span><b>${esc(t('model'))}</b><span>${esc(me.llm)}${me.llm === 'stub' ? ' <span class="hint">(offline rules — set LLM_PROVIDER=groq for a real model)</span>' : ''}</span><b>${esc(t('voice'))}</b><span>${me.voice ? 'on' : 'off <span class="hint">(needs GROQ_API_KEY)</span>'}</span><b>${esc(t('channel'))}</b><span>${esc(me.channel)}</span></div>
-      <div class="card stack"><b>${esc(t('language'))}</b><div class="btnrow"><button class="btn ${state.lang === 'en' ? 'primary' : ''}" data-lang="en">English</button><button class="btn ${state.lang === 'ur' ? 'primary' : ''}" data-lang="ur">اردو</button></div></div>
+      <div class="card stack"><b>${esc(t('language'))}</b><div class="btnrow"><button class="btn ${state.lang === 'en' ? 'primary' : ''}" data-lang="en" aria-pressed="${state.lang === 'en'}">English</button><button class="btn ${state.lang === 'ur' ? 'primary' : ''}" data-lang="ur" aria-pressed="${state.lang === 'ur'}">اردو</button></div></div>
+      <div class="card stack"><b>${esc(t('theme'))}</b><div class="btnrow">${['light', 'dark'].map(th => `<button type="button" class="btn ${state.theme === th ? 'primary' : ''}" data-theme-pick="${th}" aria-pressed="${state.theme === th}">${esc(t('theme_' + th))}</button>`).join('')}</div></div>
       ${btn(t('change_pin'), 'id="pin"')}
       ${can('export') ? btn(t('export_excel'), 'id="exp"') : ''}${can('backup') && !me.business.demo ? btn(t('backup'), 'id="bak"') : ''}
       <button class="btn" id="install" hidden>${esc(t('install'))}</button>
@@ -593,6 +647,7 @@
       <button class="btn danger" id="out">${esc(t('signout'))}</button>
       <p class="hint">Munshi ${esc((await api('/api/config')).version)} · <a class="link" href="https://github.com/azamali992/munshi" target="_blank" rel="noopener">source</a></p></div>`;
     $$('[data-lang]').forEach(b => b.onclick = () => setLang(b.dataset.lang));
+    $$('[data-theme-pick]').forEach(b => b.onclick = () => M.setTheme(b.dataset.themePick));
     $('#out').onclick = () => signOut();
     $('#server')?.addEventListener('click', () => { location.href = 'https://localhost/?reset=1'; });
     $('#pin').onclick = () => sheet(t('change_pin'), field('Current PIN', 'old_pin', 'required', 'password') + field(t('choose_pin'), 'new_pin', 'required minlength="4" maxlength="6"', 'password'), async d => { await post('/api/me/pin', d); toast('PIN changed — sign in again'); signOut(true); });
