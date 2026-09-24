@@ -6,6 +6,66 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta, timezone
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+
+# ---------------------------------------------------------------- money rule
+# Every amount is STORED and COMPUTED as an integer number of paisa
+# (1 rupee = 100 paisa). Rupees exist only at the edges: what callers pass in
+# and what the dataclasses / report dicts hand back (JSON numbers, as before).
+#
+# Rounding rule, used everywhere and nowhere else: ROUND_HALF_UP on the
+# decimal value as written, i.e. half a paisa rounds AWAY from zero
+# (2.675 -> 268 paisa, -2.675 -> -268). A float is read through its shortest
+# repr, so 2.675 means "2.675" and not the binary 2.67499999... it happens to
+# be. Away-from-zero is symmetric, so a reversal (the negation) of an amount
+# rounds to exactly the negation of its paisa, and nets to zero.
+PAISA_PER_RUPEE = 100
+# 10^14 paisa = Rs 1 trillion. Below this every paisa amount survives the
+# rupee float round trip (to_rupees -> JSON -> to_paisa) exactly.
+MAX_PAISA = 10 ** 14
+
+
+def to_paisa(rupees) -> int:
+    """Rupees (int, float, Decimal or numeric str) -> integer paisa, ROUND_HALF_UP."""
+    if rupees is None or isinstance(rupees, bool):
+        raise ValueError(f"not an amount: {rupees!r}")
+    if isinstance(rupees, int):
+        p = rupees * PAISA_PER_RUPEE
+    else:
+        try:
+            d = rupees if isinstance(rupees, Decimal) else Decimal(str(rupees).strip())
+        except (InvalidOperation, ValueError):
+            raise ValueError(f"not an amount: {rupees!r}") from None
+        if not d.is_finite():
+            raise ValueError(f"not an amount: {rupees!r}")
+        p = int((d * PAISA_PER_RUPEE).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+    if abs(p) > MAX_PAISA:
+        raise ValueError(f"amount out of range: {rupees!r}")
+    return p
+
+
+def to_rupees(paisa: int) -> float:
+    """Integer paisa -> rupees for the API edge (the nearest float, e.g. 12345 -> 123.45)."""
+    if isinstance(paisa, bool) or not isinstance(paisa, int):
+        raise TypeError(f"paisa must be an int, got {type(paisa).__name__}: {paisa!r}")
+    return paisa / PAISA_PER_RUPEE
+
+
+def mul_div(amount: int, num: int, den: int) -> int:
+    """round(amount * num / den) in exact integer arithmetic, half away from zero
+    (the same rule as to_paisa). Used to apportion a paisa amount, e.g. the cost
+    of 3 units out of a stock of 7 worth `amount`."""
+    if den <= 0: raise ValueError("denominator must be positive")
+    n = amount * num
+    q, r = divmod(abs(n), den)
+    if 2 * r >= den: q += 1
+    return q if n >= 0 else -q
+
+
+def discounted_paisa(price_paisa: int, discount_pct) -> int:
+    """A price less a percentage discount, rounded to the paisa by the one rounding rule."""
+    pct = Decimal(str(discount_pct or 0))
+    return int((Decimal(price_paisa) * (100 - pct) / 100).quantize(Decimal(1), rounding=ROUND_HALF_UP))
 
 # ---------------------------------------------------------------- time rule
 # Instants are stored in UTC (now_iso). Which *business day* an instant
@@ -78,7 +138,8 @@ class Product:
     unit_price: float
     aliases: list[str] = field(default_factory=list)
     units_per_load: int = 1           # how much vehicle capacity one unit takes
-    cost_price: float = 0.0           # last purchase cost, for margin
+    cost_price: float = 0.0           # last purchase cost (reference only: margin and valuation use the
+                                      # moving-average cost snapshotted on each stock move, never this)
     unit: str = "bag"                 # bag | ltr | pc | kg | box
     category: str = ""
     min_stock: int = 10               # low-stock alert threshold
@@ -135,8 +196,16 @@ class OrderItem:
     unit_price: float
 
     @property
+    def unit_price_paisa(self) -> int:
+        return to_paisa(self.unit_price)
+
+    @property
+    def line_total_paisa(self) -> int:
+        return self.qty * self.unit_price_paisa
+
+    @property
     def line_total(self) -> float:
-        return round(self.qty * self.unit_price, 2)
+        return to_rupees(self.line_total_paisa)
 
 
 @dataclass
@@ -154,8 +223,12 @@ class Order:
     created_by: str = ""
 
     @property
+    def total_paisa(self) -> int:
+        return sum(i.line_total_paisa for i in self.items)
+
+    @property
     def total(self) -> float:
-        return round(sum(i.line_total for i in self.items), 2)
+        return to_rupees(self.total_paisa)
 
     @property
     def load_units(self) -> int:
@@ -212,6 +285,8 @@ class LedgerEntry:
     created_at: str = field(default_factory=now_iso)
     method: str = ""                  # cash | bank | jazzcash | easypaisa | cheque | adjustment
     received_by: str = ""
+    doc_no: str | None = None         # gapless customer-facing number (INV-2026-000001); None on pre-V5 rows
+    reversal_of: str | None = None    # set on a reversing entry: the entry_id it cancels
 
 
 @dataclass
@@ -219,11 +294,13 @@ class Purchase:
     purchase_id: str
     supplier_id: str
     warehouse_id: str
-    items: list[dict]                 # [{sku, qty, unit_cost}]
+    items: list[dict]                 # [{sku, qty, unit_cost}]  (qty negative on a reversal)
     total: float
     invoice_ref: str = ""
     paid_amount: float = 0.0
     created_at: str = field(default_factory=now_iso)
+    doc_no: str | None = None
+    reversal_of: str | None = None
 
 
 @dataclass
@@ -235,18 +312,20 @@ class SupplierLedgerEntry:
     ref: str
     method: str = ""
     created_at: str = field(default_factory=now_iso)
+    reversal_of: str | None = None
 
 
 @dataclass
 class Expense:
     expense_id: str
     category: str                     # fuel | salary | rent | repair | utilities | misc
-    amount: float
+    amount: float                     # negative only on a reversal
     note: str = ""
     method: str = "cash"
     paid_by: str = ""
     expense_date: str = field(default_factory=today_iso)
     created_at: str = field(default_factory=now_iso)
+    reversal_of: str | None = None
 
 
 @dataclass
@@ -255,7 +334,7 @@ class StockMove:
     warehouse_id: str
     sku: str
     delta: int
-    kind: str                         # sale | return | purchase | adjust | transfer_out | transfer_in
+    kind: str                         # sale | return | purchase | purchase_reversal | adjust | transfer_out | transfer_in | opening
     ref: str
     created_at: str = field(default_factory=now_iso)
 

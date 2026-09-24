@@ -1,11 +1,39 @@
 """Master data: customers, products, suppliers, godowns, routes, vehicles,
-and the stock ledger (levels + every movement)."""
+and the stock ledger (levels + every movement).
+
+Stock rules (Phase 2):
+  * move_stock is the ONLY way stock.on_hand changes, and it always writes the
+    matching stock_moves row in the same transaction, so replaying stock_moves
+    reproduces stock exactly.
+  * on_hand can never go below zero: every path is checked inside a
+    write-locked transaction (immediate_tx) and refused with
+    InsufficientStockError; a database trigger (migration V5) backs this up.
+  * Costing is the perpetual moving (weighted) average per product, pooled
+    across godowns. inventory_value holds the pool's total value in paisa;
+    each move records the value it added or removed (stock_moves.value_paisa),
+    computed atomically with the quantity change. The average is pool / units.
+    Issues take a proportional share of the pool (rounded to the paisa), and
+    the last unit out takes whatever is left, so value is conserved exactly:
+    opening + receipts = issues + closing, to the paisa."""
 from __future__ import annotations
 
 import json
 
-from munshi.domain.models import Customer, Product, Route, StockLevel, StockMove, Supplier, Vehicle, Warehouse
+from munshi.domain.models import Customer, Product, Route, StockLevel, StockMove, Supplier, Vehicle, Warehouse, mul_div, to_paisa, to_rupees
 from munshi.domain.repository.base import InsufficientStockError, NotFoundError, RepositoryBase, new_id
+from munshi.domain.repository.guarded import immediate_tx
+
+_MOVE_COLS = "move_id, warehouse_id, sku, delta, kind, ref, created_at"
+
+
+def _whole(n, what: str) -> int:
+    if isinstance(n, bool): raise ValueError(f"{what} must be a whole number")
+    try:
+        f = float(n)
+    except (TypeError, ValueError):
+        raise ValueError(f"{what} must be a whole number") from None
+    if not f.is_integer(): raise ValueError(f"{what} must be a whole number")
+    return int(f)
 
 
 class MasterDataMixin(RepositoryBase):
@@ -13,9 +41,12 @@ class MasterDataMixin(RepositoryBase):
     def upsert_customer(self, c: Customer) -> Customer:
         if not c.customer_id:
             c.customer_id = self._next_code("C", "customers", "customer_id")
+        limit_p = to_paisa(c.credit_limit or 0)
+        if limit_p < 0: raise ValueError("credit limit cannot be negative")
         with self._tx() as cur:
             cur.execute("INSERT OR REPLACE INTO customers (customer_id, name, phone, tier, credit_limit, route_id, language, address, discount_pct, credit_days, active) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                        (c.customer_id, c.name.strip(), c.phone.strip(), c.tier, float(c.credit_limit), c.route_id or None, c.language, c.address, float(c.discount_pct), int(c.credit_days), int(c.active)))
+                        (c.customer_id, c.name.strip(), c.phone.strip(), c.tier, limit_p, c.route_id or None, c.language, c.address, float(c.discount_pct), int(c.credit_days), int(c.active)))
+        c.credit_limit = to_rupees(limit_p)
         return c
 
     def get_customer(self, customer_id: str) -> Customer:
@@ -46,18 +77,31 @@ class MasterDataMixin(RepositoryBase):
         t = f"%{text.lower().strip()}%"
         return [self._customer(r) for r in self._all("SELECT * FROM customers WHERE active=1 AND (lower(name) LIKE ? OR phone LIKE ? OR lower(customer_id) LIKE ?) ORDER BY name LIMIT ?", (t, t, t, limit))]
 
+    def customer_credit_limit_paisa(self, customer_id: str) -> int:
+        r = self._one("SELECT credit_limit FROM customers WHERE customer_id=?", (customer_id,))
+        if not r: raise NotFoundError(f"no such customer: {customer_id}")
+        return int(r["credit_limit"] or 0)
+
     @staticmethod
     def _customer(r) -> Customer:
-        d = dict(r); d["active"] = bool(d.get("active", 1)); return Customer(**d)
+        d = dict(r); d["active"] = bool(d.get("active", 1)); d["credit_limit"] = to_rupees(int(d.get("credit_limit") or 0)); return Customer(**d)
 
     # ------------------------------------------------------------ products
     def upsert_product(self, p: Product) -> Product:
         if not p.sku:
             p.sku = self._next_code("P", "products", "sku")
+        price_p, cost_p = to_paisa(p.unit_price or 0), to_paisa(p.cost_price or 0)
+        if price_p < 0 or cost_p < 0: raise ValueError("prices cannot be negative")
         with self._tx() as cur:
             cur.execute("INSERT OR REPLACE INTO products (sku, name, unit_price, aliases, units_per_load, cost_price, unit, category, min_stock, active) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                        (p.sku, p.name.strip(), float(p.unit_price), json.dumps(p.aliases), int(p.units_per_load), float(p.cost_price), p.unit, p.category, int(p.min_stock), int(p.active)))
+                        (p.sku, p.name.strip(), price_p, json.dumps(p.aliases), int(p.units_per_load), cost_p, p.unit, p.category, int(p.min_stock), int(p.active)))
+        p.unit_price, p.cost_price = to_rupees(price_p), to_rupees(cost_p)
         return p
+
+    def _product_paisa(self, sku: str) -> tuple[int, int]:
+        """(unit_price, cost_price) of a product in paisa; (0, 0) if unknown."""
+        r = self._one("SELECT unit_price, cost_price FROM products WHERE sku=?", (sku,))
+        return (int(r["unit_price"] or 0), int(r["cost_price"] or 0)) if r else (0, 0)
 
     def get_product(self, sku: str) -> Product:
         r = self._one("SELECT * FROM products WHERE sku=?", (sku,))
@@ -70,7 +114,9 @@ class MasterDataMixin(RepositoryBase):
 
     @staticmethod
     def _product(r) -> Product:
-        d = dict(r); d["aliases"] = json.loads(d["aliases"] or "[]"); d["active"] = bool(d.get("active", 1)); return Product(**d)
+        d = dict(r); d["aliases"] = json.loads(d["aliases"] or "[]"); d["active"] = bool(d.get("active", 1))
+        d["unit_price"] = to_rupees(int(d.get("unit_price") or 0)); d["cost_price"] = to_rupees(int(d.get("cost_price") or 0))
+        return Product(**d)
 
     # ------------------------------------------------------------ suppliers
     def upsert_supplier(self, s: Supplier) -> Supplier:
@@ -170,8 +216,17 @@ class MasterDataMixin(RepositoryBase):
         return StockLevel(**dict(r))
 
     def set_stock(self, warehouse_id: str, sku: str, on_hand: int, reserved: int = 0) -> None:
-        with self._tx() as cur:
-            cur.execute("INSERT OR REPLACE INTO stock VALUES (?,?,?,?)", (warehouse_id, sku, int(on_hand), int(reserved)))
+        """Set a godown's count outright (seeding, stock-take). The difference is posted
+        through move_stock as an 'adjust' move, so the stock ledger stays complete."""
+        on_hand, reserved = _whole(on_hand, "on hand"), _whole(reserved, "reserved")
+        if on_hand < 0: raise InsufficientStockError(f"{sku} at {warehouse_id}: stock cannot be set below zero ({on_hand})")
+        if reserved < 0: raise ValueError("reserved cannot be negative")
+        with immediate_tx(self) as c:
+            delta = on_hand - self.get_stock(warehouse_id, sku).on_hand
+            if delta:
+                self.move_stock(warehouse_id, sku, delta, "adjust", "set_stock")
+            c.execute("INSERT INTO stock (warehouse_id, sku, on_hand, reserved) VALUES (?,?,?,?) "
+                      "ON CONFLICT(warehouse_id, sku) DO UPDATE SET reserved=excluded.reserved", (warehouse_id, sku, on_hand, reserved))
 
     def stock_by_sku(self, sku: str) -> list[StockLevel]:
         return [StockLevel(**dict(r)) for r in self._all("SELECT * FROM stock WHERE sku=?", (sku,))]
@@ -180,43 +235,91 @@ class MasterDataMixin(RepositoryBase):
         q, a = ("SELECT * FROM stock WHERE warehouse_id=?", (warehouse_id,)) if warehouse_id else ("SELECT * FROM stock", ())
         return [StockLevel(**dict(r)) for r in self._all(q, a)]
 
-    def move_stock(self, warehouse_id: str, sku: str, delta: int, kind: str, ref: str, allow_negative: bool = False) -> StockLevel:
-        """The only way on_hand changes. Records the movement for the stock ledger."""
-        s = self.get_stock(warehouse_id, sku)
-        if s.on_hand + delta < 0 and not allow_negative:
-            raise InsufficientStockError(f"{sku} at {warehouse_id} would go to {s.on_hand + delta}")
-        with self._tx() as c:
-            c.execute("INSERT OR REPLACE INTO stock VALUES (?,?,?,?)", (warehouse_id, sku, s.on_hand + int(delta), s.reserved))
-            m = StockMove(new_id("MOV"), warehouse_id, sku, int(delta), kind, ref)
-            c.execute("INSERT INTO stock_moves VALUES (?,?,?,?,?,?,?)", (m.move_id, warehouse_id, sku, m.delta, kind, ref, m.created_at))
+    # ------------------------------------------------------------ moving-average pool
+    def _pool(self, sku: str) -> tuple[int, int]:
+        """(units on hand across all godowns, pool value in paisa) for a product."""
+        q = self._one("SELECT COALESCE(SUM(on_hand), 0) q FROM stock WHERE sku=?", (sku,))["q"]
+        v = self._one("SELECT value_paisa FROM inventory_value WHERE sku=?", (sku,))
+        return int(q), int(v["value_paisa"]) if v else 0
+
+    def avg_cost_paisa(self, sku: str) -> int:
+        """Current moving-average unit cost, rounded to the paisa (display only; never used to post)."""
+        qty, pool = self._pool(sku)
+        return mul_div(pool, 1, qty) if qty > 0 else self._product_paisa(sku)[1]
+
+    def _move_value(self, sku: str, delta: int, kind: str, value_paisa: int | None) -> int:
+        """The signed inventory value a move of `delta` units adds to (or takes from) the pool."""
+        qty, pool = self._pool(sku)
+        after = qty + delta
+        if value_paisa is not None:
+            v = int(value_paisa)                                  # an explicit cost (purchase, return at its load cost)
+        elif delta > 0:
+            v = mul_div(pool, delta, qty) if qty > 0 else delta * self._product_paisa(sku)[1]   # at average; empty pool: cost price
+        else:
+            v = -mul_div(pool, -delta, qty) if qty > 0 else 0      # issue at average
+        if after <= 0 and not kind.startswith("transfer"):
+            v = -pool                                             # the last unit out takes what is left: the pool ends at exactly 0
+        return max(v, -pool)                                      # the pool never goes negative
+
+    def move_stock(self, warehouse_id: str, sku: str, delta: int, kind: str, ref: str, *,
+                   value_paisa: int | None = None, order_id: str | None = None) -> StockLevel:
+        """The only way on_hand changes. In one write-locked transaction: refuse anything that
+        would take on_hand below zero, change on_hand, write the stock_moves row (with the value
+        moved, i.e. the cost snapshot), and update the product's moving-average pool."""
+        delta = _whole(delta, "quantity")
+        if delta == 0: raise ValueError("a stock move needs a non-zero quantity")
+        with immediate_tx(self) as c:
+            s = self.get_stock(warehouse_id, sku)
+            if delta < 0 and s.on_hand + delta < 0:     # (an inbound move may lift a legacy negative row towards zero)
+                raise InsufficientStockError(f"{sku} at {warehouse_id}: only {s.on_hand} on hand, cannot take out {-delta} — stock may never go below zero")
+            value = self._move_value(sku, delta, kind, value_paisa)
+            # (not an UPSERT: the V5 BEFORE INSERT guard would see a negative delta as a negative row)
+            if not c.execute("UPDATE stock SET on_hand = on_hand + ? WHERE warehouse_id=? AND sku=?", (delta, warehouse_id, sku)).rowcount:
+                c.execute("INSERT INTO stock (warehouse_id, sku, on_hand, reserved) VALUES (?,?,?,0)", (warehouse_id, sku, delta))
+            m = StockMove(new_id("MOV"), warehouse_id, sku, delta, kind, ref)
+            c.execute(f"INSERT INTO stock_moves ({_MOVE_COLS}, value_paisa, order_id) VALUES (?,?,?,?,?,?,?,?,?)",
+                      (m.move_id, warehouse_id, sku, delta, kind, ref, m.created_at, value, order_id))
+            if not c.execute("UPDATE inventory_value SET value_paisa = value_paisa + ? WHERE sku=?", (value, sku)).rowcount:
+                c.execute("INSERT INTO inventory_value (sku, value_paisa) VALUES (?, ?)", (sku, value))
         return self.get_stock(warehouse_id, sku)
 
     def adjust_stock(self, warehouse_id: str, sku: str, delta: int, reason: str, actor: str, approved_by: str) -> StockLevel:
-        self.get_product(sku); self.get_warehouse(warehouse_id)
-        s = self.move_stock(warehouse_id, sku, delta, "adjust", reason[:80])
-        self.audit(actor, "adjust_stock", "stock", f"{warehouse_id}/{sku}", {"delta": delta, "reason": reason}, approved_by)
+        """A manual correction (damage, count difference). Priced at the moving average; never below zero."""
+        delta = _whole(delta, "adjustment")
+        if delta == 0: raise ValueError("an adjustment needs a non-zero quantity")
+        with immediate_tx(self):
+            self.get_product(sku); self.get_warehouse(warehouse_id)
+            s = self.move_stock(warehouse_id, sku, delta, "adjust", reason[:80])
+            self.audit(actor, "adjust_stock", "stock", f"{warehouse_id}/{sku}", {"delta": delta, "reason": reason}, approved_by)
         return s
 
     def transfer_stock(self, from_wh: str, to_wh: str, sku: str, qty: int, actor: str, approved_by: str) -> dict:
+        qty = _whole(qty, "transfer quantity")
         if qty <= 0: raise ValueError("transfer quantity must be positive")
         if from_wh == to_wh: raise ValueError("transfer needs two different godowns")
-        self.get_warehouse(from_wh); self.get_warehouse(to_wh); self.get_product(sku)
-        if self.get_stock(from_wh, sku).available < qty:
-            raise InsufficientStockError(f"only {self.get_stock(from_wh, sku).available} {sku} available at {from_wh}")
-        ref = new_id("TRF")
-        with self._tx():
-            self.move_stock(from_wh, sku, -qty, "transfer_out", ref)
-            self.move_stock(to_wh, sku, qty, "transfer_in", ref)
-        self.audit(actor, "transfer_stock", "stock", ref, {"from": from_wh, "to": to_wh, "sku": sku, "qty": qty}, approved_by)
+        with immediate_tx(self):
+            self.get_warehouse(from_wh); self.get_warehouse(to_wh); self.get_product(sku)
+            avail = self.get_stock(from_wh, sku).available
+            if avail < qty:
+                raise InsufficientStockError(f"only {avail} {sku} available at {from_wh}")
+            ref = new_id("TRF")
+            # the cost pool is per product across godowns, so a transfer moves units, not value
+            self.move_stock(from_wh, sku, -qty, "transfer_out", ref, value_paisa=0)
+            self.move_stock(to_wh, sku, qty, "transfer_in", ref, value_paisa=0)
+            self.audit(actor, "transfer_stock", "stock", ref, {"from": from_wh, "to": to_wh, "sku": sku, "qty": qty}, approved_by)
         return {"transfer_id": ref, "from": from_wh, "to": to_wh, "sku": sku, "qty": qty}
 
     def stock_moves(self, sku: str | None = None, warehouse_id: str | None = None, limit: int = 200) -> list[StockMove]:
         conds, a = [], []
         if sku: conds.append("sku=?"); a.append(sku)
         if warehouse_id: conds.append("warehouse_id=?"); a.append(warehouse_id)
-        q = "SELECT * FROM stock_moves" + (" WHERE " + " AND ".join(conds) if conds else "") + " ORDER BY created_at DESC, rowid DESC LIMIT ?"
+        q = f"SELECT {_MOVE_COLS} FROM stock_moves" + (" WHERE " + " AND ".join(conds) if conds else "") + " ORDER BY created_at DESC, rowid DESC LIMIT ?"
         a.append(limit)
         return [StockMove(**dict(r)) for r in self._all(q, tuple(a))]
+
+    def replay_stock_ledger(self) -> dict[tuple[str, str], int]:
+        """On-hand per (godown, sku) as the stock ledger says it should be: the sum of every move."""
+        return {(r["warehouse_id"], r["sku"]): int(r["q"]) for r in self._all("SELECT warehouse_id, sku, SUM(delta) q FROM stock_moves GROUP BY warehouse_id, sku")}
 
     def low_stock(self) -> list[dict]:
         thresholds = {p.sku: p.min_stock for p in self.list_products()}

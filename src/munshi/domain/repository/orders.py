@@ -4,16 +4,26 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from munshi.domain.models import Order, OrderItem, sql_business_date
+from munshi.domain.models import Order, OrderItem, discounted_paisa, sql_business_date, to_paisa, to_rupees
 from munshi.domain.repository.base import CreditHoldError, InsufficientStockError, NotFoundError, StateError, new_id
+from munshi.domain.repository.guarded import immediate_tx
 from munshi.domain.repository.master import MasterDataMixin
 
 _ORDER_COLS = "order_id, customer_id, items, status, channel, source_text, created_at, warehouse_id, discount_pct, notes, created_by"
 
 
+def _items_json(items: list[OrderItem]) -> str:
+    """Order lines as stored: prices in integer paisa."""
+    return json.dumps([{"sku": i.sku, "qty": i.qty, "unit_price_paisa": i.unit_price_paisa} for i in items])
+
+
+def _items_from_json(raw: str) -> list[OrderItem]:
+    return [OrderItem(i["sku"], int(i["qty"]), to_rupees(int(i["unit_price_paisa"]))) for i in json.loads(raw or "[]")]
+
+
 class OrdersMixin(MasterDataMixin):
     def _order_from_row(self, r: sqlite3.Row) -> Order:
-        d = dict(r); d["items"] = [OrderItem(**i) for i in json.loads(d["items"])]
+        d = dict(r); d["items"] = _items_from_json(d["items"])
         d.setdefault("discount_pct", 0.0); d.setdefault("notes", ""); d.setdefault("created_by", "")
         return Order(**d)
 
@@ -32,9 +42,12 @@ class OrdersMixin(MasterDataMixin):
         q += " ORDER BY created_at DESC, rowid DESC LIMIT ?"; a.append(limit)
         return [self._order_from_row(r) for r in self._all(q, tuple(a))]
 
-    def outstanding(self, customer_id: str) -> float:
+    def outstanding_paisa(self, customer_id: str) -> int:
         r = self._one("SELECT COALESCE(SUM(amount),0) s FROM ledger WHERE customer_id=?", (customer_id,))
-        return round(float(r["s"]), 2)
+        return int(r["s"])
+
+    def outstanding(self, customer_id: str) -> float:
+        return to_rupees(self.outstanding_paisa(customer_id))
 
     def _resolve_items(self, cust, items: list[dict]) -> tuple[list[OrderItem], list[dict]]:
         """Lines with the customer's standing discount applied, or an explicit negotiated unit_price. Returns (lines, overrides)."""
@@ -44,17 +57,20 @@ class OrdersMixin(MasterDataMixin):
             p = self.get_product(str(it["sku"])); qty = int(it["qty"])
             if qty <= 0: raise ValueError(f"bad quantity for {p.sku}")
             if not p.active: raise StateError(f"{p.name} is no longer sold")
-            list_price = round(p.unit_price * (1 - cust.discount_pct / 100), 2)
-            price = float(it["unit_price"]) if it.get("unit_price") not in (None, "", 0) else list_price
-            if price < 0: raise ValueError(f"bad price for {p.sku}")
-            if price != list_price: overrides.append({"sku": p.sku, "list": list_price, "price": price})
-            resolved.append(OrderItem(p.sku, qty, round(price, 2)))
+            list_p = discounted_paisa(self._product_paisa(p.sku)[0], cust.discount_pct)
+            price_p = to_paisa(it["unit_price"]) if it.get("unit_price") not in (None, "", 0) else list_p
+            if price_p < 0: raise ValueError(f"bad price for {p.sku}")
+            if price_p != list_p: overrides.append({"sku": p.sku, "list": to_rupees(list_p), "price": to_rupees(price_p)})
+            resolved.append(OrderItem(p.sku, qty, to_rupees(price_p)))
         return resolved, overrides
 
     def exposure_if(self, customer_id: str, extra: float) -> tuple[float, float]:
-        """(exposure after adding `extra`, credit limit)."""
-        cust = self.get_customer(customer_id)
-        return round(self.outstanding(customer_id) + extra, 2), cust.credit_limit
+        """(exposure after adding `extra`, credit limit), in rupees."""
+        exposure_p, limit_p = self._exposure_paisa(customer_id, to_paisa(extra))
+        return to_rupees(exposure_p), to_rupees(limit_p)
+
+    def _exposure_paisa(self, customer_id: str, extra_p: int) -> tuple[int, int]:
+        return self.outstanding_paisa(customer_id) + extra_p, self.customer_credit_limit_paisa(customer_id)
 
     def create_order(self, customer_id: str, items: list[dict], channel: str, source_text: str, actor: str, notes: str = "") -> Order:
         cust = self.get_customer(customer_id)
@@ -64,14 +80,15 @@ class OrdersMixin(MasterDataMixin):
                       discount_pct=cust.discount_pct, notes=notes, created_by=self._current_user())
         with self._tx() as c:
             c.execute(f"INSERT INTO orders ({_ORDER_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                      (order.order_id, customer_id, json.dumps([i.__dict__ for i in resolved]), order.status, channel, source_text,
+                      (order.order_id, customer_id, _items_json(resolved), order.status, channel, source_text,
                        order.created_at, None, order.discount_pct, notes, order.created_by))
         self.audit(actor, "create_order", "order", order.order_id, {"customer": customer_id, "total": order.total, "price_overrides": overrides})
         # Credit check is a hold, not a refusal: the owner decides.
-        exposure = self.outstanding(customer_id) + order.total
-        if cust.credit_limit and exposure > cust.credit_limit:
-            self.notify("owner", "credit_hold", f"{cust.name}: order {order.order_id} would take exposure to Rs {exposure:,.0f} (limit Rs {cust.credit_limit:,.0f})", order.order_id)
-            raise CreditHoldError(f"{cust.name}: exposure {exposure:,.0f} exceeds limit {cust.credit_limit:,.0f} (order {order.order_id} saved as draft)")
+        exposure_p, limit_p = self._exposure_paisa(customer_id, order.total_paisa)
+        if limit_p and exposure_p > limit_p:
+            exposure, limit = to_rupees(exposure_p), to_rupees(limit_p)
+            self.notify("owner", "credit_hold", f"{cust.name}: order {order.order_id} would take exposure to Rs {exposure:,.0f} (limit Rs {limit:,.0f})", order.order_id)
+            raise CreditHoldError(f"{cust.name}: exposure {exposure:,.0f} exceeds limit {limit:,.0f} (order {order.order_id} saved as draft)")
         return order
 
     def set_order_status(self, order_id: str, status: str, actor: str, approved_by: str | None = None) -> Order:
@@ -83,9 +100,9 @@ class OrdersMixin(MasterDataMixin):
 
     def over_credit(self, order: Order) -> str | None:
         """A sentence if confirming this order would take the customer over their limit, else None."""
-        exposure, limit = self.exposure_if(order.customer_id, order.total)
-        if limit and exposure > limit:
-            return f"{self.get_customer(order.customer_id).name}: exposure would be Rs {exposure:,.0f} against a limit of Rs {limit:,.0f}"
+        exposure_p, limit_p = self._exposure_paisa(order.customer_id, order.total_paisa)
+        if limit_p and exposure_p > limit_p:
+            return f"{self.get_customer(order.customer_id).name}: exposure would be Rs {to_rupees(exposure_p):,.0f} against a limit of Rs {to_rupees(limit_p):,.0f}"
         return None
 
     def confirm_order(self, order_id: str, actor: str, approved_by: str, override_credit: bool = False) -> Order:
@@ -110,37 +127,39 @@ class OrdersMixin(MasterDataMixin):
             o.items = resolved
         if notes is not None: o.notes = notes
         with self._tx() as c:
-            c.execute("UPDATE orders SET items=?, notes=? WHERE order_id=?", (json.dumps([i.__dict__ for i in o.items]), o.notes, order_id))
+            c.execute("UPDATE orders SET items=?, notes=? WHERE order_id=?", (_items_json(o.items), o.notes, order_id))
         self.audit(actor, "order_edited", "order", order_id, {"total": o.total, "lines": len(o.items), "price_overrides": overrides}, approved_by)
         return self.get_order(order_id)
 
     def cancel_order(self, order_id: str, reason: str, actor: str, approved_by: str | None = None) -> Order:
-        o = self.get_order(order_id)
-        if o.status not in ("draft", "confirmed", "allocated"):
-            raise StateError(f"order {order_id} is {o.status}; only draft, confirmed or allocated orders can be cancelled")
-        with self._tx() as c:
+        with immediate_tx(self) as c:
+            o = self.get_order(order_id)
+            if o.status not in ("draft", "confirmed", "allocated"):
+                raise StateError(f"order {order_id} is {o.status}; only draft, confirmed or allocated orders can be cancelled")
             if o.status == "allocated" and o.warehouse_id:
                 for it in o.items:      # release the reservation
-                    s = self.get_stock(o.warehouse_id, it.sku)
-                    c.execute("UPDATE stock SET reserved=? WHERE warehouse_id=? AND sku=?", (max(0, s.reserved - it.qty), o.warehouse_id, it.sku))
+                    c.execute("UPDATE stock SET reserved=MAX(0, reserved - ?) WHERE warehouse_id=? AND sku=?", (it.qty, o.warehouse_id, it.sku))
             c.execute("UPDATE orders SET status='cancelled', notes=? WHERE order_id=?", ((o.notes + " | " if o.notes else "") + f"cancelled: {reason}"[:200], order_id))
-        self.audit(actor, "order_cancelled", "order", order_id, {"reason": reason}, approved_by)
+            self.audit(actor, "order_cancelled", "order", order_id, {"reason": reason}, approved_by)
         return self.get_order(order_id)
 
     def allocate_order(self, order_id: str, warehouse_id: str, actor: str, approved_by: str | None = None) -> dict:
-        o = self.get_order(order_id)
-        if o.status != "confirmed": raise StateError(f"order {order_id} is {o.status}, not confirmed")
-        self.get_warehouse(warehouse_id)
-        short = []
-        for it in o.items:
-            s = self.get_stock(warehouse_id, it.sku)
-            if s.available < it.qty: short.append({"sku": it.sku, "need": it.qty, "available": s.available})
-        if short:
-            raise InsufficientStockError(json.dumps(short))
-        with self._tx() as c:
-            for it in o.items:
-                s = self.get_stock(warehouse_id, it.sku)
-                c.execute("INSERT OR REPLACE INTO stock VALUES (?,?,?,?)", (warehouse_id, it.sku, s.on_hand, s.reserved + it.qty))
+        """Reserve the order's stock at a godown. Check and reservation run in one write-locked
+        transaction, so two allocations can never both take the last units."""
+        with immediate_tx(self) as c:
+            o = self.get_order(order_id)
+            if o.status != "confirmed": raise StateError(f"order {order_id} is {o.status}, not confirmed")
+            self.get_warehouse(warehouse_id)
+            need: dict[str, int] = {}
+            for it in o.items: need[it.sku] = need.get(it.sku, 0) + it.qty      # a sku split over lines is one demand
+            short = []
+            for sku, qty in need.items():
+                s = self.get_stock(warehouse_id, sku)
+                if s.available < qty: short.append({"sku": sku, "need": qty, "available": s.available})
+            if short:
+                raise InsufficientStockError(json.dumps(short))
+            for sku, qty in need.items():
+                c.execute("UPDATE stock SET reserved = reserved + ? WHERE warehouse_id=? AND sku=?", (qty, warehouse_id, sku))
             c.execute("UPDATE orders SET status='allocated', warehouse_id=? WHERE order_id=?", (warehouse_id, order_id))
-        self.audit(actor, "allocate_order", "order", order_id, {"warehouse": warehouse_id}, approved_by)
+            self.audit(actor, "allocate_order", "order", order_id, {"warehouse": warehouse_id}, approved_by)
         return {"order_id": order_id, "warehouse_id": warehouse_id, "status": "allocated"}
