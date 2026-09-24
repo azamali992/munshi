@@ -4,9 +4,15 @@ and the daily close.
 handle_message()  routes a message to a specialist and runs one turn; if the
                   specialist pauses on a gated tool, a PendingApproval is
                   persisted and returned instead of the action running.
-resolve()         a human with the right role approves or rejects it; the
-                  specialist resumes from its checkpoint (SQLite when the
+resolve()         a human with the right role -- and, unless they are the owner,
+                  not the person who asked for it -- approves or rejects it;
+                  the specialist resumes from its checkpoint (SQLite when the
                   platform has a checkpoint_path, so a restart loses nothing).
+                  If the resumed turn asks for another gated action, that
+                  becomes a new card rather than a silent "Done.".
+
+One gated call per step: see safety.middleware.OneGatedCallPerStep. A card is
+never raised for a call whose record reference is blank.
 """
 from __future__ import annotations
 
@@ -28,7 +34,8 @@ from munshi.channels import build_channel, deliver_outbox
 from munshi.domain.repository import MunshiRepository
 from munshi.domain.seed import seeded_repository
 from munshi.observability.tracing import TurnTrace, configure_tracking, trace_turn
-from munshi.safety.risk import approver_for, risk_of, role_may_approve
+from munshi.safety.middleware import DEFERRED_KEY
+from munshi.safety.risk import approval_refusal, approver_for, risk_of, stricter_role
 from munshi.tools.core import MunshiTools
 
 log = logging.getLogger("munshi.platform")
@@ -170,24 +177,108 @@ class MunshiPlatform:
                     return Reply(txt, specialist, None, thread_id)
 
                 bundle = self.specialists[specialist]
-                result = bundle.agent.invoke({"messages": [HumanMessage(text)], "role": role}, config=self._cfg(thread_id, role, specialist))
-                interrupts = result.get("__interrupt__")
-                if interrupts:
-                    req = interrupts[0].value["action_requests"][0]
-                    tool = req["name"]
-                    pa = PendingApproval(uuid.uuid4().hex[:10].upper(), thread_id, specialist, tool, req["args"],
-                                         risk_of(tool).value, self._needs_role(tool, req["args"]), role, user)
-                    self.repo.save_approval(asdict(pa))
-                    self.repo.notify(pa.needs_role, "approval", f"{bundle.title} wants to: {pa.describe()}" + (f" (asked by {user})" if user else ""), pa.approval_id)
-                    tr.required_approval = True; tr.tool_called = tool
-                    txt = f"{bundle.title} wants to: {pa.describe()}. Needs {pa.needs_role} approval."
-                    self.repo.add_chat(thread_id, "munshi", txt, {"specialist": specialist, "approval_id": pa.approval_id})
-                    return Reply(txt, specialist, pa, thread_id)
+                cfg = self._cfg(thread_id, role, specialist)
+                self._clear_orphaned_interrupt(bundle, cfg)
+                result = bundle.agent.invoke({"messages": [HumanMessage(text)], "role": role}, config=cfg)
+                reply = self._settle(bundle, specialist, thread_id, role, user, result, tr)
+                self.repo.add_chat(thread_id, "munshi", reply.text, {"specialist": specialist} | ({"approval_id": reply.pending.approval_id} if reply.pending else {}))
+                return reply
 
-                txt = self._final_text(result)
-                tr.response_text = txt
-                self.repo.add_chat(thread_id, "munshi", txt, {"specialist": specialist})
-                return Reply(txt, specialist, None, thread_id)
+    # ------------------------------------------------------------------ pausing on a gated call
+    _MAX_DECLINES = 3
+
+    def _settle(self, bundle, specialist: str, thread_id: str, role: str, user: str, result: dict, tr, lead: str = "") -> Reply:
+        """Turn a specialist run into a Reply. If the run paused on a gated call,
+        persist exactly one approval card for it -- unless the call references
+        something that doesn't exist (or the pause holds more than one action,
+        which OneGatedCallPerStep prevents), in which case the call is declined
+        back to the agent so the thread is never left hanging on an unanswered
+        tool call, and the human is told plainly that it was not done.
+        `lead` is set when settling a resumed turn ("Approved. "): whatever
+        follows is a follow-up to an action that has already been decided."""
+        problems: list[str] = []
+        for _ in range(self._MAX_DECLINES + 1):
+            interrupts = result.get("__interrupt__")
+            if not interrupts:
+                break
+            value = interrupts[0].value
+            reqs = value.get("action_requests", [])
+            problem = "only one action needing approval can be asked for at a time" if len(reqs) != 1 else self._unresolvable(reqs[0]["name"], reqs[0]["args"])
+            if problem is None:
+                return self._open_card(bundle, specialist, thread_id, role, user, reqs[0], value.get(DEFERRED_KEY, []), problems, tr, lead)
+            log.warning("declined gated call on %s/%s: %s", thread_id, specialist, problem)
+            problems.append(problem)
+            if len(problems) > self._MAX_DECLINES:
+                break
+            result = bundle.agent.invoke(Command(resume={"decisions": [{"type": "reject", "message": f"Not asked for: {problem}."}] * max(len(reqs), 1)}),
+                                         config=self._cfg(thread_id, role, specialist))
+        if problems and lead:
+            txt = f"{lead}A follow-up action couldn't be asked for — {problems[0]}. That follow-up was not done."
+        elif problems:
+            txt = f"Couldn't ask for approval — {problems[0]}. Nothing was done."
+        else:
+            txt = self._final_text(result)
+        tr.response_text = txt
+        return Reply(txt, specialist, None, thread_id)
+
+    def _open_card(self, bundle, specialist: str, thread_id: str, role: str, user: str, req: dict, deferred: list[dict], problems: list[str], tr,
+                   lead: str = "") -> Reply:
+        tool = req["name"]
+        pa = PendingApproval(uuid.uuid4().hex[:10].upper(), thread_id, specialist, tool, req["args"],
+                             risk_of(tool).value, self._needs_role(tool, req["args"]), role, user)
+        self.repo.save_approval(asdict(pa))
+        later = ""
+        if deferred:
+            later = (" Only one action needing approval can be asked for at a time — not asked for yet: "
+                     + "; ".join(self._summary(d.get("name", "?"), d.get("args") or {}) for d in deferred)
+                     + ". Ask again for it once this one is decided.")
+        self.repo.notify(pa.needs_role, "approval", f"{bundle.title} wants to: {pa.describe()}" + (f" (asked by {user})" if user else ""), pa.approval_id)
+        tr.required_approval = True; tr.tool_called = tool
+        skipped = f"(Skipped: {problems[0]}.) " if problems else ""
+        txt = f"{lead}{skipped}{bundle.title} {'next ' if lead else ''}wants to: {pa.describe()}. Needs {pa.needs_role} approval.{later}"
+        return Reply(txt, specialist, pa, thread_id)
+
+    @staticmethod
+    def _summary(tool: str, args: dict) -> str:
+        try:
+            return PendingApproval("", "", "", tool, args, "", "clerk", "").describe()
+        except Exception:
+            return f"{tool}({args})"
+
+    # Required arguments that name a record. Every gated tool that takes one of these requires it.
+    _REFS = {"order_id": "order", "customer_id": "customer", "plan_id": "dispatch plan", "supplier_id": "supplier", "reminder_id": "reminder"}
+
+    def _unresolvable(self, tool: str, args: dict) -> str | None:
+        """Why no card should be raised for this call, or None. A card must never
+        read "Confirm order ." -- a required reference that is blank means the
+        model didn't find one, so there is nothing a human could approve.
+        (A well-formed id that doesn't exist still gets a card and fails safely
+        on approve with "no such ..."; eval step cancel_unknown_order pins that.)"""
+        refs = [(k, v) for k, v in args.items() if k in self._REFS] + [("order_id", v) for v in (args.get("order_ids") or [])]
+        for key, raw in refs:
+            if not str(raw or "").strip():
+                return f"no {self._REFS[key]} was named"
+        return None
+
+    def _clear_orphaned_interrupt(self, bundle, cfg: dict) -> None:
+        """A paused graph with no card behind it (e.g. a thread wedged before this
+        fix, or a resume that crashed) would carry an unanswered tool call into
+        the next model request, which provider APIs refuse. Decline it first."""
+        try:
+            state = bundle.agent.get_state(cfg)
+        except Exception:
+            return
+        for _ in range(self._MAX_DECLINES):
+            if not state.interrupts:
+                return
+            n = max(len(state.interrupts[0].value.get("action_requests", [])), 1)
+            log.warning("declining orphaned interrupt on %s", cfg["configurable"]["thread_id"])
+            try:
+                bundle.agent.invoke(Command(resume={"decisions": [{"type": "reject", "message": "Superseded: the user sent a new message instead."}] * n}), config=cfg)
+                state = bundle.agent.get_state(cfg)
+            except Exception:
+                log.exception("couldn't clear orphaned interrupt")
+                return
 
     def resolve(self, approval_id: str, approve: bool, role: str, note: str = "", user: str = "") -> Reply:
         with self._lock:
@@ -195,8 +286,12 @@ class MunshiPlatform:
             pa = self.pending.get(approval_id)
             if not pa:
                 raise KeyError(f"no pending approval {approval_id}")
-            if approve and not (role_may_approve(role, pa.tool) and (role == "owner" or pa.needs_role == "clerk")):
-                raise PermissionError(f"{pa.tool} needs {pa.needs_role} approval; you are {role}")
+            if approve:
+                # re-check at decision time: the requirement can only get stricter (e.g. the order went over limit meanwhile)
+                need = stricter_role(pa.needs_role, self._needs_role(pa.tool, pa.args))
+                why = approval_refusal(role, pa.tool, need, approver=user, requester=pa.requested_by)
+                if why:
+                    raise PermissionError(why)
             bundle = self.specialists[pa.specialist]
             decision = {"type": "approve"} if approve else {"type": "reject", "message": note or f"rejected by {role}"}
             with self._trace(f"{pa.specialist}.resume", role, f"{'approve' if approve else 'reject'} {pa.tool}") as tr:
@@ -212,10 +307,14 @@ class MunshiPlatform:
                     txt = f"Couldn't resume that action ({type(e).__name__}); please ask the munshi again."
                     self.repo.add_chat(pa.thread_id, "munshi", txt, {"specialist": pa.specialist, "resolved": approval_id, "approved": approve, "error": True})
                     return Reply(txt, pa.specialist, None, pa.thread_id)
-                txt = self._final_text(result)
-                self.repo.add_chat(pa.thread_id, "munshi", txt, {"specialist": pa.specialist, "resolved": approval_id, "approved": approve})
+                # The resumed turn may go on to ask for another gated action ("confirm A, then B"): that gets its
+                # own card, on the requester's behalf, instead of a bare "Done." over a paused graph.
+                reply = self._settle(bundle, pa.specialist, pa.thread_id, pa.requested_by_role, pa.requested_by, result, tr,
+                                     lead="Approved. " if approve else "Rejected. ")
+                meta = {"specialist": pa.specialist, "resolved": approval_id, "approved": approve}
+                self.repo.add_chat(pa.thread_id, "munshi", reply.text, meta | ({"approval_id": reply.pending.approval_id} if reply.pending else {}))
                 if approve: self.deliver_messages()
-                return Reply(txt, pa.specialist, None, pa.thread_id)
+                return reply
 
     def list_pending(self, thread_id: str | None = None) -> list[dict]:
         items = [self._pa(a) for a in self.repo.pending_approvals(thread_id)]
