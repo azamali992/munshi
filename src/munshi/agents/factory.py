@@ -34,9 +34,9 @@ def build_specialist(name: str, title: str, model: BaseChatModel, role_tool_map:
     HITL middleware generated from the risk registry. `checkpointer` is shared
     across specialists (thread ids are namespaced by the platform); None means
     an in-memory saver, fine for tests and the offline demo."""
-    from datetime import date
+    from munshi.domain.models import business_today
     all_tools = list({t.name: t for ts in role_tool_map.values() for t in ts}.values())
-    role_prompt_map = {r: p + HOUSE_RULES.format(today=date.today().isoformat()) for r, p in role_prompt_map.items()}
+    role_prompt_map = {r: p + HOUSE_RULES.format(today=business_today().isoformat()) for r, p in role_prompt_map.items()}
     gate, prompt = build_role_gated_middleware(role_tool_map, role_prompt_map)
     cp = checkpointer or InMemorySaver()
     agent = create_agent(model, tools=all_tools, state_schema=MunshiState,

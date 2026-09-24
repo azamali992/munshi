@@ -5,15 +5,55 @@ delivery stop, cash deposit, ledger entry, reminder, promise, audit row."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta, timezone
+
+# ---------------------------------------------------------------- time rule
+# Instants are stored in UTC (now_iso). Which *business day* an instant
+# belongs to is always decided in Pakistan time, never by the server OS
+# clock (Docker images default to UTC) and never by the UTC date prefix
+# of the stored string. Pakistan has kept UTC+5 without DST since 2009,
+# so a fixed offset is exact and needs no tzdata on the host.
+BUSINESS_UTC_OFFSET_HOURS = 5
+BUSINESS_TZ = timezone(timedelta(hours=BUSINESS_UTC_OFFSET_HOURS), "PKT")   # Asia/Karachi
 
 
 def now_iso() -> str:
+    """The current instant, UTC, for storage."""
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
+def business_now() -> datetime:
+    """The current wall-clock time in Pakistan, independent of the server's TZ."""
+    return datetime.now(UTC).astimezone(BUSINESS_TZ)
+
+
+def business_today() -> date:
+    return business_now().date()
+
+
 def today_iso() -> str:
-    return date.today().isoformat()
+    """Today's business date (Asia/Karachi) as YYYY-MM-DD."""
+    return business_today().isoformat()
+
+
+def to_business_date(ts: str | datetime | date) -> date:
+    """The Pakistan business day a stored timestamp belongs to. Naive stamps are
+    taken to be UTC (the storage convention); aware ones are converted; a bare
+    date is already a business date and is returned as is."""
+    if isinstance(ts, str):
+        s = ts.strip()
+        if len(s) == 10: return date.fromisoformat(s)
+        ts = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    if not isinstance(ts, datetime): return ts
+    if ts.tzinfo is None: ts = ts.replace(tzinfo=UTC)
+    return ts.astimezone(BUSINESS_TZ).date()
+
+
+def sql_business_date(column: str) -> str:
+    """SQLite expression giving the business date of a stored UTC ISO timestamp
+    column. SQLite's date() honours a trailing +HH:MM / Z and treats naive
+    stamps as UTC, matching to_business_date()."""
+    return f"date({column}, '+{BUSINESS_UTC_OFFSET_HOURS} hours')"
 
 
 @dataclass
