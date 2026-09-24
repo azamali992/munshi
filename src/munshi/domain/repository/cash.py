@@ -39,6 +39,11 @@ from munshi.domain.repository.numbering import next_doc_no
 
 PAYMENT_METHODS = ("cash", "bank", "jazzcash", "easypaisa", "cheque", "adjustment")
 EXPENSE_CATEGORIES = ("fuel", "salary", "rent", "repair", "utilities", "loading", "food", "misc")
+# Posted only by record_deposit when a driver hands in less cash than his stops collected. Deliberately
+# NOT in EXPENSE_CATEGORIES: nobody can key one by hand (the web form's pattern refuses it and
+# record_expense would coerce it to "misc"), so every row in this category is system-derived and
+# traceable to a deposit. Its note always starts "<plan_id> ", which is how a plan's rows are found.
+SHORTAGE_CATEGORY = "cash_shortage"
 
 _LEDGER_COLS = "entry_id, customer_id, kind, amount, ref, due_date, created_at, method, received_by, doc_no, reversal_of"
 _SUP_COLS = "entry_id, supplier_id, kind, amount, ref, method, created_at, reversal_of"
@@ -75,15 +80,62 @@ class CashMixin(DispatchMixin):
                       (dep.deposit_id, plan_id, counted_p, counted_by, dep.deposited_at))
             # attribution: the stop whose cash is closest to the shortfall is the first place to look
             suspects = []
+            plate = self.get_vehicle(plan.vehicle_id).plate
             if variance_p < 0:
                 gap_p = -variance_p
                 suspects = sorted((s for s in stops if s[2] > 0), key=lambda s: abs(s[2] - gap_p))[:2]
-                self.notify("owner", "variance", f"Cash short by Rs {to_rupees(gap_p):,.0f} on {plan_id} ({self.get_vehicle(plan.vehicle_id).plate})", plan_id)
-            self.audit(actor, "record_deposit", "plan", plan_id, {"expected": to_rupees(expected_p), "counted": to_rupees(counted_p), "variance": to_rupees(variance_p)})
+                self.notify("owner", "variance", f"Cash short by Rs {to_rupees(gap_p):,.0f} on {plan_id} ({plate})", plan_id)
+            shortage = self._book_shortage(c, plan_id, plate, max(0, -variance_p), dep.deposit_id, suspects, counted_by, actor)
+            self.audit(actor, "record_deposit", "plan", plan_id, {"expected": to_rupees(expected_p), "counted": to_rupees(counted_p), "variance": to_rupees(variance_p),
+                                                                  "shortage_entry": shortage["expense_id"] if shortage else None})
         return {"plan_id": plan_id, "expected": to_rupees(expected_p), "counted": to_rupees(counted_p), "previously_deposited": to_rupees(already_p),
                 "variance": to_rupees(variance_p),
                 "suspect_stops": [{"stop_id": sid, "customer_id": cid, "customer_name": self.get_customer(cid).name, "cash_collected": to_rupees(cash)}
-                                  for sid, cid, cash in suspects]}
+                                  for sid, cid, cash in suspects],
+                "shortage_entry": shortage}
+
+    # A driver's cash shortfall is a loss to the business the moment it is found, so it is booked as an
+    # expense (category cash_shortage) dated the day of the deposit. ACCOUNTING JUDGMENT CALL (default,
+    # owner may revisit): expense now, not a receivable against the driver pending recovery. It keeps
+    # profit honest immediately instead of hiding the loss behind an investigation that may never
+    # formally close, and nothing is lost by it:
+    #   * counting error / money found  -> the owner reverses the entry (reverse_expense, audited);
+    #   * the driver makes it good      -> he hands the cash in as another deposit on the same plan,
+    #                                      and that deposit books a negative "recovery" row here;
+    #   * a paid-by-instalment hand-in  -> the same mechanism: the first part books the gap, the rest
+    #                                      recovers it, and the plan nets to zero once square.
+    # Not built (possible future enhancement): a per-driver shortfall record for trust/performance.
+    #
+    # method is "adjustment", not "cash": the cash never reached the drawer, so it must not appear as a
+    # cash outflow (the hand-in is already the true cash-in). The cashbook shows it as a memo line.
+    #
+    # Each deposit reconciles the plan's booked shortage to the current gap. "Booked" counts the
+    # system's own rows (shortages and recoveries) but not owner reversals, so a later deposit never
+    # re-posts a loss the owner has already cancelled; a recovery is capped at what is still on the
+    # books net of reversals, so a cancelled shortage is never "recovered" into a gain.
+    def _book_shortage(self, c, plan_id: str, plate: str, gap_p: int, deposit_id: str, suspects: list, counted_by: str, actor: str) -> dict | None:
+        own = "SELECT expense_id FROM expenses WHERE category=? AND reversal_of IS NULL AND substr(note, 1, ?)=?"
+        key = (SHORTAGE_CATEGORY, len(plan_id) + 1, plan_id + " ")
+        booked_p = int(self._one(f"SELECT COALESCE(SUM(amount), 0) s FROM expenses WHERE expense_id IN ({own})", key)["s"])
+        reversed_p = int(self._one(f"SELECT COALESCE(SUM(amount), 0) s FROM expenses WHERE reversal_of IN ({own})", key)["s"])
+        delta_p = gap_p - booked_p
+        if delta_p < 0: delta_p = -max(0, min(-delta_p, booked_p + reversed_p))     # recover at most what is still on the books
+        if delta_p == 0: return None
+        if delta_p > 0:
+            look = "; ".join(f"{sid} {self.get_customer(cid).name} Rs {to_rupees(cash):,.0f}" for sid, cid, cash in suspects)
+            note = f"{plan_id} ({plate}) cash short on {deposit_id}" + (f"; check {look}" if look else "")
+        else:
+            note = f"{plan_id} ({plate}) shortage made good by {deposit_id}"
+        e = Expense(new_id("EXP"), SHORTAGE_CATEGORY, to_rupees(delta_p), note[:120], "adjustment", counted_by or self._current_user(), today_iso())
+        c.execute(f"INSERT INTO expenses ({_EXP_COLS}) VALUES (?,?,?,?,?,?,?,?,?)",
+                  (e.expense_id, e.category, delta_p, e.note, e.method, e.paid_by, e.expense_date, e.created_at, None))
+        self.audit(actor, "cash_shortage" if delta_p > 0 else "cash_shortage_recovered", "expense", e.expense_id,
+                   {"plan": plan_id, "deposit": deposit_id, "amount": e.amount, "gap": to_rupees(gap_p), "suspect_stops": [s[0] for s in suspects]})
+        return {"expense_id": e.expense_id, "amount": e.amount, "kind": "shortage" if delta_p > 0 else "recovery", "note": e.note}
+
+    def shortfalls(self, day: str) -> list[Expense]:
+        """Driver cash shortfalls booked (and recovered / reversed) on a business day."""
+        return [self._expense(r) for r in self._all(f"SELECT {_EXP_COLS} FROM expenses WHERE category=? AND expense_date=? ORDER BY rowid", (SHORTAGE_CATEGORY, day))]
 
     def _deposited_paisa(self, plan_id: str) -> int:
         return int(self._one("SELECT COALESCE(SUM(amount_counted), 0) s FROM deposits WHERE plan_id=?", (plan_id,))["s"])
@@ -382,9 +434,15 @@ class CashMixin(DispatchMixin):
             amt = int(r["amount_counted"]); handins_p += amt
             deposits.append({"kind": "driver hand-in", "who": self.get_vehicle(self.get_plan(r["plan_id"]).vehicle_id).plate, "amount": to_rupees(amt),
                              "ref": r["deposit_id"], "by": r["counted_by"], "at": r["deposited_at"]})
+        # Memo, not part of `net`: driver cash that should have arrived and didn't (booked as a
+        # cash_shortage expense by record_deposit; recoveries and reversals net it down). The drawer never
+        # held it, so it is neither a hand-in nor a cash-out -- but the day's book must show it.
+        short = [{"kind": "driver shortfall" + (" reversal" if x.reversal_of else " recovered" if x.amount < 0 else ""), "who": x.note,
+                  "amount": x.amount, "ref": x.expense_id, "by": x.paid_by, "at": x.created_at} for x in self.shortfalls(day)]
         return {"date": day, "cash_in": ins, "driver_handins": deposits, "cash_out": outs,
                 "total_in": to_rupees(ins_p), "total_handins": to_rupees(handins_p), "total_out": to_rupees(outs_p),
-                "net": to_rupees(ins_p + handins_p - outs_p)}
+                "net": to_rupees(ins_p + handins_p - outs_p),
+                "shortfalls": short, "total_shortfall": to_rupees(sum(to_paisa(s["amount"]) for s in short))}
 
     @staticmethod
     def _today() -> date:
