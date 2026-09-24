@@ -26,6 +26,11 @@ class CreditNoteIn(BaseModel):
     reason: str = Field(min_length=3, max_length=120)
 
 
+class ReversalIn(BaseModel):
+    # the repository also requires >= 3 characters after trimming (a blank-padded reason is a 400)
+    reason: str = Field(min_length=3, max_length=120)
+
+
 class PurchaseLine(BaseModel):
     sku: str
     qty: int = Field(ge=1)
@@ -106,6 +111,14 @@ def credit_note(body: CreditNoteIn, c: Ctx = Depends(context("settings:write")))
     return c.platform.ops.credit_note(body.customer_id, body.amount, body.reason, approved_by=c.signature)
 
 
+# Reversals cancel money that already moved (HIGH_RISK): owner only, like credit notes and supplier payments.
+# Each posts one exact negation linked by reversal_of; a second attempt on the same entry is refused (409),
+# so a retried or double-clicked request can never reverse twice.
+@router.post("/khata/entries/{entry_id}/reverse", status_code=201)
+def reverse_ledger_entry(entry_id: str, body: ReversalIn, c: Ctx = Depends(context("settings:write"))):   # owner only
+    return c.platform.ops.reverse_ledger_entry(entry_id, body.reason, approved_by=c.signature)
+
+
 # ---------------------------------------------------------------- purchases + suppliers
 @router.get("/purchases")
 def purchases(supplier_id: str = "", c: Ctx = Depends(context("purchases:read"))):
@@ -116,6 +129,11 @@ def purchases(supplier_id: str = "", c: Ctx = Depends(context("purchases:read"))
 @router.post("/purchases", status_code=201)
 def purchase(body: PurchaseIn, c: Ctx = Depends(context("purchases:write"))):
     return c.platform.ops.record_purchase(body.supplier_id, [l.model_dump() for l in body.items], body.warehouse_id, body.invoice_ref, body.paid_amount, approved_by=c.signature)
+
+
+@router.post("/purchases/{purchase_id}/reverse", status_code=201)
+def reverse_purchase(purchase_id: str, body: ReversalIn, c: Ctx = Depends(context("settings:write"))):   # owner only
+    return c.platform.ops.reverse_purchase(purchase_id, body.reason, approved_by=c.signature)
 
 
 @router.get("/payables")
@@ -131,6 +149,11 @@ def supplier_khata(supplier_id: str, c: Ctx = Depends(context("purchases:read"))
 @router.post("/suppliers/{supplier_id}/pay", status_code=201)
 def pay_supplier(supplier_id: str, body: SupplierPayIn, c: Ctx = Depends(context("settings:write"))):   # owner only
     return c.platform.ops.pay_supplier(supplier_id, body.amount, body.method, body.ref, approved_by=c.signature)
+
+
+@router.post("/suppliers/entries/{entry_id}/reverse", status_code=201)
+def reverse_supplier_entry(entry_id: str, body: ReversalIn, c: Ctx = Depends(context("settings:write"))):   # owner only
+    return c.platform.ops.reverse_supplier_entry(entry_id, body.reason, approved_by=c.signature)
 
 
 # ---------------------------------------------------------------- stock writes (form-based)
@@ -168,6 +191,11 @@ def expenses(start: str = "", end: str = "", c: Ctx = Depends(context("reports:r
 @router.post("/expenses", status_code=201)
 def add_expense(body: ExpenseIn, c: Ctx = Depends(context("expenses:write"))):
     return asdict(c.repo.record_expense(body.category, body.amount, body.note, body.method, c.who, c.role, c.signature, body.expense_date))
+
+
+@router.post("/expenses/{expense_id}/reverse", status_code=201)
+def reverse_expense(expense_id: str, body: ReversalIn, c: Ctx = Depends(context("settings:write"))):   # owner only
+    return c.platform.ops.reverse_expense(expense_id, body.reason, approved_by=c.signature)
 
 
 # ---------------------------------------------------------------- reminders + promises
