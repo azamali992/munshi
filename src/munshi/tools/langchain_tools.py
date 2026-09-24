@@ -151,6 +151,17 @@ def build_tools(ops: MunshiTools) -> dict[str, BaseTool]:
         return ops.credit_note(customer_id, amount, reason)
 
     @tool
+    def reverse_ledger_entry(entry_id: str, reason: str) -> dict:
+        """Cancel one customer khata entry (a bounced cheque, a payment keyed to the wrong customer, a wrong invoice) by its ID,
+        e.g. RCP-2026-000012 or INV-2026-000031, with a reason. Posts the exact negation; the original stays. Each entry can be reversed once."""
+        return ops.reverse_ledger_entry(entry_id, reason)
+
+    @tool
+    def reverse_expense(expense_id: str, reason: str) -> dict:
+        """Cancel a mis-keyed expense by its ID (EXP-...), with a reason. Posts a negative expense today; the original stays. Re-record the correct amount separately."""
+        return ops.reverse_expense(expense_id, reason)
+
+    @tool
     def record_payment(customer_id: str, amount: float, method: str = "cash", ref: str = "") -> dict:
         """Record a payment received at the office or by bank/JazzCash/Easypaisa/cheque; posts to the khata and drafts a receipt."""
         return ops.record_payment(customer_id, amount, method, ref)
@@ -194,6 +205,18 @@ def build_tools(ops: MunshiTools) -> dict[str, BaseTool]:
     def pay_supplier(supplier_id: str, amount: float, method: str = "cash", ref: str = "") -> dict:
         """Pay a supplier against their balance."""
         return ops.pay_supplier(supplier_id, amount, method, ref)
+
+    @tool
+    def reverse_purchase(purchase_id: str, reason: str) -> dict:
+        """Undo a mis-keyed purchase by its ID (PUR-...), with a reason: the goods leave the godown again and the bill (and any payment made with it)
+        come off the supplier's account. Refused if the goods are no longer all in stock."""
+        return ops.reverse_purchase(purchase_id, reason)
+
+    @tool
+    def reverse_supplier_entry(entry_id: str, reason: str) -> dict:
+        """Cancel one supplier-account entry by its ID (a payment SPY-... that bounced or went to the wrong supplier, a wrong opening-balance bill), with a reason.
+        A bill that came with a purchase is undone with reverse_purchase instead."""
+        return ops.reverse_supplier_entry(entry_id, reason)
 
     @tool
     def broken_promises() -> list:
@@ -259,7 +282,9 @@ def build_tools(ops: MunshiTools) -> dict[str, BaseTool]:
                  list_routes, list_vehicles, get_plan, list_stops, aging_report, get_digest, suggest_dispatch,
                  create_order, confirm_order, cancel_order, allocate_order, create_dispatch_plan, approve_dispatch_plan,
                  adjust_stock, transfer_stock, close_stop, record_deposit, credit_note, record_payment, record_expense, cashbook,
+                 reverse_ledger_entry, reverse_expense,
                  find_supplier, list_suppliers, supplier_khata, payables_report, record_purchase, pay_supplier,
+                 reverse_purchase, reverse_supplier_entry,
                  draft_reminder, draft_due_reminders, send_reminder, log_promise, broken_promises,
                  sales_report, profit_summary, collection_report, stock_ledger, stock_valuation, slow_stock, top_customers]
     return {t.name: t for t in all_tools}

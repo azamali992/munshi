@@ -37,6 +37,16 @@ def _biz(repo: MunshiRepository) -> str:
     return repo.business_name
 
 
+# A reversal is only ever asked for against a named entry: the words alone are not enough.
+_REVERSE = contains("reverse", "reversal", "undo", "bounced", "bounce")
+
+
+def _khata_ids(text: str, repo: MunshiRepository) -> list[str]:
+    """Customer-khata entry ids in the text: receipts, credit notes, opening balances, invoices (the business's own prefix too)."""
+    prefixes = ["RCP", "CRN", "OPB", "REV", "INV", (repo.setting("invoice_prefix") or "INV").strip().upper()]
+    return [i for p in dict.fromkeys(prefixes) for i in ids_in(text, p)]
+
+
 # ------------------------------------------------------------------ Order
 def build_order_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChatModel | None = None, checkpointer=None) -> AgentBundle:
     T = build_tools(ops); B = _biz(repo)
@@ -131,14 +141,16 @@ def build_hisaab_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCha
     T = build_tools(ops); B = _biz(repo)
     read = [T["get_digest"], T["get_plan"], T["list_stops"], T["get_customer_khata"], T["cashbook"]]
     clerk = read + [T["record_deposit"], T["record_payment"], T["record_expense"]]
-    owner = clerk + [T["credit_note"]]
+    owner = clerk + [T["credit_note"], T["reverse_ledger_entry"], T["reverse_expense"]]
     prompts = {
-        "owner": f"You are the Hisaab Munshi for {B}. Reconcile cash handed in against cash collected on each plan, attribute any shortfall to a stop, record payments received at the office (cash, bank, JazzCash, Easypaisa, cheque) and expenses, keep the khata honest, and issue credit notes only with a stated reason.",
-        "clerk": f"You are the Hisaab Munshi for {B}. Record deposits, office payments and expenses; reconcile. Credit notes need the owner.",
+        "owner": f"You are the Hisaab Munshi for {B}. Reconcile cash handed in against cash collected on each plan, attribute any shortfall to a stop, record payments received at the office (cash, bank, JazzCash, Easypaisa, cheque) and expenses, keep the khata honest, and issue credit notes only with a stated reason. Nothing is ever edited or deleted: a mis-keyed khata entry, a bounced cheque or a wrong expense is cancelled by reversing that one entry, by its ID, with a stated reason.",
+        "clerk": f"You are the Hisaab Munshi for {B}. Record deposits, office payments and expenses; reconcile. Credit notes and reversals need the owner.",
         "salesman": "You are the Hisaab Munshi. Salesmen don't record money; they can ask the office.",
         "driver": "You are the Hisaab Munshi. Drivers hand cash to the cashier; they don't record deposits.",
     }
     rules = [
+        Rule(lambda t: _REVERSE(t) and bool(ids_in(t, "EXP")), "reverse_expense", lambda t: {"expense_id": ids_in(t, "EXP")[0], "reason": t[:120]}),
+        Rule(lambda t: _REVERSE(t) and bool(_khata_ids(t, repo)), "reverse_ledger_entry", lambda t: {"entry_id": _khata_ids(t, repo)[0], "reason": t[:120]}),
         Rule(contains("credit note", "credit", "refund", "waive"), "credit_note",
              lambda t: {"customer_id": parse_customer(t, repo) or "", "amount": money_in(t), "reason": t[:80]}),
         Rule(lambda t: contains("deposit", "handed", "counted", "jama")(t) and bool(ids_in(t, "DSP")), "record_deposit",
@@ -153,7 +165,7 @@ def build_hisaab_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCha
         Rule(contains("digest", "today", "summary", "close the day", "aaj"), "get_digest", lambda t: {}),
     ]
     m = _model(model, rules, "I can record a deposit against a plan, a payment received at the office, an expense, show a khata or the cashbook, or give today's digest.",
-               [(lambda p: "need the owner" in p, "Credit notes need the owner's approval."),
+               [(lambda p: "need the owner" in p, "Credit notes and reversals need the owner's approval."),
                 (lambda p: "don't record money" in p, "Payments are recorded by the office — tell the clerk.")])
     return build_specialist("hisaab", "Hisaab Munshi", m, {"owner": owner, "clerk": clerk, "salesman": [], "driver": []}, prompts, checkpointer)
 
@@ -163,10 +175,10 @@ def build_khareed_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCh
     T = build_tools(ops); B = _biz(repo)
     read = [T["find_supplier"], T["list_suppliers"], T["supplier_khata"], T["payables_report"], T["get_stock"], T["search_products"]]
     clerk = read + [T["record_purchase"]]
-    owner = clerk + [T["pay_supplier"]]
+    owner = clerk + [T["pay_supplier"], T["reverse_purchase"], T["reverse_supplier_entry"]]
     prompts = {
-        "owner": f"You are the Khareed Munshi for {B}, in charge of buying. Receive stock from suppliers into the godown with the bill on their account, track what we owe each supplier, and pay suppliers only with a stated method and reference.",
-        "clerk": f"You are the Khareed Munshi for {B}. Record stock received from suppliers and show what we owe. Supplier payments need the owner.",
+        "owner": f"You are the Khareed Munshi for {B}, in charge of buying. Receive stock from suppliers into the godown with the bill on their account, track what we owe each supplier, and pay suppliers only with a stated method and reference. Nothing is ever edited or deleted: a mis-keyed purchase is undone with reverse_purchase (the goods go back too), a bounced or misdirected supplier payment with reverse_supplier_entry, each by its ID and with a stated reason.",
+        "clerk": f"You are the Khareed Munshi for {B}. Record stock received from suppliers and show what we owe. Supplier payments and reversals need the owner.",
         "salesman": "You are the Khareed Munshi. Salesmen don't handle purchases.",
         "driver": "You are the Khareed Munshi. Drivers don't handle purchases.",
     }
@@ -179,6 +191,9 @@ def build_khareed_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCh
         return {"supplier_id": parse_supplier(t, repo) or "", "items": items, "warehouse_id": (ids_in(t, "WH") or [default_wh])[0], "invoice_ref": (re.search(r"(?:bill|invoice|ref)\s*#?\s*([A-Za-z0-9-]+)", t, re.I) or [None, ""])[1] if re.search(r"(?:bill|invoice|ref)\s*#?\s*([A-Za-z0-9-]+)", t, re.I) else "", "paid_amount": 0}
 
     rules = [
+        Rule(lambda t: _REVERSE(t) and bool(ids_in(t, "PUR")), "reverse_purchase", lambda t: {"purchase_id": ids_in(t, "PUR")[0], "reason": t[:120]}),
+        Rule(lambda t: _REVERSE(t) and bool(ids_in(t, "SPY") + ids_in(t, "BIL")), "reverse_supplier_entry",
+             lambda t: {"entry_id": (ids_in(t, "SPY") + ids_in(t, "BIL"))[0], "reason": t[:120]}),
         Rule(lambda t: contains("pay", "paid", "payment")(t) and bool(parse_supplier(t, repo)), "pay_supplier",
              lambda t: {"supplier_id": parse_supplier(t, repo) or "", "amount": money_in(t), "method": method_in(t), "ref": t[:60]}),
         Rule(lambda t: contains("received", "purchase", "bought", "khareed", "aaya", "arrived", "stock in")(t) and bool(parse_items(t, repo)), "record_purchase", _purchase_args),
@@ -186,7 +201,7 @@ def build_khareed_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCh
         Rule(lambda t: bool(parse_supplier(t, repo)), "supplier_khata", lambda t: {"supplier_id": parse_supplier(t, repo)}),
     ]
     m = _model(model, rules, "Tell me what arrived and from whom, e.g. 'received 100 urea from Fauji at 3600', or ask what we owe.",
-               [(lambda p: "need the owner" in p, "Supplier payments need the owner's approval."),
+               [(lambda p: "need the owner" in p, "Supplier payments and reversals need the owner's approval."),
                 (lambda p: "don't handle purchases" in p, "Purchases are handled by the office.")])
     return build_specialist("khareed", "Khareed Munshi", m, {"owner": owner, "clerk": clerk, "salesman": [], "driver": []}, prompts, checkpointer)
 

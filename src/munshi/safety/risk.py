@@ -59,9 +59,14 @@ RISK_REGISTRY: dict[str, RiskTier] = {
     "record_payment": RiskTier.LOW_RISK,
     "record_expense": RiskTier.LOW_RISK,
     "credit_note": RiskTier.HIGH_RISK,
+    # reversals cancel money that already moved: owner-approved, like credit_note / pay_supplier
+    "reverse_ledger_entry": RiskTier.HIGH_RISK,
+    "reverse_expense": RiskTier.HIGH_RISK,
     # khareed
     "record_purchase": RiskTier.LOW_RISK,
     "pay_supplier": RiskTier.HIGH_RISK,
+    "reverse_purchase": RiskTier.HIGH_RISK,
+    "reverse_supplier_entry": RiskTier.HIGH_RISK,
     # wasooli
     "draft_reminder": RiskTier.LOW_RISK,
     "draft_due_reminders": RiskTier.LOW_RISK,

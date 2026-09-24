@@ -156,6 +156,14 @@ class MunshiTools:
         e = self.repo.add_ledger(customer_id, "credit_note", -abs(float(amount)), reason, None, "hisaab_munshi", approved_by, "adjustment")
         return asdict(e)
 
+    def reverse_ledger_entry(self, entry_id: str, reason: str, approved_by: str = "owner") -> dict:
+        # a reversal changes money that already moved: HIGH_RISK, owner-approved, like credit_note
+        e = self.repo.reverse_ledger_entry(entry_id, reason, "hisaab_munshi", approved_by)
+        return asdict(e) | {"customer_name": self.repo.get_customer(e.customer_id).name, "outstanding": self.repo.outstanding(e.customer_id)}
+
+    def reverse_expense(self, expense_id: str, reason: str, approved_by: str = "owner") -> dict:
+        return asdict(self.repo.reverse_expense(expense_id, reason, "hisaab_munshi", approved_by))
+
     def cashbook(self, day: str = "") -> dict:
         return self.repo.cashbook(day or None)
 
@@ -183,6 +191,14 @@ class MunshiTools:
     def pay_supplier(self, supplier_id: str, amount: float, method: str = "cash", ref: str = "", approved_by: str = "owner") -> dict:
         e = self.repo.pay_supplier(supplier_id, amount, method or "cash", ref, "khareed_munshi", approved_by)
         return asdict(e) | {"supplier_name": self.repo.get_supplier(supplier_id).name, "balance": self.repo.supplier_balance(supplier_id)}
+
+    def reverse_purchase(self, purchase_id: str, reason: str, approved_by: str = "owner") -> dict:
+        p = self.repo.reverse_purchase(purchase_id, reason, "khareed_munshi", approved_by)
+        return asdict(p) | {"supplier_name": self.repo.get_supplier(p.supplier_id).name, "balance": self.repo.supplier_balance(p.supplier_id)}
+
+    def reverse_supplier_entry(self, entry_id: str, reason: str, approved_by: str = "owner") -> dict:
+        e = self.repo.reverse_supplier_entry(entry_id, reason, "khareed_munshi", approved_by)
+        return asdict(e) | {"supplier_name": self.repo.get_supplier(e.supplier_id).name, "balance": self.repo.supplier_balance(e.supplier_id)}
 
     # ---------- wasooli ----------
     def draft_reminder(self, customer_id: str, tier: str = "") -> dict:
