@@ -102,7 +102,7 @@ def import_xlsx(repo: MunshiRepository, data: bytes, actor: str) -> dict:
                 result["suppliers"] += 1
                 ob = float(r.get("opening_balance") or 0)
                 if ob > 0 and not prev:
-                    repo._conn.execute("INSERT INTO supplier_ledger VALUES (?,?,?,?,?,?,?)", (f"BIL-OPEN-{s.supplier_id}", s.supplier_id, "bill", ob, "opening balance", "", repo._all("SELECT datetime('now') d")[0]["d"]))
+                    repo.supplier_opening_balance(s.supplier_id, ob, actor)
             except Exception as e: result["errors"].append(f"Suppliers row {i}: {e}")
     if "Stock" in wb.sheetnames:
         whs = {w.warehouse_id for w in repo.list_warehouses()}
@@ -113,7 +113,7 @@ def import_xlsx(repo: MunshiRepository, data: bytes, actor: str) -> dict:
                 repo.get_product(sku)
                 cur = repo.get_stock(wh, sku).on_hand
                 delta = int(r.get("on_hand") or 0) - cur
-                if delta: repo.move_stock(wh, sku, delta, "adjust", "import", allow_negative=True)
+                if delta: repo.move_stock(wh, sku, delta, "adjust", "import")     # never below zero
                 result["stock"] += 1
             except Exception as e: result["errors"].append(f"Stock row {i}: {e}")
     repo.audit(actor, "import_xlsx", "import", "workbook", {k: v for k, v in result.items() if k != "errors"} | {"errors": len(result["errors"])})

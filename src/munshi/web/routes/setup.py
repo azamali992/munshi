@@ -164,11 +164,8 @@ def suppliers(c: Ctx = Depends(context("purchases:read"))):
 def add_supplier(body: SupplierIn, c: Ctx = Depends(context("purchases:write"))):
     s = c.repo.upsert_supplier(Supplier("", body.name, body.phone, body.address))
     c.repo.audit(c.role, "supplier_added", "supplier", s.supplier_id, {"name": s.name}, approved_by=c.signature)
-    if body.opening_balance > 0:
-        from munshi.domain.models import now_iso
-        from munshi.domain.repository import new_id
-        with c.repo._tx() as cur:
-            cur.execute("INSERT INTO supplier_ledger VALUES (?,?,?,?,?,?,?)", (new_id("BIL"), s.supplier_id, "bill", body.opening_balance, "opening balance", "", now_iso()))
+    if body.opening_balance > 0:     # through the repository: stored as integer paisa
+        c.repo.supplier_opening_balance(s.supplier_id, body.opening_balance, c.role, c.signature)
     return asdict(s) | {"balance": c.repo.supplier_balance(s.supplier_id)}
 
 
