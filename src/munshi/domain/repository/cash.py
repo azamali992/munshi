@@ -223,7 +223,33 @@ class CashMixin(DispatchMixin):
             payload = {"reverses": entry_id, "kind": r["kind"], "amount": to_rupees(-int(r["amount"])), "customer": r["customer_id"], "reason": reason}
             self.audit(actor, "reverse_ledger_entry", "ledger", entry_id, payload | {"reversal": rid}, approved_by)
             self.audit(actor, "ledger_reversal", "ledger", rid, payload, approved_by)
+            self._queue_reversal_correction(r, rid)
         return self.get_ledger_entry(rid)
+
+    def _customer_messages_for(self, r) -> list[str]:
+        """Outbox refs of the customer messages that stated this entry (and so the balance after it). A receipt
+        or invoice sent from chat is queued with ref = the entry id; the message at the door after a delivery is
+        queued with ref = the stop's invoice and states the cash taken, so a driver's receipt is covered by it."""
+        refs = [r["entry_id"]]
+        if r["kind"] == "payment" and (r["received_by"] or "") == "driver" and (r["ref"] or "").startswith("STP-"):
+            done = self._one("SELECT result FROM stop_closes WHERE stop_id=?", (r["ref"],))
+            inv = json.loads(done["result"]).get("invoice_id") if done else None
+            if inv: refs.append(inv)
+        marks = ",".join("?" * len(refs))
+        return [m["ref"] for m in self._all(f"SELECT ref FROM outbox WHERE ref IN ({marks}) AND status IN ('queued', 'sent')", tuple(refs))]
+
+    def _queue_reversal_correction(self, r, rid: str) -> None:
+        """The customer was told this entry's amount and the balance after it (a WhatsApp receipt, an invoice at the
+        door). Reversing it makes that balance wrong, so a correction goes out the same way, templated: what was
+        cancelled, the reversal's number, and the balance now. Never the reason (free text is not sent to customers).
+        Nothing is sent for an entry the customer was never told about, or whose message failed."""
+        if not self._customer_messages_for(r): return
+        cust = self.get_customer(r["customer_id"])
+        what = {"payment": "Receipt", "invoice": "Invoice", "credit_note": "Credit note"}.get(r["kind"], "Entry")
+        method = f", {r['method']}" if r["kind"] == "payment" and r["method"] else ""
+        self.queue_message("whatsapp", cust.phone,
+                           f"{self.business_name}: Correction. {what} {r['entry_id']} (Rs {to_rupees(abs(int(r['amount']))):,.0f}{method}) has been cancelled "
+                           f"({rid}). Balance now Rs {self.outstanding(r['customer_id']):,.0f}.", rid)
 
     # ------------------------------------------------------------ expenses
     @staticmethod

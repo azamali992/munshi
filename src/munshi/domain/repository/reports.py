@@ -25,7 +25,9 @@ def _p(e) -> int:
 class ReportsMixin(CollectionsMixin):
     def digest(self, day: str | None = None) -> dict:
         day = day or today_iso()
-        orders_today = self._orders_on(day)
+        booked = self._orders_on(day)
+        # a cancelled order is not activity: it never counts towards the day's orders or their value
+        orders_today = [o for o in booked if o.status != "cancelled"]
         plans = self.list_plans(day)
         stops = [s for p in plans for s in self.list_stops(p.plan_id)]
         cash_p = sum(cash for p in plans for _, _, cash in self._stop_cash_paisa(p.plan_id))
@@ -38,7 +40,8 @@ class ReportsMixin(CollectionsMixin):
             "date": day,
             "orders": {"count": len(orders_today), "value": to_rupees(sum(o.total_paisa for o in orders_today)),
                        "draft": sum(o.status == "draft" for o in orders_today), "confirmed": len(self.list_orders("confirmed", limit=500)),
-                       "allocated": len(self.list_orders("allocated", limit=500))},
+                       "allocated": len(self.list_orders("allocated", limit=500)),
+                       "cancelled": len(booked) - len(orders_today)},
             "dispatch": {"plans": len(plans), "stops": len(stops),
                          "delivered": sum(s.status == "delivered" for s in stops), "short": sum(s.status == "short" for s in stops),
                          "pending": sum(s.status == "pending" for s in stops)},
@@ -107,7 +110,41 @@ class ReportsMixin(CollectionsMixin):
             by_sku[r["sku"]] = {"qty": int(r["q"]), "revenue": int(r["rev"]), "cost": int(r["cost"])}
             cost += int(r["cost"])
         return {"revenue": revenue, "gross": gross, "credits": credits, "invoices": sum(1 for e in invoices if not e.reversal_of), "cost": cost,
-                "by_day": by_day, "by_cust": by_cust, "by_booker": by_booker, "by_sku": by_sku}
+                "by_day": by_day, "by_cust": by_cust, "by_booker": by_booker, "by_sku": by_sku} | self._cost_coverage(start, end, invoices)
+
+    def _cost_coverage(self, start: str, end: str, invoices: list) -> dict:
+        """Which of the period's sales have a known cost. An invoice's cost is known when the delivery that raised
+        it wrote sale_lines and every line carries a cost above zero. A hand-keyed invoice (no delivery), a sale
+        of a product whose cost was never entered (cost 0), or pre-Munshi history has no cost: its revenue lands
+        in revenue with nothing against it in cost of goods, which would show as margin. So it is counted here
+        and the reports flag it instead of presenting an inflated margin as fact.
+
+        Not counted: reversals, and invoices reversed within the same period (the pair nets out of revenue).
+        Opening balances are already excluded from `invoices`. Credit notes carry no cost by nature."""
+        reversed_here = {e.reversal_of for e in invoices if e.reversal_of}
+        standing = [e for e in invoices if not e.reversal_of and e.entry_id not in reversed_here]
+        lines = {r["invoice_id"]: int(r["min_cost"]) for r in self._all(
+            "SELECT invoice_id, MIN(cost_paisa) min_cost FROM sale_lines WHERE invoice_id IS NOT NULL AND "
+            + sql_business_date("created_at") + " BETWEEN ? AND ? GROUP BY invoice_id", (start, end))}
+        missing = [e for e in standing if lines.get(e.entry_id, 0) <= 0]
+        costed = self._one("SELECT COALESCE(SUM(revenue_paisa), 0) rev, COALESCE(SUM(cost_paisa), 0) cost FROM sale_lines WHERE cost_paisa > 0 AND "
+                           + sql_business_date("created_at") + " BETWEEN ? AND ?", (start, end))
+        return {"cost_missing_count": len(missing), "cost_missing_revenue": sum(_p(e) for e in missing),
+                "costed_revenue": int(costed["rev"]), "costed_cost": int(costed["cost"])}
+
+    @staticmethod
+    def _cost_fields(s: dict) -> dict:
+        """The cost-coverage block every margin-bearing report carries (rupees):
+        cost_missing {count, revenue}: sales in the period whose cost is unknown;
+        margin_reliable: False when any is, i.e. gross_margin / margin_pct are overstated;
+        costed_margin_pct: margin on the sales whose cost IS known (None if there are none);
+        caveat: one plain sentence for the reader, or None."""
+        n, rev = s["cost_missing_count"], s["cost_missing_revenue"]
+        crev, ccost = s["costed_revenue"], s["costed_cost"]
+        caveat = (f"Cost is unknown for Rs {to_rupees(rev):,.0f} of sales ({n} invoice{'' if n == 1 else 's'}), "
+                  "so the margin shown is overstated.") if n else None
+        return {"cost_missing": {"count": n, "revenue": to_rupees(rev)}, "margin_reliable": n == 0,
+                "costed_margin_pct": round((crev - ccost) / crev * 100, 1) if crev > 0 else None, "caveat": caveat}
 
     def sales_report(self, start: str, end: str) -> dict:
         """Sales between two dates, net of credit notes, by day, product and customer, with gross margin at the
@@ -125,7 +162,8 @@ class ReportsMixin(CollectionsMixin):
                 "by_day": [{"date": d, "revenue": to_rupees(v)} for d, v in sorted(s["by_day"].items())],
                 "by_product": sorted(by_product, key=lambda r: -r["revenue"]),
                 "by_customer": sorted([{"customer_id": k, "name": names.get(k, k), "revenue": to_rupees(v)} for k, v in s["by_cust"].items()], key=lambda r: -r["revenue"])[:20],
-                "by_booker": sorted([{"name": k, "revenue": to_rupees(v)} for k, v in s["by_booker"].items()], key=lambda r: -r["revenue"])}
+                "by_booker": sorted([{"name": k, "revenue": to_rupees(v)} for k, v in s["by_booker"].items()], key=lambda r: -r["revenue"])} \
+            | self._cost_fields(s)
 
     def invoice_lines(self, invoice_id: str) -> list[dict]:
         """What a delivery invoice billed, product by product, from the sale record (rupees)."""
@@ -145,7 +183,13 @@ class ReportsMixin(CollectionsMixin):
         for e in payments:
             m = e.method or "cash"; by_method[m] = by_method.get(m, 0) - _p(e)
         credits = -sum(_p(e) for e in self._credit_notes(start, end))
+        # How many payments stand. A reversal (a bounced cheque, a receipt keyed to the wrong customer) is not a payment,
+        # and the receipt it cancels no longer is one either when both fall in the period; the amounts already net.
+        reversals = [e for e in payments if e.reversal_of]
+        cancelled = {e.reversal_of for e in reversals}
+        standing = [e for e in payments if not e.reversal_of and e.entry_id not in cancelled]
         return {"start": start, "end": end, "invoiced": to_rupees(invoiced), "collected": to_rupees(collected), "credit_notes": to_rupees(credits),
+                "payment_count": len(standing), "reversals": {"count": len(reversals), "amount": to_rupees(sum(_p(e) for e in reversals))},
                 "collection_rate_pct": round(collected / invoiced * 100, 1) if invoiced else 0.0,
                 "by_method": {k: to_rupees(v) for k, v in by_method.items()}, "aging": self.aging_summary()}
 
@@ -211,4 +255,6 @@ class ReportsMixin(CollectionsMixin):
         exp_total = sum(by_cat.values())
         return {"start": start, "end": end, "revenue": to_rupees(s["revenue"]), "credit_notes": to_rupees(s["credits"]),
                 "cost_of_goods": to_rupees(s["cost"]), "gross_margin": to_rupees(margin),
-                "expenses": to_rupees(exp_total), "expenses_by_category": {k: to_rupees(v) for k, v in by_cat.items()}, "net": to_rupees(margin - exp_total)}
+                "margin_pct": round(margin / s["revenue"] * 100, 1) if s["revenue"] > 0 else 0.0,
+                "expenses": to_rupees(exp_total), "expenses_by_category": {k: to_rupees(v) for k, v in by_cat.items()}, "net": to_rupees(margin - exp_total)} \
+            | self._cost_fields(s)
