@@ -119,6 +119,11 @@ def _is_name_word(w: str, name: str) -> bool:
     return any(_token_matches(w, nt) for nt in _names_words(name))
 
 
+def is_res_word(w: str, res) -> bool:
+    """A word of the name a resolution found -- or of the learned name that decided it ('ffc' for Fauji Fertilizer)."""
+    return _is_name_word(w, res.name) or bool(res.alias and w in words(fold(res.alias.get("phrase") or "")))
+
+
 def ordinal(text: str) -> int | None:
     """1 for 'pehla wala' / 'first' / '1', 2 for 'doosra'... when that is ALL the message says."""
     toks = [w for w in words(fold(text)) if w not in _FILLER or w in _ORD_WORD]
@@ -142,8 +147,8 @@ def answer(ask: dict, text: str, repo) -> tuple[str, str | None] | None:
         res = (customer_resolution if slot == "customer" else supplier_resolution)(text, repo)
         if not res.ok or res.other is not None:
             return None
-        rid, name = res.id or "", res.name
-        if _leftover(text, lambda w: _is_name_word(w, name)):          # (an ID like C-009 is already out of the words)
+        rid = res.id or ""
+        if _leftover(text, lambda w: is_res_word(w, res)):              # (an ID like C-009 is already out of the words)
             return None
         return f"{base} {rid}", None
     if slot == "amount":

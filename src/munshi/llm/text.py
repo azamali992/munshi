@@ -138,3 +138,35 @@ def romanize(token: str) -> str:
 
 def has_urdu_word(token: str) -> bool:
     return token in _URDU_WORDS
+
+
+# ------------------------------------------------------------------ learned-name keys
+# The words people put around a nickname ('Bhatti SAHAB', 'Malik WALE', 'Haji JI'), each spelling onto one form, so a
+# phrase learned as 'Bhatti sahib' is the same memory as 'bhatti sahab' or 'بھٹی صاحب'.
+_HONORIFICS = {k: v for v, ks in {
+    "sahab": ["sahab", "sahib", "saab", "sahb", "sb", "صاحب"], "ji": ["ji", "jee", "جی"],
+    "wale": ["wale", "wala", "wali", "walay", "walon", "waly", "walo", "waale", "waala", "والے", "والا", "والی"],
+    "bhai": ["bhai", "bhaijan", "bhaiya", "bhayya", "بھائی"], "seth": ["seth", "sait", "سیٹھ"], "chacha": ["chacha", "چاچا"],
+}.items() for k in (fold(x) for x in ks)}
+HONORIFIC_KEYS = frozenset(_HONORIFICS.values())
+
+
+def is_honorific(token: str) -> bool:
+    return fold(token) in _HONORIFICS
+
+
+def token_key(token: str) -> str:
+    """One word of a learned name as it is matched: honorifics onto one spelling, Roman words by their sound key
+    (Bhatti/Bhati/Bhattee), Urdu trade-name words through their stored Roman form (بھٹی -> bhatti), any other Urdu
+    word as itself."""
+    t = fold(token)
+    if t in _HONORIFICS:
+        return _HONORIFICS[t]
+    if "؀" <= t[:1] <= "ۿ":
+        return phonetic(romanize(t)) if has_urdu_word(t) else t
+    return phonetic(t) or t
+
+
+def phrase_key(phrase: str) -> str:
+    """The normalised form a learned name is stored and looked up under ('Bhatti Sahib' -> 'bati sahab')."""
+    return " ".join(token_key(w) for w in words(fold(phrase)))
