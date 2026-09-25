@@ -61,6 +61,21 @@ def _didnt(text: str) -> AIMessage:
     return AIMessage(content=str(text), response_metadata={OUTCOME_KEY: NOT_UNDERSTOOD})
 
 
+# A clarifying question for ONE missing piece (llm.replies.Ask) is marked response_metadata[ASK_KEY] =
+# {"slot", "candidates"}: the platform keeps it as the thread's open question (see agents/followup.py).
+ASK_KEY = "munshi_ask"
+
+
+def ask_meta(reply: Any) -> dict | None:
+    slot = getattr(reply, "slot", None)
+    return {"slot": slot, "candidates": list(getattr(reply, "candidates", None) or [])} if slot else None
+
+
+def ask_of(msg: Any) -> dict | None:
+    """The open question a message asks ({"slot", "candidates"}), or None."""
+    return (getattr(msg, "response_metadata", None) or {}).get(ASK_KEY) if isinstance(msg, AIMessage) else None
+
+
 def history() -> list[BaseMessage]:
     """The messages of the thread the current stub turn is answering (empty outside a turn)."""
     return list(_HISTORY.get() or [])
@@ -207,6 +222,9 @@ class StubToolCallingModel(BaseChatModel):
                 log.exception("stub fallback failed on %r", text[:80])
                 reply = None
             if reply:
-                return _didnt(reply) if isinstance(reply, NotUnderstood) else AIMessage(content=reply)
+                if isinstance(reply, NotUnderstood):
+                    return _didnt(reply)
+                am = ask_meta(reply)
+                return AIMessage(content=str(reply), response_metadata={ASK_KEY: am} if am else {})
         # nothing matched and nothing specific to ask: the generic capability line is a "didn't understand"
         return _didnt(self.fallback_text)
