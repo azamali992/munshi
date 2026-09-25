@@ -297,7 +297,7 @@ def test_v6_applies_to_a_pre_v6_file_and_reopening_applies_nothing(tmp_path, mon
     conn.close()
     monkeypatch.undo()
     r = MunshiRepository(path)
-    assert migrations.current_version(r._conn) == 6 and r.get_customer("C-1").name == "Bhatti Kisan Store"
+    assert migrations.current_version(r._conn) == migrations.MIGRATIONS[-1][0] >= 6 and r.get_customer("C-1").name == "Bhatti Kisan Store"
     assert r.learned_aliases() == [] and r._one("SELECT COUNT(*) FROM alias_card_links")[0] == 0
     r.learn_alias(phrase_key("bhatti sahab"), "Bhatti sahab", "customer", "C-1", "test")
     with pytest.raises(sqlite3.IntegrityError):                   # one ACTIVE row per phrase, enforced by the file itself

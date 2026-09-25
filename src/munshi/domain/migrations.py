@@ -398,8 +398,70 @@ CREATE TABLE IF NOT EXISTS alias_card_links (
  PRIMARY KEY (approval_id, link, entity_kind, phrase_norm))
 """
 
+# ============================================================================ V7
+# Price history: every change to a product's list price (unit_price) or reference cost (cost_price), with the old
+# and new value in paisa and when. Captured by triggers on `products` so NO path can change a price without a
+# record -- the office console, the phone app's product form, an Excel import, a purchase updating the last cost.
+#   * upsert_product writes with INSERT OR REPLACE. A BEFORE INSERT trigger still sees the old row (REPLACE deletes it
+#     only at the constraint check, after BEFORE triggers), so it records old -> new; an AFTER UPDATE trigger covers
+#     plain UPDATEs (record_purchase's cost update, the office console's price change).
+#   * Who changed it: a trigger cannot know the signed-in user, so `changed_by` starts '' and the writer that knows
+#     (domain/repository/office.py) stamps it once in the same transaction. Otherwise append-only: no delete, and no
+#     update except that one-time stamp of changed_by/source on a row whose changed_by is still ''.
+#   * audit_seq: the audit trail's last rowid when the change was written (audit is append-only, so rowids only grow).
+#     A change made outside the console is attributed to the first matching audit row written AFTER it -- the one
+#     the same request writes right after changing the price -- not to whatever happened in the same second.
+# Additive only: a new table and triggers; nothing existing changes.
+V7 = """
+CREATE TABLE IF NOT EXISTS price_history (
+ history_id INTEGER PRIMARY KEY,
+ sku TEXT NOT NULL,
+ field TEXT NOT NULL CHECK (field IN ('unit_price', 'cost_price')),
+ old_paisa INTEGER NOT NULL CHECK (typeof(old_paisa) = 'integer'),
+ new_paisa INTEGER NOT NULL CHECK (typeof(new_paisa) = 'integer'),
+ changed_at TEXT NOT NULL,
+ changed_by TEXT NOT NULL DEFAULT '',
+ source TEXT NOT NULL DEFAULT '',
+ audit_seq INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS ix_price_history_sku ON price_history(sku, history_id)
+"""
+
+_NOW_SQL = "strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')"      # the same shape as models.now_iso()
+_SEQ_SQL = "(SELECT COALESCE(MAX(rowid), 0) FROM audit)"
+V7_TRIGGERS = [
+    f"""CREATE TRIGGER IF NOT EXISTS products_price_history_replace BEFORE INSERT ON products
+        BEGIN
+          INSERT INTO price_history (sku, field, old_paisa, new_paisa, changed_at, audit_seq)
+            SELECT sku, 'unit_price', unit_price, NEW.unit_price, {_NOW_SQL}, {_SEQ_SQL} FROM products WHERE sku = NEW.sku AND unit_price IS NOT NEW.unit_price;
+          INSERT INTO price_history (sku, field, old_paisa, new_paisa, changed_at, audit_seq)
+            SELECT sku, 'cost_price', cost_price, NEW.cost_price, {_NOW_SQL}, {_SEQ_SQL} FROM products WHERE sku = NEW.sku AND cost_price IS NOT NEW.cost_price;
+        END""",
+    f"""CREATE TRIGGER IF NOT EXISTS products_price_history_unit BEFORE UPDATE OF unit_price ON products
+        WHEN OLD.unit_price IS NOT NEW.unit_price
+        BEGIN INSERT INTO price_history (sku, field, old_paisa, new_paisa, changed_at, audit_seq)
+              VALUES (OLD.sku, 'unit_price', OLD.unit_price, NEW.unit_price, {_NOW_SQL}, {_SEQ_SQL}); END""",
+    f"""CREATE TRIGGER IF NOT EXISTS products_price_history_cost BEFORE UPDATE OF cost_price ON products
+        WHEN OLD.cost_price IS NOT NEW.cost_price
+        BEGIN INSERT INTO price_history (sku, field, old_paisa, new_paisa, changed_at, audit_seq)
+              VALUES (OLD.sku, 'cost_price', OLD.cost_price, NEW.cost_price, {_NOW_SQL}, {_SEQ_SQL}); END""",
+    """CREATE TRIGGER IF NOT EXISTS price_history_append_only_delete BEFORE DELETE ON price_history
+        BEGIN SELECT RAISE(ABORT, 'price_history is append-only'); END""",
+    """CREATE TRIGGER IF NOT EXISTS price_history_append_only_update BEFORE UPDATE ON price_history
+        WHEN NOT (OLD.changed_by = '' AND NEW.history_id IS OLD.history_id AND NEW.sku IS OLD.sku AND NEW.field IS OLD.field
+                  AND NEW.old_paisa IS OLD.old_paisa AND NEW.new_paisa IS OLD.new_paisa AND NEW.changed_at IS OLD.changed_at
+                  AND NEW.audit_seq IS OLD.audit_seq)
+        BEGIN SELECT RAISE(ABORT, 'price_history is append-only (only an unattributed row may be stamped with who changed it, once)'); END""",
+]
+
+
+def _v7(conn: sqlite3.Connection) -> None:
+    _run_sql(conn, V7)
+    for stmt in V7_TRIGGERS:        # trigger bodies contain ';': executed one by one
+        conn.execute(stmt)
+
+
 Step = str | Callable[[sqlite3.Connection], None]
-MIGRATIONS: list[tuple[int, Step]] = [(1, V1), (2, V2), (3, V3), (4, V4), (5, _v5), (6, V6)]
+MIGRATIONS: list[tuple[int, Step]] = [(1, V1), (2, V2), (3, V3), (4, V4), (5, _v5), (6, V6), (7, _v7)]
 
 
 def current_version(conn: sqlite3.Connection) -> int:
