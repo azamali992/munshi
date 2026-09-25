@@ -22,5 +22,5 @@ def build_chat_model(provider: str | None = None) -> BaseChatModel | None:
         if not key:
             raise ValueError("LLM_PROVIDER=groq needs GROQ_API_KEY (free key: https://console.groq.com). See .env.example.")
         from langchain_groq import ChatGroq
-        return ChatGroq(model=os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile"), api_key=key, temperature=0)
+        return ChatGroq(model=os.environ.get("LLM_MODEL", "openai/gpt-oss-120b"), api_key=key, temperature=0)
     raise ValueError(f"unknown LLM_PROVIDER {provider!r}")
