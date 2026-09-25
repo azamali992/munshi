@@ -33,7 +33,7 @@ from munshi.domain.models import business_now, business_today
 from munshi.domain.repository import CapacityError, CreditHoldError, InsufficientStockError, NotFoundError, OtpError, StateError
 from munshi.llm.factory import build_chat_model
 from munshi.tenancy.hub import TenantHub
-from munshi.web.routes import auth, money, ops, reports, setup
+from munshi.web.routes import auth, money, office, ops, reports, setup
 
 STATIC = Path(__file__).parent / "static"
 VERSION = "1.0.0"
@@ -148,7 +148,7 @@ def build_app(data_dir: str | None = None, model=None, enable_tracing: bool | No
     app.state.login_limiter = RateLimiter(rate_per_minute=10, burst=10)
     app.state.signup_limiter = RateLimiter(rate_per_minute=3, burst=3)
     app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
-    for r in (auth.router, setup.router, ops.router, money.router, reports.router):
+    for r in (auth.router, setup.router, ops.router, money.router, reports.router, office.router):
         app.include_router(r)
 
     # ---------------- errors -> clean messages, never stack traces
