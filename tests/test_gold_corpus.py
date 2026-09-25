@@ -90,3 +90,21 @@ def test_urdu_script_routes(results):
     urdu = [r for r in rows if r["lang"] == "urdu"]
     assert len(urdu) >= 12
     assert sum(r["routing_ok"] for r in urdu) / len(urdu) >= 0.9, _explain(urdu, lambda r: not r["routing_ok"])
+
+
+# The owner's real first session (eval/gold_user_session.jsonl) and multi-turn follow-ups written before the fix
+# (eval/gold_followups.jsonl): answers to the munshi's own questions, remembered customers, whole-business questions,
+# stock coming in. Blind first run before the fix: 15.8% and 21.4% correct (0 wrong cards). Achieved after: 100% / 100%.
+FOLLOWUP_FLOORS = {"gold_user_session": 94.0, "gold_followups": 97.0}     # one message of margin on each
+
+
+@pytest.fixture(scope="module")
+def followups():
+    return {name: evaluate(ROOT / "eval" / f"{name}.jsonl") for name in FOLLOWUP_FLOORS}
+
+
+@pytest.mark.parametrize("name", list(FOLLOWUP_FLOORS))
+def test_follow_up_conversations(followups, name):
+    s, rows = followups[name]
+    assert s["wrong_cards"] == 0 and s["unsafe_executed_writes"] == 0 and s["crashes"] == 0, _explain(rows, lambda r: r["unsafe"] or r["error"])
+    assert s["end_to_end_correct_pct"] >= FOLLOWUP_FLOORS[name], f"{name} regressed:\n" + _explain(rows, lambda r: not r["correct"])

@@ -79,12 +79,29 @@ class MunshiTools:
                 hits.append(asdict(p))
         return hits[:8]
 
-    def get_stock(self, sku: str) -> list[dict]:
-        self.repo.get_product(sku)
-        return [asdict(s) | {"available": s.available} for s in self.repo.stock_by_sku(sku)]
+    def get_stock(self, sku: str = "") -> list[dict]:
+        """One product's stock at every godown; with no SKU, every active product's (read-only)."""
+        if sku:
+            self.repo.get_product(sku)
+            return [asdict(s) | {"available": s.available} for s in self.repo.stock_by_sku(sku)]
+        active = {p.sku for p in self.repo.list_products()}
+        return [asdict(s) | {"available": s.available} for s in self.repo.list_stock() if s.sku in active]
 
-    def list_orders(self, status: str = "") -> list[dict]:
-        return [self._order(o) for o in self.repo.list_orders(status or None, limit=40)]
+    def list_orders(self, status: str = "", sku: str = "", customer_id: str = "", days: int = 0) -> list[dict]:
+        """Recent orders, newest first; optionally only one status, one product, one customer, or the last N days
+        (days=1: today). Read-only."""
+        days = max(0, int(days or 0))
+        since = (date.fromisoformat(today_iso()) - timedelta(days=days - 1)).isoformat() if days else ""
+        rows = self.repo.list_orders(status or None, customer_id=customer_id or None, limit=200 if (sku or days) else 40,
+                                     day=today_iso() if days == 1 else None)
+        out = []
+        for o in rows:
+            if sku and not any(i.sku == sku for i in o.items):
+                continue
+            if since and str(o.created_at)[:10] < since:
+                continue
+            out.append(self._order(o))
+        return out[:40]
 
     def get_order(self, order_id: str) -> dict:
         return self._order(self.repo.get_order(order_id))
@@ -285,8 +302,12 @@ class MunshiTools:
         return self.repo.profit_summary(start, end)
 
     def collection_report(self, start: str = "", end: str = "") -> dict:
+        """The period's collection figures plus the payments themselves (who paid, how much, how), newest last."""
         start, end = self._range(start, end)
-        return self.repo.collection_report(start, end)
+        names = {c.customer_id: c.name for c in self.repo.list_customers(include_inactive=True)}
+        pays = [{"entry_id": e.entry_id, "customer_id": e.customer_id, "name": names.get(e.customer_id, e.customer_id), "amount": -e.amount,
+                 "method": e.method or "cash", "at": e.created_at} for e in self.repo.ledger_between(start, end, "payment")]
+        return self.repo.collection_report(start, end) | {"payments": pays}
 
     def stock_ledger(self, sku: str, warehouse_id: str = "") -> dict:
         return self.repo.stock_ledger(sku, warehouse_id or None)

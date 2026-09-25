@@ -49,14 +49,16 @@ def build_tools(ops: MunshiTools) -> dict[str, BaseTool]:
         return ops.search_products(text)
 
     @tool
-    def get_stock(sku: str) -> list:
-        """Stock for a SKU at every godown: on hand, reserved, available."""
+    def get_stock(sku: str = "") -> list:
+        """Stock for a SKU at every godown: on hand, reserved, available. Leave sku empty for every product's stock
+        (e.g. 'aaj ka stock', 'sab maal kitna hai')."""
         return ops.get_stock(sku)
 
     @tool
-    def list_orders(status: str = "") -> list:
-        """List recent orders, optionally by status (draft, confirmed, allocated, dispatched, delivered, short)."""
-        return ops.list_orders(status)
+    def list_orders(status: str = "", sku: str = "", customer_id: str = "", days: int = 0) -> list:
+        """List recent orders, newest first. Optional filters: status (draft, confirmed, allocated, dispatched, delivered, short),
+        sku (orders containing that product), customer_id, days (1 = today, 7 = last week)."""
+        return ops.list_orders(status, sku, customer_id, days)
 
     @tool
     def get_order(order_id: str) -> dict:
@@ -241,7 +243,8 @@ def build_tools(ops: MunshiTools) -> dict[str, BaseTool]:
 
     @tool
     def collection_report(start: str = "", end: str = "") -> dict:
-        """Invoiced vs collected for a period, by payment method, plus the aging summary."""
+        """Invoiced vs collected for a period, by payment method, the payments themselves (who paid how much), plus the aging
+        summary. For 'who paid today' use start = end = today."""
         return ops.collection_report(start, end)
 
     @tool

@@ -232,7 +232,7 @@ def _num_before(tokens, m: Mention) -> tuple[int, str | None] | None:
 
 def _num_after(tokens, m: Mention) -> tuple[int, str | None] | None:
     j = m.end
-    if j < len(tokens) and tokens[j] in (":", "x", "="):
+    if j < len(tokens) and tokens[j] in (":", "x", "=", "ke", "ki", "ka", "of"):      # 'drip line ke 1000' = 1000 drip line
         j += 1
     if j < len(tokens) and _is_num(tokens[j]):
         nxt = tokens[j + 1] if j + 1 < len(tokens) else ""
