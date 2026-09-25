@@ -7,14 +7,18 @@ exactly like the stub LLM clients in this account's other two agent
 projects (the author's other agent projects).
 
 It is deliberately simple: one keyword-matched tool call per user turn,
-then a one-line summary once the tool result comes back. That's enough to
-exercise real control flow (tool selection, risk-gated approval,
-role-based tool visibility, multi-agent delegation) without trying to fake
-actual language understanding -- for that, point the platform at a real
-model via llm/factory.py instead.
+then a one-line summary once the tool result comes back. The language work
+it relies on (normalising Urdu script and Roman Urdu, reading spoken
+numbers, resolving customers and products with a confidence rule) lives in
+llm/text.py, llm/numbers.py, llm/resolve.py and llm/parse.py; when a rule
+isn't sure it doesn't fire, and `fallback_fn` asks a question instead.
 """
 from __future__ import annotations
 
+import json
+import logging
+import re
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -22,6 +26,35 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import ConfigDict
+
+from munshi.llm.text import fold
+
+log = logging.getLogger("munshi.stub")
+
+# The conversation the current turn belongs to, and a scratch cache for this one model call
+# (rules and their argument builders parse the same text several times).
+_HISTORY: ContextVar[list[BaseMessage] | None] = ContextVar("munshi_stub_history", default=None)
+_TURN: ContextVar[dict | None] = ContextVar("munshi_stub_turn", default=None)
+
+# Keys never echoed back into chat: the delivery code is the customer's, not the reader's.
+_REDACT = {"otp"}
+
+
+def history() -> list[BaseMessage]:
+    """The messages of the thread the current stub turn is answering (empty outside a turn)."""
+    return list(_HISTORY.get() or [])
+
+
+def turn_cache() -> dict:
+    c = _TURN.get()
+    return c if c is not None else {}
+
+
+def memo(key: Any, fn: Callable[[], Any]) -> Any:
+    c = turn_cache()
+    if key not in c:
+        c[key] = fn()
+    return c[key]
 
 
 @dataclass
@@ -37,33 +70,40 @@ class Rule:
 def contains(*keywords: str) -> Callable[[str], bool]:
     """Whole-word/whole-phrase matching, not raw substring -- "restock"
     must not accidentally match a rule for the keyword "stock" just
-    because one contains the other's letters."""
-    import re
-
-    patterns = [re.compile(r"\b" + re.escape(k.lower()) + r"\b") for k in keywords]
+    because one contains the other's letters. Both sides go through
+    text.fold, so Urdu-script keywords match whichever keyboard typed them."""
+    patterns = [re.compile(r"(?<!\w)" + re.escape(fold(k)) + r"(?!\w)") for k in keywords]
 
     def _match(text: str) -> bool:
-        lowered = text.lower()
-        return any(p.search(lowered) for p in patterns)
+        folded = fold(text)
+        return any(p.search(folded) for p in patterns)
 
     return _match
 
 
+def _redact(x: Any) -> Any:
+    if isinstance(x, dict):
+        return {k: _redact(v) for k, v in x.items() if k not in _REDACT}
+    if isinstance(x, list):
+        return [_redact(i) for i in x]
+    return x
+
+
 class StubToolCallingModel(BaseChatModel):
     """`rules` are tried in order against the most recent HumanMessage; the
-    first match whose tool is currently bound wins. If nothing matches, the
-    model falls back to the first entry in `prompt_fallbacks` whose
-    predicate matches the current SystemMessage (this is how the stub
-    reacts to dynamic_prompt-driven role messaging -- e.g. a billing
-    request from a role with no billing tools bound can still surface a
-    "this needs manager approval" reply, matched against the system prompt
-    ops_platform.safety.middleware's role-gated prompt middleware set for
-    that role -- rather than a generic non-answer). If nothing in
-    `prompt_fallbacks` matches either, `fallback_text` is used."""
+    first match whose tool is currently bound wins. If a rule matched but its
+    tool isn't bound for this role (or the role has no tools at all), the model
+    answers from the first `prompt_fallbacks` entry whose predicate matches the
+    current SystemMessage -- the role-gated prompt set by
+    safety.middleware -- e.g. "Drivers can't place orders". Otherwise
+    `fallback_fn(text, system_text)` may return a context-aware reply (a
+    clarifying question naming the candidates, a refusal); if it returns None,
+    `fallback_text` is used."""
 
     rules: list[Rule] = []
     prompt_fallbacks: list[tuple[Callable[[str], bool], str]] = []
     fallback_text: str = "I'm not sure how to help with that."
+    fallback_fn: Callable[[str, str], str | None] | None = None
     _bound_tool_names: list[str] = []
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -86,6 +126,20 @@ class StubToolCallingModel(BaseChatModel):
                 return str(m.content)
         return ""
 
+    @staticmethod
+    def _summary(content: str) -> AIMessage:
+        if content.lstrip().startswith("{") and '"error"' in content[:40]:
+            try:
+                return AIMessage(content=f"Couldn't do that: {json.loads(content)['error']}")
+            except Exception:
+                return AIMessage(content=f"Couldn't do that: {content}")
+        try:
+            data = json.loads(content)
+            content = json.dumps(_redact(data), ensure_ascii=False)
+        except (ValueError, TypeError):
+            pass
+        return AIMessage(content=f"Done -- {content}")
+
     def _generate(
         self,
         messages: list[BaseMessage],
@@ -95,30 +149,42 @@ class StubToolCallingModel(BaseChatModel):
     ) -> ChatResult:
         last = messages[-1]
         if isinstance(last, ToolMessage):
-            content = str(last.content)
-            if content.lstrip().startswith("{") and '"error"' in content[:40]:
-                import json as _json
-                try:
-                    msg = AIMessage(content=f"Couldn't do that: {_json.loads(content)['error']}")
-                except Exception:
-                    msg = AIMessage(content=f"Couldn't do that: {content}")
-            else:
-                msg = AIMessage(content=f"Done -- {content}")
-            return ChatResult(generations=[ChatGeneration(message=msg)])
+            return ChatResult(generations=[ChatGeneration(message=self._summary(str(last.content)))])
 
+        h_tok, t_tok = _HISTORY.set(list(messages)), _TURN.set({})
+        try:
+            return ChatResult(generations=[ChatGeneration(message=self._decide(messages))])
+        finally:
+            _HISTORY.reset(h_tok)
+            _TURN.reset(t_tok)
+
+    def _decide(self, messages: list[BaseMessage]) -> AIMessage:
         text = self._latest_human_text(messages)
+        intent_unbound = False
         for rule in self.rules:
-            if not rule.match(text):
+            try:
+                if not rule.match(text):
+                    continue
+                if rule.tool_name in self._bound_tool_names:
+                    tool_call = {"name": rule.tool_name, "args": rule.args(text), "id": f"call_{rule.tool_name}"}
+                    return AIMessage(content="", tool_calls=[tool_call])
+            except Exception:                       # a parsing bug must never become a crash or a guess
+                log.exception("stub rule %s failed on %r", rule.tool_name, text[:80])
                 continue
-            if rule.tool_name in self._bound_tool_names:
-                tool_call = {"name": rule.tool_name, "args": rule.args(text), "id": f"call_{rule.tool_name}"}
-                msg = AIMessage(content="", tool_calls=[tool_call])
-                return ChatResult(generations=[ChatGeneration(message=msg)])
+            intent_unbound = True
             break   # the intent is clear but this role has no such tool: answer from the role's prompt, like a real model would
 
         system_text = "\n".join(str(m.content) for m in messages if isinstance(m, SystemMessage))
-        for predicate, reply in self.prompt_fallbacks:
-            if predicate(system_text):
-                return ChatResult(generations=[ChatGeneration(message=AIMessage(content=reply))])
-
-        return ChatResult(generations=[ChatGeneration(message=AIMessage(content=self.fallback_text))])
+        if intent_unbound or not self._bound_tool_names:
+            for predicate, reply in self.prompt_fallbacks:
+                if predicate(system_text):
+                    return AIMessage(content=reply)
+        if self.fallback_fn is not None:
+            try:
+                reply = self.fallback_fn(text, system_text)
+            except Exception:
+                log.exception("stub fallback failed on %r", text[:80])
+                reply = None
+            if reply:
+                return AIMessage(content=reply)
+        return AIMessage(content=self.fallback_text)

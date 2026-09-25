@@ -1,36 +1,38 @@
-"""The seven specialist munshis. Each is built from the shared factory with
-its own role->tools map, role->prompt map, and — for offline runs — its own
-deterministic rule set. A real LLM (LLM_PROVIDER=groq) gets the same tools
+"""The seven specialist munshis, plus the help desk. Each is built from the shared
+factory with its own role->tools map, role->prompt map, and -- for offline runs --
+its own deterministic rule set. A real LLM (LLM_PROVIDER=groq) gets the same tools
 and prompts and does the language work itself.
 
 Roles: owner, clerk, salesman, driver. The tool list bound for a role IS
-that role's capability; there is no prompt-based refusal to bypass."""
+that role's capability; there is no prompt-based refusal to bypass.
+
+Offline rules follow one principle: a rule only fires when the language layer
+(llm/parse.py, llm/resolve.py) is sure -- the customer resolved with a clear lead,
+every product and quantity accounted for, the amount unambiguous. Otherwise no
+tool is called and the specialist's fallback asks ONE question naming what it
+needs ("Which customer -- Chaudhry Farms (C-002) or Chaudhry Traders (C-011)?")."""
 from __future__ import annotations
 
 import re
+from datetime import timedelta
 
 from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, ToolMessage
 
 from munshi.agents.factory import AgentBundle, build_specialist
 from munshi.domain.repository import MunshiRepository
-from munshi.llm.parse import date_in, ids_in, int_in, method_in, money_in, parse_customer, parse_items, parse_supplier
-from munshi.llm.stub_model import Rule, StubToolCallingModel, contains
+from munshi.llm import replies as RP
+from munshi.llm.parse import amount_in, analyse_close, analyse_order, customer_resolution, date_in, ids_in, int_in, is_bounce, method_in, sku_in, supplier_resolution, warehouses_in
+from munshi.llm.stub_model import Rule, StubToolCallingModel, contains, history, memo
+from munshi.llm.text import fold, is_urdu
 from munshi.tools.core import MunshiTools
 from munshi.tools.langchain_tools import build_tools
 
 ROLES = ("owner", "clerk", "salesman", "driver")
 
 
-def _model(model, rules, fallback, prompt_fallbacks=()):
-    return model or StubToolCallingModel(rules=rules, fallback_text=fallback, prompt_fallbacks=list(prompt_fallbacks))
-
-
-def _sku_in(text: str, repo: MunshiRepository) -> str:
-    t = text.lower()
-    for p in repo.list_products():
-        if any(k.lower() in t for k in [p.sku, p.name, *p.aliases] if len(k) > 2):
-            return p.sku
-    return ""
+def _model(model, rules, fallback, prompt_fallbacks=(), fallback_fn=None):
+    return model or StubToolCallingModel(rules=rules, fallback_text=fallback, prompt_fallbacks=list(prompt_fallbacks), fallback_fn=fallback_fn)
 
 
 def _biz(repo: MunshiRepository) -> str:
@@ -47,6 +49,112 @@ def _khata_ids(text: str, repo: MunshiRepository) -> list[str]:
     return [i for p in dict.fromkeys(prefixes) for i in ids_in(text, p)]
 
 
+# ------------------------------------------------------------------ shared language helpers (memoised per model call)
+def _order(text, repo):
+    return memo(("order", text), lambda: analyse_order(text, repo))
+
+
+def _cust(text, repo):
+    return memo(("cust", text), lambda: customer_resolution(text, repo))
+
+
+def _supp(text, repo):
+    return memo(("supp", text), lambda: supplier_resolution(text, repo))
+
+
+def _amount(text):
+    return memo(("amt", text), lambda: amount_in(text))
+
+
+def _sku(text, repo):
+    return memo(("sku", text), lambda: sku_in(text, repo))
+
+
+_PRONOUN = contains("isko", "isse", "ise", "iska", "iski", "ye", "yeh", "yehi", "yahi", "wo", "woh", "usko", "use", "uska", "uski", "unka", "inka",
+                    "this", "it", "that", "same", "wala", "wali", "wale", "یہ", "اسے", "اسکو", "اس کا", "اس کو", "وہ", "اسی")
+
+
+def _recent(pattern: str, key: str | None = None, lookback: int = 8) -> str:
+    """The most recent ID matching `pattern` in this thread's last few messages -- from tool results, or from
+    the `key` argument of a tool call. Used only for a pronoun ('isko confirm kar do', 'uska balance')."""
+    msgs = history()[:-1][-lookback:]
+    for m in reversed(msgs):
+        if key and isinstance(m, AIMessage):
+            for c in reversed(m.tool_calls or []):
+                v = str((c.get("args") or {}).get(key) or "")
+                if re.fullmatch(pattern, v):
+                    return v
+        if isinstance(m, ToolMessage):
+            found = re.findall(pattern, str(m.content))
+            if found:
+                return found[0]
+    return ""
+
+
+def _order_ref(text: str, repo) -> str:
+    """The order a confirm/cancel is about: an ID in the text, else -- only for a pronoun ('isko', 'ye wala') -- the
+    last order on this thread, and only if it belongs to the customer the message names (when it names one)."""
+    ids = ids_in(text, "ORD")
+    if ids:
+        return ids[0]
+    if not _PRONOUN(text):
+        return ""
+    oid = _recent(r"ORD-[A-Z0-9]{8}", "order_id")
+    named = _cust(text, repo)
+    if oid and named.status != "none":
+        try:
+            if not named.ok or repo.get_order(oid).customer_id != named.id:
+                return ""
+        except Exception:
+            return ""
+    return oid
+
+
+def _customer_or_recent(text: str, repo) -> str:
+    r = _cust(text, repo)
+    if r.ok:
+        return r.id or ""
+    if r.status == "none" and _PRONOUN(text):
+        return _recent(r"C-\d{3,}", "customer_id")
+    return ""
+
+
+def _period(text: str) -> tuple[str, str]:
+    """('start', 'end') for 'aaj', 'kal', 'is hafte', 'pichle hafte', 'is mahine', 'pichle mahine'; ('', '') = the tool's default."""
+    iso = re.findall(r"\d{4}-\d{2}-\d{2}", text)
+    if iso:
+        return (iso + [""])[0], (iso + ["", ""])[1]
+    from munshi.domain.models import business_today
+    today = business_today()
+    t = fold(text)
+    if re.search(r"\b(aaj|today)\b|اج", t):
+        return today.isoformat(), today.isoformat()
+    if re.search(r"\b(yesterday|kal)\b", t):
+        y = today - timedelta(days=1)
+        return y.isoformat(), y.isoformat()
+    if re.search(r"\b(pichl[ea]y? hafte|last week|pichle haftay)\b", t):
+        mon = today - timedelta(days=today.weekday() + 7)
+        return mon.isoformat(), (mon + timedelta(days=6)).isoformat()
+    if re.search(r"\b(is hafte|this week|is haftay)\b", t):
+        return (today - timedelta(days=today.weekday())).isoformat(), today.isoformat()
+    if re.search(r"\b(pichl[ea]y? mahine|last month)\b", t):
+        first = today.replace(day=1)
+        prev_end = first - timedelta(days=1)
+        return prev_end.replace(day=1).isoformat(), prev_end.isoformat()
+    if re.search(r"\b(is mahine|this month|is maah)\b|اس مہینی", t):
+        return today.replace(day=1).isoformat(), today.isoformat()
+    return "", ""
+
+
+def _urdu_didnt(text: str) -> str | None:
+    return RP.t("didnt", True) if is_urdu(text) else None
+
+
+_KHATA = contains("khata", "balance", "outstanding", "baqi", "baaki", "udhaar", "udhar", "hisaab", "hisab", "owe", "owes", "dena hai", "dene hain",
+                  "kitne paise", "کھاتہ", "کھاتا", "حساب", "بیلنس", "باقی", "ادھار")
+_STOCKQ = contains("stock", "available", "kitna", "kitni", "kitne", "bachi", "pari", "padi", "how much", "how many", "hai", "اسٹاک", "سٹاک", "کتنا", "کتنی")
+
+
 # ------------------------------------------------------------------ Order
 def build_order_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChatModel | None = None, checkpointer=None) -> AgentBundle:
     T = build_tools(ops); B = _biz(repo)
@@ -59,18 +167,66 @@ def build_order_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChat
         "salesman": f"You are the Order Munshi for {B}, with a salesman on the route. Book the order as a draft (the office confirms it), and show the customer's khata and stock when asked. You cannot confirm or cancel orders.",
         "driver": "You are the Order Munshi. Drivers cannot place orders; tell them to pass the request to the office.",
     }
+    list_words = contains("orders", "order list", "list", "pending", "draft", "drafts", "dikhao", "dikha", "kaun se", "konse", "آرڈرز")
+
+    def _list_status(t: str) -> str:
+        f = fold(t)
+        for s in ("draft", "confirmed", "allocated", "dispatched", "delivered", "short", "cancelled"):
+            if re.search(rf"\b{s}\b", f):
+                return s
+        return ""
+
+    repeat = contains("dobara", "phir se", "repeat", "pichli dafa", "pichla", "pichle", "last time", "same order", "wahi order", "دوبارہ")
+
+    cancel_w = contains("cancel", "mansookh", "منسوخ")
+    confirm_w = lambda t: contains("confirm", "pakka", "کنفرم", "پکا")(t) or (contains("haan", "yes", "ok")(t) and bool(ids_in(t, "ORD")))  # noqa: E731
+
+    def _open_orders(cid: str) -> str:
+        rows = [o for o in repo.list_orders(customer_id=cid, limit=10) if o.status in ("draft", "confirmed", "allocated")][:4]
+        return "; ".join(f"{o.order_id} ({o.status}, " + ", ".join(f"{i.qty} x {i.sku}" for i in o.items) + ")" for o in rows)
+
     rules = [
-        Rule(contains("cancel", "mansookh"), "cancel_order", lambda t: {"order_id": (ids_in(t, "ORD") or [""])[0], "reason": t[:80]}),
-        Rule(contains("confirm", "haan", "yes", "ok"), "confirm_order", lambda t: {"order_id": (ids_in(t, "ORD") or [""])[0]}),
-        Rule(contains("khata", "balance", "outstanding", "baqi", "udhaar"), "get_customer_khata", lambda t: {"customer_id": parse_customer(t, repo) or ""}),
-        Rule(contains("stock", "available", "hai", "kitna"), "get_stock", lambda t: {"sku": _sku_in(t, repo)}),
-        Rule(lambda t: bool(parse_items(t, repo)) and bool(parse_customer(t, repo)), "create_order",
-             lambda t: {"customer_id": parse_customer(t, repo), "items": parse_items(t, repo), "source_text": t}),
-        Rule(lambda t: bool(parse_customer(t, repo)), "find_customer", lambda t: {"text": parse_customer(t, repo)}),
+        Rule(lambda t: cancel_w(t) and bool(_order_ref(t, repo)), "cancel_order", lambda t: {"order_id": _order_ref(t, repo), "reason": t[:80]}),
+        Rule(lambda t: confirm_w(t) and bool(_order_ref(t, repo)), "confirm_order", lambda t: {"order_id": _order_ref(t, repo)}),
+        Rule(lambda t: bool(ids_in(t, "ORD")), "get_order", lambda t: {"order_id": ids_in(t, "ORD")[0]}),
+        Rule(lambda t: list_words(t) and contains("order", "orders", "آرڈر", "آرڈرز")(t) and not _order(t, repo).items and _cust(t, repo).status == "none",
+             "list_orders", lambda t: {"status": _list_status(t)}),
+        Rule(lambda t: _KHATA(t) and bool(_customer_or_recent(t, repo)), "get_customer_khata", lambda t: {"customer_id": _customer_or_recent(t, repo)}),
+        Rule(lambda t: contains("rate", "price", "qeemat", "bhao", "قیمت", "ریٹ")(t) and bool(_sku(t, repo)), "search_products", lambda t: {"text": _sku(t, repo)}),
+        Rule(lambda t: _STOCKQ(t) and bool(_sku(t, repo)) and _cust(t, repo).status == "none" and not _order(t, repo).items, "get_stock",
+             lambda t: {"sku": _sku(t, repo)}),
+        Rule(lambda t: _order(t, repo).ready, "create_order",
+             lambda t: {"customer_id": _order(t, repo).customer.id, "items": _order(t, repo).items, "source_text": t}),
+        # just a customer ('aur Haji Sons ka?'): their khata -- a read, and only for a confident match
+        Rule(lambda t: _cust(t, repo).ok and not _order(t, repo).items and not _order(t, repo).problems and not repeat(t)
+             and not cancel_w(t) and not confirm_w(t), "get_customer_khata",
+             lambda t: {"customer_id": _cust(t, repo).id}),
     ]
+
+    def fallback(t: str, system: str) -> str | None:
+        urdu = is_urdu(t)
+        op = _order(t, repo)
+        if cancel_w(t) or confirm_w(t):
+            verb = "cancel" if cancel_w(t) else "confirm"
+            opts = _open_orders(op.customer.id) if op.customer.ok else ""
+            where = f" {op.customer.name}'s open orders: {opts}." if opts else f" Say its ID, e.g. '{verb} ORD-...'."
+            return f"No order was named, so nothing was done. Which order should I {verb}?{where}"
+        if repeat(t) and not op.items:
+            return "I can't repeat an earlier order from chat yet -- tell me the items and quantities (the last order is in Orders)."
+        if _KHATA(t) and not op.items:
+            return RP.ask_customer(op.customer, urdu)
+        if op.items or op.problems or op.unknown or op.dropped:
+            return RP.ask_order(op, urdu)
+        if op.customer.status == "ambiguous":
+            return RP.ask_customer(op.customer, urdu)
+        if op.customer.ok:
+            return RP.t("no_items", urdu)
+        return _urdu_didnt(t)
+
     m = _model(model, rules, "Tell me the customer and the items, e.g. 'Chaudhry Farms ko 20 urea aur 5 dap'.",
-               [(lambda p: "cannot place orders" in p, "Drivers can't place orders — please pass this to the office."),
-                (lambda p: "cannot confirm or cancel" in p, "Salesmen book drafts; the office confirms or cancels. Give me the customer and items to book.")])
+               [(lambda p: "cannot place orders" in p, "Drivers can't place orders or look up khata — please pass this to the office."),
+                (lambda p: "cannot confirm or cancel" in p, "Salesmen book drafts; the office confirms or cancels. Give me the customer and items to book.")],
+               fallback)
     return build_specialist("order", "Order Munshi", m, {"owner": desk, "clerk": desk, "salesman": booker, "driver": []}, prompts, checkpointer)
 
 
@@ -87,26 +243,57 @@ def build_godown_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCha
         "driver": "You are the Godown Munshi. Drivers can view their plan but not change allocation.",
     }
     default_wh = repo.default_warehouse_id() if repo.list_warehouses() else ""
+    write_off = contains("write off", "write-off", "writeoff", "damaged", "reduce", "phat", "phati", "kharab", "chori", "lost", "toot", "expired")
+
+    def _transfer(t: str) -> dict | None:
+        whs = warehouses_in(t, repo)
+        op = _order(t, repo)
+        if len(whs) != 2 or len(op.items) != 1 or [p for p in op.problems if not p.startswith("two customers")]:
+            return None
+        f = fold(t)
+        src, dst = whs
+        second_name = next((w for w in repo.list_warehouses() if w.warehouse_id == dst), None)
+        if second_name and re.search(rf"\b{re.escape(fold(second_name.name.split()[0]))}\s+se\b|\bfrom\s+{re.escape(fold(dst))}", f):
+            src, dst = dst, src
+        return {"from_warehouse": src, "to_warehouse": dst, "sku": op.items[0]["sku"], "qty": op.items[0]["qty"]}
+
+    def _adjust(t: str) -> dict | None:
+        sku, n = _sku(t, repo), int_in(t)
+        if not sku or n == 0:
+            return None
+        whs = warehouses_in(t, repo)
+        return {"warehouse_id": (whs or [default_wh])[0], "sku": sku, "delta": -abs(n) if write_off(t) else n, "reason": t[:80]}
+
     rules = [
-        Rule(contains("approve", "load", "manzoor"), "approve_dispatch_plan", lambda t: {"plan_id": (ids_in(t, "DSP") or [""])[0]}),
-        Rule(contains("transfer", "move", "shift"), "transfer_stock",
-             lambda t: {"from_warehouse": (ids_in(t, "WH") or [default_wh, ""])[0], "to_warehouse": (ids_in(t, "WH") + ["", ""])[1], "sku": _sku_in(t, repo), "qty": abs(int_in(t))}),
-        Rule(contains("restock", "adjust", "write off", "write-off", "damaged", "received"), "adjust_stock",
-             lambda t: {"warehouse_id": (ids_in(t, "WH") or [default_wh])[0], "sku": _sku_in(t, repo),
-                        "delta": (-abs(int_in(t)) if any(w in t.lower() for w in ("write", "damaged", "reduce")) else abs(int_in(t))),
-                        "reason": t[:80]}),
+        Rule(contains("approve", "load", "loading", "manzoor"), "approve_dispatch_plan", lambda t: {"plan_id": (ids_in(t, "DSP") or [""])[0]}),
+        Rule(lambda t: contains("transfer", "move", "shift")(t) and _transfer(t) is not None, "transfer_stock", lambda t: _transfer(t)),
+        Rule(lambda t: contains("restock", "adjust", "write off", "write-off", "damaged", "received", "phat", "phati", "kharab", "chori")(t) and _adjust(t) is not None,
+             "adjust_stock", lambda t: _adjust(t)),
         Rule(lambda t: contains("allocate", "reserve")(t) and bool(ids_in(t, "ORD")), "allocate_order",
-             lambda t: {"order_id": ids_in(t, "ORD")[0], "warehouse_id": (ids_in(t, "WH") or [default_wh])[0]}),
+             lambda t: {"order_id": ids_in(t, "ORD")[0], "warehouse_id": (warehouses_in(t, repo) or [default_wh])[0]}),
         Rule(lambda t: contains("dispatch", "plan", "bhejo", "gaari")(t) and bool(ids_in(t, "ORD")), "create_dispatch_plan",
              lambda t: {"route_id": (ids_in(t, "R") or [""])[0], "vehicle_id": (ids_in(t, "V") or [""])[0],
-                        "order_ids": ids_in(t, "ORD"), "plan_date": date_in(t) or ""}),
-        Rule(contains("dispatch", "plan", "suggest", "today", "aaj"), "suggest_dispatch", lambda t: {"plan_date": date_in(t) or ""}),
-        Rule(contains("stock", "kitna", "available"), "get_stock", lambda t: {"sku": _sku_in(t, repo)}),
+                        "order_ids": ids_in(t, "ORD"), "plan_date": date_in(t) if re.search(r"\d{4}-\d{2}-\d{2}", t) else ""}),
+        Rule(contains("dispatch", "suggest", "today", "aaj"), "suggest_dispatch", lambda t: {"plan_date": (re.findall(r"\d{4}-\d{2}-\d{2}", t) or [""])[0]}),
+        Rule(lambda t: bool(_sku(t, repo)) and (_STOCKQ(t) or contains("godown", "گودام")(t)), "get_stock", lambda t: {"sku": _sku(t, repo)}),
         Rule(contains("confirmed", "allocated", "orders"), "list_orders", lambda t: {"status": "confirmed" if "confirmed" in t.lower() else "allocated"}),
     ]
+
+    def fallback(t: str, system: str) -> str | None:
+        urdu = is_urdu(t)
+        if contains("transfer", "move", "shift")(t):
+            return "Which product, how many, and from which godown to which? e.g. 'transfer 20 urea WH-MULTAN WH-VEHARI'."
+        if _STOCKQ(t) and not _sku(t, repo):
+            return "Which product? e.g. 'urea ka stock kitna hai'." if not urdu else "کون سا مال؟ مثال: «یوریا کا اسٹاک کتنا ہے»۔"
+        if contains("restock", "adjust", "write off", "damaged")(t):
+            return "Which product and how many, with the reason? e.g. 'write off 5 urea, bags torn'."
+        return _urdu_didnt(t)
+
     m = _model(model, rules, "I can check stock, allocate confirmed orders, suggest or create a dispatch plan, transfer stock, and approve loading.",
                [(lambda p: "need the owner" in p, "Stock adjustments need the owner — ask them to approve."),
-                (lambda p: "not allocate or plan" in p, "Salesmen can check stock; allocation and dispatch are the office's job.")])
+                (lambda p: "not allocate or plan" in p, "Salesmen can check stock; allocation and dispatch are the office's job."),
+                (lambda p: "view their plan" in p, "Drivers can see their stops with the Delivery Munshi: ask 'mera agla stop kaun sa hai'.")],
+               fallback)
     return build_specialist("godown", "Godown Munshi", m, {"owner": owner, "clerk": clerk, "salesman": [T["get_stock"]], "driver": [T["get_plan"]]}, prompts, checkpointer)
 
 
@@ -115,28 +302,70 @@ def build_delivery_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseC
     T = build_tools(ops); B = _biz(repo)
     tools = [T["get_plan"], T["list_stops"], T["get_order"], T["close_stop"]]
     prompts = {r: f"You are the Delivery Munshi for {B}, on the driver's phone. Show the stops in order and close each one with what was delivered, what came back, cash taken, and the customer's OTP. Never close a stop without the OTP." for r in ROLES}
+    close_words = contains("close", "delivered", "deliver", "de diya", "diya", "band", "utar", "utar diya", "pohncha", "ڈیلیور", "دے دیا")
+
+    def _close(t: str):
+        return memo(("close", t), lambda: analyse_close(t, repo))
 
     def _close_args(t: str) -> dict:
-        stop = (ids_in(t, "STP") or [""])[0]
-        try:
-            st = repo.get_stop(stop) if stop else None
-            order = repo.get_order(st.order_id) if st else None
-        except Exception:          # unknown stop: let the tool report it, don't crash the model
-            st = order = None
-        delivered = [{"sku": i.sku, "qty": i.qty} for i in order.items] if (order and "all" in t.lower()) else parse_items(t, repo)
-        otp = re.search(r"otp\D*(\d{4})", t, re.I)
-        return {"stop_id": stop, "delivered_items": delivered, "returned_items": [],
-                "cash_collected": money_in(re.sub(r"otp\D*\d{4}", "", t, flags=re.I).replace(stop, "")), "otp": otp.group(1) if otp else ""}
+        c = _close(t)
+        delivered = c.delivered
+        if delivered is None:                       # 'delivered all' / 'sab de diya': what was loaded for the stop, less anything returned
+            try:
+                order = repo.get_order(repo.get_stop(c.stop_id).order_id)
+                back = {}
+                for r in c.returned:
+                    back[r["sku"]] = back.get(r["sku"], 0) + r["qty"]
+                delivered = [{"sku": i.sku, "qty": i.qty - back.get(i.sku, 0)} for i in order.items if i.qty - back.get(i.sku, 0) > 0]
+            except Exception:                      # unknown stop: let the tool report it, don't crash the model
+                delivered = []
+        return {"stop_id": c.stop_id, "delivered_items": delivered, "returned_items": c.returned, "cash_collected": c.cash, "otp": c.otp}
 
+    def _todays_plans() -> list:
+        from munshi.domain.models import business_today
+        return [p for p in repo.list_plans(plan_date=business_today().isoformat()) if p.status in ("approved", "loaded")]
+
+    next_words = contains("agla", "next", "kahan", "stops", "stop", "plan", "aaj", "mera", "اگلا", "اسٹاپ")
     rules = [
-        Rule(lambda t: contains("close", "delivered", "deliver")(t) and bool(ids_in(t, "STP")), "close_stop", _close_args),
+        Rule(lambda t: close_words(t) and bool(ids_in(t, "STP")) and not _close(t).problems, "close_stop", _close_args),
         Rule(lambda t: bool(ids_in(t, "DSP")), "list_stops", lambda t: {"plan_id": ids_in(t, "DSP")[0]}),
+        Rule(lambda t: next_words(t) and not ids_in(t, "STP") and not contains("close", "band", "otp")(t) and len(_todays_plans()) == 1, "list_stops",
+             lambda t: {"plan_id": _todays_plans()[0].plan_id}),
     ]
-    m = _model(model, rules, "Tell me the plan ID to see stops, or close a stop: 'close STP-XXXX delivered all, cash 50000, OTP 1234'.")
+
+    def fallback(t: str, system: str) -> str | None:
+        stop = (ids_in(t, "STP") or [""])[0]
+        if stop and close_words(t):
+            probs = _close(t).problems
+            if probs:
+                return f"To close {stop} I need {probs[0]}. e.g. 'close {stop} delivered all, cash 50000, otp 1234'."
+        if next_words(t) and not stop:
+            plans = _todays_plans()
+            if not plans:
+                return "No dispatch plan is loaded for today yet -- ask the office."
+            if len(plans) > 1:
+                opts = ", ".join(f"{p.plan_id} ({p.vehicle_id}, {p.route_id})" for p in plans)
+                return f"Which vehicle are you on? Today's plans: {opts}. Send 'stops for DSP-...'."
+        if contains("close", "band", "otp")(t) and not stop:
+            return "I close one stop at a time, each with its own customer's OTP. Which stop? Send 'close STP-... delivered all, cash 50000, otp 1234'."
+        return _urdu_didnt(t)
+
+    m = _model(model, rules, "Tell me the plan ID to see stops, or close a stop: 'close STP-XXXX delivered all, cash 50000, OTP 1234'.", (), fallback)
     return build_specialist("delivery", "Delivery Munshi", m, {"owner": tools, "clerk": tools, "salesman": [], "driver": tools}, prompts, checkpointer)
 
 
 # ------------------------------------------------------------------ Hisaab
+_EXPENSE_CATS = (("fuel", ("diesel", "petrol", "fuel", "cng")), ("salary", ("salary", "tankhwah", "tankha")), ("rent", ("rent", "kiraya", "kiraaya")),
+                 ("utilities", ("bijli", "electric", "electricity", "gas bill", "pani ka bill", "internet")),
+                 ("repair", ("repair", "tyre", "tire", "puncture", "mistri", "marammat", "مرمت")),
+                 ("loading", ("mazdoor", "mazdoori", "labour", "labor", "loading", "palledar")),
+                 ("food", ("khana", "lunch", "food", "chai", "chai pani")))
+
+
+def _expense_category(t: str) -> str:
+    return next((c for c, ws in _EXPENSE_CATS if contains(*ws)(t)), "misc")
+
+
 def build_hisaab_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChatModel | None = None, checkpointer=None) -> AgentBundle:
     T = build_tools(ops); B = _biz(repo)
     read = [T["get_digest"], T["get_plan"], T["list_stops"], T["get_customer_khata"], T["cashbook"]]
@@ -148,25 +377,65 @@ def build_hisaab_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCha
         "salesman": "You are the Hisaab Munshi. Salesmen don't record money; they can ask the office.",
         "driver": "You are the Hisaab Munshi. Drivers hand cash to the cashier; they don't record deposits.",
     }
+    pay_words = contains("paid", "payment", "received", "diye", "diya", "di", "jama", "transfer", "jazzcash", "jazz cash", "easypaisa", "easy paisa", "cheque",
+                         "check", "bank", "cash", "bheje", "bheja", "dale", "daale", "mile", "mila", "aaya", "aaye", "aayi", "wasool", "vasool",
+                         "جمع", "ادائیگی", "بینک", "وصول")
+    expense_words = contains("expense", "kharcha", "kharch", "diesel", "petrol", "fuel", "salary", "tankhwah", "rent", "kiraya", "bijli", "repair",
+                             "mazdoor", "mazdoori", "labour", "tyre", "puncture", "marammat", "chai", "chai pani", "خرچہ", "مرمت")
+    credit_words = contains("credit note", "credit", "refund", "waive", "maaf")
+
+    def _one_customer(t):
+        r = _cust(t, repo)
+        return r.ok and r.other is None
+
+    def _amt_ok(t):
+        return _amount(t).amount is not None
+
+    def _deposit_amount(t):
+        return amount_in(t.replace(ids_in(t, "DSP")[0], " ") if ids_in(t, "DSP") else t)
+
     rules = [
         Rule(lambda t: _REVERSE(t) and bool(ids_in(t, "EXP")), "reverse_expense", lambda t: {"expense_id": ids_in(t, "EXP")[0], "reason": t[:120]}),
         Rule(lambda t: _REVERSE(t) and bool(_khata_ids(t, repo)), "reverse_ledger_entry", lambda t: {"entry_id": _khata_ids(t, repo)[0], "reason": t[:120]}),
-        Rule(contains("credit note", "credit", "refund", "waive"), "credit_note",
-             lambda t: {"customer_id": parse_customer(t, repo) or "", "amount": money_in(t), "reason": t[:80]}),
-        Rule(lambda t: contains("deposit", "handed", "counted", "jama")(t) and bool(ids_in(t, "DSP")), "record_deposit",
-             lambda t: {"plan_id": ids_in(t, "DSP")[0], "amount_counted": money_in(t.replace(ids_in(t, "DSP")[0], "")), "counted_by": "cashier"}),
-        Rule(contains("expense", "kharcha", "diesel", "petrol", "fuel", "salary", "tankhwah", "rent", "bijli", "repair"), "record_expense",
-             lambda t: {"category": next((c for c, words in (("fuel", ("diesel", "petrol", "fuel")), ("salary", ("salary", "tankhwah")), ("rent", ("rent",)), ("utilities", ("bijli", "electric", "gas bill")), ("repair", ("repair", "tyre", "tire"))) if any(w in t.lower() for w in words)), "misc"),
-                        "amount": money_in(t), "note": t[:80], "method": method_in(t)}),
-        Rule(lambda t: contains("paid", "payment", "received", "diye", "jama", "transfer", "jazzcash", "easypaisa", "cheque")(t) and bool(parse_customer(t, repo)), "record_payment",
-             lambda t: {"customer_id": parse_customer(t, repo) or "", "amount": money_in(t), "method": method_in(t), "ref": t[:60]}),
-        Rule(contains("cashbook", "cash book", "cash today", "rokar"), "cashbook", lambda t: {"day": date_in(t) or ""}),
-        Rule(contains("khata", "balance", "outstanding"), "get_customer_khata", lambda t: {"customer_id": parse_customer(t, repo) or ""}),
-        Rule(contains("digest", "today", "summary", "close the day", "aaj"), "get_digest", lambda t: {}),
+        Rule(lambda t: credit_words(t) and _one_customer(t) and _amt_ok(t), "credit_note",
+             lambda t: {"customer_id": _cust(t, repo).id, "amount": _amount(t).amount, "reason": t[:80]}),
+        Rule(lambda t: contains("deposit", "handed", "counted", "jama")(t) and bool(ids_in(t, "DSP")) and _deposit_amount(t).amount is not None, "record_deposit",
+             lambda t: {"plan_id": ids_in(t, "DSP")[0], "amount_counted": _deposit_amount(t).amount, "counted_by": "cashier"}),
+        Rule(lambda t: expense_words(t) and not _cust(t, repo).ok and _amt_ok(t), "record_expense",
+             lambda t: {"category": _expense_category(t), "amount": _amount(t).amount, "note": t[:80], "method": method_in(t)}),
+        Rule(lambda t: pay_words(t) and not is_bounce(t) and not credit_words(t) and _one_customer(t) and _amt_ok(t), "record_payment",
+             lambda t: {"customer_id": _cust(t, repo).id, "amount": _amount(t).amount, "method": method_in(t), "ref": t[:60]}),
+        Rule(contains("cashbook", "cash book", "cash today", "rokar", "کیش بک"), "cashbook", lambda t: {"day": (re.findall(r"\d{4}-\d{2}-\d{2}", t) or [""])[0]}),
+        Rule(lambda t: _KHATA(t) and not credit_words(t) and bool(_customer_or_recent(t, repo)), "get_customer_khata",
+             lambda t: {"customer_id": _customer_or_recent(t, repo)}),
+        Rule(lambda t: contains("digest", "today", "summary", "close the day", "aaj", "hisaab", "hisab")(t) and not credit_words(t), "get_digest", lambda t: {}),
     ]
+
+    def fallback(t: str, system: str) -> str | None:
+        urdu = is_urdu(t)
+        if is_bounce(t):
+            return RP.t("bounce", urdu)
+        r = _cust(t, repo)
+        if credit_words(t) and r.ok and not _amt_ok(t):
+            return f"How much should the credit note to {r.name} be, and why? e.g. 'credit note {r.name} 5000 damaged bags'. The owner approves it."
+        if pay_words(t) or credit_words(t) or _KHATA(t):
+            if r.status == "ambiguous":
+                return RP.ask_customer(r, urdu)
+            if r.ok and r.other is not None:
+                return RP.t("two_customers", urdu, a=r.name, b=r.other.name)
+            if r.ok and not _amt_ok(t):
+                return RP.t("how_much", urdu) if _amount(t).problem == "how much?" else f"{_amount(t).problem.capitalize()}."
+            if not r.ok and (pay_words(t) or credit_words(t)):
+                return RP.ask_customer(r, urdu)
+        if expense_words(t) and not _amt_ok(t):
+            return RP.t("how_much", urdu)
+        return _urdu_didnt(t)
+
     m = _model(model, rules, "I can record a deposit against a plan, a payment received at the office, an expense, show a khata or the cashbook, or give today's digest.",
                [(lambda p: "need the owner" in p, "Credit notes and reversals need the owner's approval."),
-                (lambda p: "don't record money" in p, "Payments are recorded by the office — tell the clerk.")])
+                (lambda p: "don't record money" in p, "Payments are recorded by the office — tell the clerk."),
+                (lambda p: "don't record deposits" in p, "Drivers hand the cash to the cashier; the office records it.")],
+               fallback)
     return build_specialist("hisaab", "Hisaab Munshi", m, {"owner": owner, "clerk": clerk, "salesman": [], "driver": []}, prompts, checkpointer)
 
 
@@ -183,26 +452,57 @@ def build_khareed_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCh
         "driver": "You are the Khareed Munshi. Drivers don't handle purchases.",
     }
     default_wh = repo.default_warehouse_id() if repo.list_warehouses() else ""
+    pay = lambda t: contains("pay", "paid", "payment", "de do", "dedo", "de dein", "transfer", "ada", "ادائیگی")(t) and not contains("received", "aaya", "aayi", "aaye")(t)  # noqa: E731
+    arrived = contains("received", "purchase", "bought", "khareed", "aaya", "aayi", "aaye", "aai", "aya", "ayi", "arrived", "stock in", "aa gaya", "آئی", "آیا", "آئے")
 
     def _purchase_args(t: str) -> dict:
-        items = parse_items(t, repo)
-        cost = re.search(r"(?:@|at|rate)\s*(\d[\d,]*)", t, re.I)
-        if cost and items: items = [dict(i, unit_cost=float(cost.group(1).replace(",", ""))) for i in items]
-        return {"supplier_id": parse_supplier(t, repo) or "", "items": items, "warehouse_id": (ids_in(t, "WH") or [default_wh])[0], "invoice_ref": (re.search(r"(?:bill|invoice|ref)\s*#?\s*([A-Za-z0-9-]+)", t, re.I) or [None, ""])[1] if re.search(r"(?:bill|invoice|ref)\s*#?\s*([A-Za-z0-9-]+)", t, re.I) else "", "paid_amount": 0}
+        op = _order(t, repo)
+        from munshi.llm.parse import catalogue, prepare
+        prices = prepare(t, catalogue(repo)).prices
+        items = [dict(i, unit_cost=prices[0]) for i in op.items] if len(set(prices)) == 1 else list(op.items)
+        ref = re.search(r"(?:bill|invoice|ref)\s*(?:no\.?|#)?\s*([A-Za-z0-9][A-Za-z0-9-]*)", t, re.I)
+        return {"supplier_id": _supp(t, repo).id, "items": items, "warehouse_id": (warehouses_in(t, repo) or [default_wh])[0],
+                "invoice_ref": ref.group(1) if ref else "", "paid_amount": 0}
+
+    def _purchase_ready(t: str) -> bool:
+        op = _order(t, repo)
+        issues = [p for p in op.problems if not p.startswith("two customers")]
+        return _supp(t, repo).ok and bool(op.items) and not issues
 
     rules = [
         Rule(lambda t: _REVERSE(t) and bool(ids_in(t, "PUR")), "reverse_purchase", lambda t: {"purchase_id": ids_in(t, "PUR")[0], "reason": t[:120]}),
         Rule(lambda t: _REVERSE(t) and bool(ids_in(t, "SPY") + ids_in(t, "BIL")), "reverse_supplier_entry",
              lambda t: {"entry_id": (ids_in(t, "SPY") + ids_in(t, "BIL"))[0], "reason": t[:120]}),
-        Rule(lambda t: contains("pay", "paid", "payment")(t) and bool(parse_supplier(t, repo)), "pay_supplier",
-             lambda t: {"supplier_id": parse_supplier(t, repo) or "", "amount": money_in(t), "method": method_in(t), "ref": t[:60]}),
-        Rule(lambda t: contains("received", "purchase", "bought", "khareed", "aaya", "arrived", "stock in")(t) and bool(parse_items(t, repo)), "record_purchase", _purchase_args),
-        Rule(contains("payable", "owe", "dena", "suppliers"), "payables_report", lambda t: {}),
-        Rule(lambda t: bool(parse_supplier(t, repo)), "supplier_khata", lambda t: {"supplier_id": parse_supplier(t, repo)}),
+        Rule(lambda t: pay(t) and _supp(t, repo).ok and _amount(t).amount is not None, "pay_supplier",
+             lambda t: {"supplier_id": _supp(t, repo).id, "amount": _amount(t).amount, "method": method_in(t), "ref": t[:60]}),
+        Rule(lambda t: arrived(t) and _purchase_ready(t), "record_purchase", _purchase_args),
+        Rule(lambda t: _supp(t, repo).ok and contains("hisaab", "hisab", "khata", "balance", "account", "dena", "kitna", "owe", "حساب")(t), "supplier_khata",
+             lambda t: {"supplier_id": _supp(t, repo).id}),
+        Rule(contains("payable", "payables", "owe", "dena", "suppliers", "kitna dena"), "payables_report", lambda t: {}),
+        Rule(lambda t: _supp(t, repo).ok and not arrived(t) and not pay(t), "supplier_khata", lambda t: {"supplier_id": _supp(t, repo).id}),
     ]
+
+    def fallback(t: str, system: str) -> str | None:
+        urdu = is_urdu(t)
+        s = _supp(t, repo)
+        if (arrived(t) or pay(t)) and not s.ok:
+            return RP.ask_supplier(s, urdu)
+        if pay(t) and _amount(t).amount is None:
+            return RP.t("how_much", urdu)
+        if arrived(t):
+            op = _order(t, repo)
+            issues = [p for p in op.problems if not p.startswith("two customers")]
+            if op.unknown:
+                return RP.t("unknown_item", urdu, what=op.unknown[0])
+            if issues:
+                return RP.t("fix_qty", urdu, why=issues[0])
+            return RP.t("no_items", urdu)
+        return _urdu_didnt(t)
+
     m = _model(model, rules, "Tell me what arrived and from whom, e.g. 'received 100 urea from Fauji at 3600', or ask what we owe.",
                [(lambda p: "need the owner" in p, "Supplier payments and reversals need the owner's approval."),
-                (lambda p: "don't handle purchases" in p, "Purchases are handled by the office.")])
+                (lambda p: "don't handle purchases" in p, "Purchases are handled by the office.")],
+               fallback)
     return build_specialist("khareed", "Khareed Munshi", m, {"owner": owner, "clerk": clerk, "salesman": [], "driver": []}, prompts, checkpointer)
 
 
@@ -217,18 +517,52 @@ def build_wasooli_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCh
         "salesman": f"You are the Wasooli Munshi for {B}, with a salesman on the route. Show who owes what and log promises to pay that customers make to him. Reminders are sent by the office.",
         "driver": "You are the Wasooli Munshi. Drivers don't run collections.",
     }
+    promise_words = contains("promise", "wada", "waada", "will pay", "de denge", "denge", "de dega", "dega", "وعدہ")
+    broken = contains("broken", "missed", "slipped", "toda", "tod diya", "tora", "توڑا")
+
+    def _tier(t: str) -> str:
+        if contains("final", "aakhri", "akhri", "last")(t):
+            return "final"
+        if contains("firm", "sakht", "strict", "hard")(t):
+            return "firm"
+        if contains("gentle", "narm", "soft", "polite")(t):
+            return "gentle"
+        return ""
+
+    def _promise_ready(t: str) -> bool:
+        return _cust(t, repo).ok and _amount(t).amount is not None and bool(date_in(t))
+
     rules = [
-        Rule(contains("promise", "wada", "will pay"), "log_promise",
-             lambda t: {"customer_id": parse_customer(t, repo) or "", "amount": money_in(t), "promised_date": date_in(t) or ""}),
-        Rule(contains("broken", "missed", "slipped"), "broken_promises", lambda t: {}),
+        Rule(broken, "broken_promises", lambda t: {}),
+        Rule(lambda t: promise_words(t) and _promise_ready(t), "log_promise",
+             lambda t: {"customer_id": _cust(t, repo).id, "amount": _amount(t).amount, "promised_date": date_in(t)}),
         Rule(lambda t: contains("send")(t) and bool(ids_in(t, "REM")), "send_reminder", lambda t: {"reminder_id": ids_in(t, "REM")[0]}),
-        Rule(lambda t: contains("remind", "reminder", "yaad")(t) and bool(parse_customer(t, repo)), "draft_reminder",
-             lambda t: {"customer_id": parse_customer(t, repo), "tier": next((x for x in ("gentle", "firm", "final") if x in t.lower()), "")}),
-        Rule(contains("remind", "reminders", "collections", "chase", "wasooli"), "draft_due_reminders", lambda t: {"min_days_overdue": max(1, int_in(t) or 1)}),
-        Rule(lambda t: contains("khata", "balance")(t) and bool(parse_customer(t, repo)), "get_customer_khata", lambda t: {"customer_id": parse_customer(t, repo)}),
-        Rule(contains("aging", "overdue", "receivable", "who owes", "baqi", "owes"), "aging_report", lambda t: {}),
+        Rule(lambda t: contains("remind", "reminder", "yaad", "yaad dehani", "یاد دہانی")(t) and _cust(t, repo).ok, "draft_reminder",
+             lambda t: {"customer_id": _cust(t, repo).id, "tier": _tier(t)}),
+        Rule(lambda t: contains("remind", "reminders", "collections", "chase", "wasooli")(t) and _cust(t, repo).status == "none"
+             and not contains("list", "لسٹ", "kis kis", "kaun kaun", "kon kon", "who", "report")(t),
+             "draft_due_reminders", lambda t: {"min_days_overdue": max(1, int_in(t) or 1)}),
+        Rule(lambda t: _KHATA(t) and _cust(t, repo).ok, "get_customer_khata", lambda t: {"customer_id": _cust(t, repo).id}),
+        Rule(contains("aging", "overdue", "receivable", "receivables", "who owes", "baqi", "owes", "kis kis", "kaun kaun", "kon kon", "udhaar", "udhar",
+                      "dene", "list", "wasooli", "collections", "report", "وصولی", "لسٹ", "ادھار"), "aging_report", lambda t: {}),
     ]
-    m = _model(model, rules, "I can show aging, draft reminders for overdue accounts, send an approved reminder, log a promise to pay, or list broken promises.")
+
+    def fallback(t: str, system: str) -> str | None:
+        urdu = is_urdu(t)
+        r = _cust(t, repo)
+        if promise_words(t):
+            if not r.ok:
+                return RP.ask_customer(r, urdu)
+            if _amount(t).amount is None:
+                return "How much did they promise, and by when?"
+            if not date_in(t):
+                return f"By when will {r.name} pay? e.g. '{r.name} promise {int(_amount(t).amount or 0)} by 2026-10-02' or 'jumma tak'."
+        if contains("remind", "reminder", "yaad")(t) and r.status == "ambiguous":
+            return RP.ask_customer(r, urdu)
+        return _urdu_didnt(t)
+
+    m = _model(model, rules, "I can show aging, draft reminders for overdue accounts, send an approved reminder, log a promise to pay, or list broken promises.",
+               [(lambda p: "don't run collections" in p, "Collections are run by the office.")], fallback)
     return build_specialist("wasooli", "Wasooli Munshi", m, {"owner": office, "clerk": office, "salesman": field, "driver": []}, prompts, checkpointer)
 
 
@@ -242,23 +576,70 @@ def build_report_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCha
         "salesman": "You are the Report Munshi. Reports are for the office.",
         "driver": "You are the Report Munshi. Reports are for the office.",
     }
+
+    def _range(t: str) -> dict:
+        s, e = _period(t)
+        return {"start": s, "end": e}
+
     rules = [
-        Rule(contains("profit", "munafa", "net", "margin"), "profit_summary", lambda t: {"start": (re.findall(r"\d{4}-\d{2}-\d{2}", t) + ["", ""])[0], "end": (re.findall(r"\d{4}-\d{2}-\d{2}", t) + ["", ""])[1]}),
-        Rule(contains("collection", "collected", "recovery"), "collection_report", lambda t: {}),
-        Rule(contains("valuation", "worth", "stock value"), "stock_valuation", lambda t: {}),
-        Rule(contains("slow", "dead stock", "not selling", "nahi bik"), "slow_stock", lambda t: {"days": int_in(t) or 30}),
-        Rule(contains("top customers", "best customers", "top"), "top_customers", lambda t: {"days": int_in(t) or 30}),
-        Rule(lambda t: contains("ledger", "movement", "history")(t) and bool(_sku_in(t, repo)), "stock_ledger", lambda t: {"sku": _sku_in(t, repo), "warehouse_id": (ids_in(t, "WH") or [""])[0]}),
-        Rule(contains("sales", "sale", "bikri", "revenue"), "sales_report", lambda t: {"start": (re.findall(r"\d{4}-\d{2}-\d{2}", t) + ["", ""])[0], "end": (re.findall(r"\d{4}-\d{2}-\d{2}", t) + ["", ""])[1]}),
+        Rule(contains("profit", "munafa", "net", "margin", "منافع"), "profit_summary", _range),
+        Rule(contains("collection", "collections", "collected", "recovery"), "collection_report", _range),
+        Rule(contains("valuation", "worth", "stock value", "value"), "stock_valuation", lambda t: {}),
+        Rule(contains("slow", "dead stock", "not selling", "nahi bik", "bik nahi"), "slow_stock", lambda t: {"days": int_in(t) or 30}),
+        Rule(lambda t: contains("top customers", "best customers", "top")(t) or bool(re.search(r"sab se (zyada|ziada|zaida) kaun", fold(t))), "top_customers",
+             lambda t: {"days": int_in(t) or 30}),
+        Rule(lambda t: contains("ledger", "movement", "history")(t) and bool(_sku(t, repo)), "stock_ledger",
+             lambda t: {"sku": _sku(t, repo), "warehouse_id": (ids_in(t, "WH") or [""])[0]}),
+        Rule(contains("sales", "sale", "bikri", "revenue", "بکری", "سیل"), "sales_report", _range),
         Rule(contains("payable", "owe"), "payables_report", lambda t: {}),
         Rule(contains("digest", "summary", "today"), "get_digest", lambda t: {}),
     ]
     m = _model(model, rules, "Ask for sales, profit, collections, stock valuation, slow stock, top customers or a product's stock ledger.",
-               [(lambda p: "for the office" in p, "Reports are for the office.")])
+               [(lambda p: "for the office" in p, "Reports are for the office.")], lambda t, s: _urdu_didnt(t))
     return build_specialist("report", "Report Munshi", m, {"owner": tools, "clerk": tools, "salesman": [], "driver": []}, prompts, checkpointer)
+
+
+# ------------------------------------------------------------------ Help desk (no tools, ever)
+def build_help_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChatModel | None = None, checkpointer=None) -> AgentBundle:
+    """Greetings, thanks, 'what can you do', and plain refusals of what no munshi may do. It has no tool for any
+    role, and it always answers from the fixed, reviewed strings in llm/replies.py -- even when a real model is
+    configured -- so a refusal can't be talked into something else and never depends on a provider being up."""
+    from munshi.agents import manager as M
+    B = _biz(repo)
+    prompts = {r: f"You are the help desk for {B} [role:{r}]. Answer greetings and say plainly what you can't do. You have no tools." for r in ROLES}
+
+    def reply(t: str, system: str) -> str:
+        urdu = is_urdu(t)
+        role = (re.search(r"\[role:(\w+)\]", system) or [None, "clerk"])[1]
+        if M._DESTROY(t):
+            return RP.t("refuse_delete", urdu)
+        if M._SECRET(t):
+            return RP.t("refuse_secret", urdu)
+        if M._EDIT(t):
+            return RP.t("refuse_edit", urdu)
+        if M._PERSONAL(t):
+            return RP.t("offtopic", urdu) if urdu else "I can't see staff salaries or personal records. " + RP.HELP_BY_ROLE.get(role, "")
+        if M._BYPASS(t):
+            return RP.t("refuse_bypass", urdu)
+        if M._GREET(t):
+            return RP.t("greet", urdu)
+        if M._THANKS(t):
+            return RP.t("thanks", urdu)
+        if M._BYE(t):
+            return RP.t("bye", urdu)
+        if M._HELP(t):
+            return RP.HELP_BY_ROLE.get(role, RP.HELP_BY_ROLE["clerk"])
+        if M._ACK(t):
+            return RP.t("ack", urdu)
+        if M._OFFTOPIC(t):
+            return RP.t("offtopic", urdu)
+        return RP.t("didnt", urdu, closest="an order or a khata question")
+
+    m = StubToolCallingModel(rules=[], fallback_text="", fallback_fn=reply)
+    return build_specialist("help", "Munshi", m, {r: [] for r in ROLES}, prompts, checkpointer)
 
 
 BUILDERS = {
     "order": build_order_munshi, "godown": build_godown_munshi, "delivery": build_delivery_munshi, "hisaab": build_hisaab_munshi,
-    "khareed": build_khareed_munshi, "wasooli": build_wasooli_munshi, "report": build_report_munshi,
+    "khareed": build_khareed_munshi, "wasooli": build_wasooli_munshi, "report": build_report_munshi, "help": build_help_munshi,
 }
