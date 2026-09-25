@@ -51,6 +51,7 @@ if str(ROOT / "src") not in sys.path:
 from langchain_core.messages import AIMessage, HumanMessage  # noqa: E402
 
 from munshi.domain.models import Customer, business_today  # noqa: E402
+from munshi.llm.factory import build_chat_model  # noqa: E402
 from munshi.platform import MunshiPlatform  # noqa: E402
 from munshi.safety.risk import RISK_REGISTRY, RiskTier  # noqa: E402
 
@@ -71,7 +72,9 @@ def next_friday() -> str:
 
 
 def build_platform():
-    p = MunshiPlatform()
+    # the same model the web app would run with: build_chat_model() returns None for the stub
+    # (specialists then use their offline rules) and the real chat model for LLM_PROVIDER=groq
+    p = MunshiPlatform(model=build_chat_model())
     r = p.repo
     r.upsert_customer(Customer("C-011", "Chaudhry Traders", "0300-1111011", "standard", 300_000, "R-VEHARI", address="Burewala"))
     r.upsert_customer(Customer("C-012", "Malik Seeds", "0300-1111012", "standard", 300_000, "R-VEHARI", address="Mailsi"))
