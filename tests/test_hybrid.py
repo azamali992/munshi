@@ -17,7 +17,7 @@ from munshi.domain.models import Customer
 from munshi.domain.repository import MunshiRepository
 from munshi.domain.seed import seeded_repository
 from munshi.llm.parse import analyse_order
-from munshi.platform import MODEL_APPROVAL_PREFIX, MunshiPlatform, engine_of
+from munshi.platform import DETAILS, MODEL_APPROVAL_PREFIX, MunshiPlatform, engine_of, visible
 
 
 def _protocol(messages: list[BaseMessage]) -> None:
@@ -286,7 +286,7 @@ def test_cards_resume_on_the_engine_that_raised_them_after_a_restart(tmp_path):
     p2 = MunshiPlatform(MunshiRepository(db), model=fake2, checkpoint_path=ck)
     assert {x.approval_id for x in p2.pending_items()} == {rules_card.approval_id, model_card.approval_id}
     a = p2.resolve(rules_card.approval_id, True, "clerk", user="Sana")
-    assert a.engine == "rules" and a.model_calls == 0 and a.text.startswith("Done") and fake2.requests == []
+    assert a.engine == "rules" and a.model_calls == 0 and "ORD-" in visible(a.text) and DETAILS in a.text and fake2.requests == []
     b = p2.resolve(model_card.approval_id, True, "clerk", user="Sana")
     assert b.engine == "model" and b.text == "Ho gaya." and fake2.requests == [("act", text)]
     assert [o.customer_id for o in p2.repo.list_orders(limit=2)] and not p2.pending
@@ -306,7 +306,7 @@ def test_a_model_card_still_resumes_after_restarting_without_a_model(tmp_path):
     p2 = MunshiPlatform(MunshiRepository(db), checkpoint_path=ck)            # LLM_PROVIDER=stub now
     n = len(p2.repo.list_orders(customer_id="C-012"))
     out = p2.resolve(card.approval_id, True, "clerk", user="Sana")
-    assert out.engine == "model" and out.model_calls == 0 and out.text.startswith("Done") and "Malik Seeds" in out.text
+    assert out.engine == "model" and out.model_calls == 0 and DETAILS in out.text and "Malik Seeds" in visible(out.text)
     assert len(p2.repo.list_orders(customer_id="C-012")) == n + 1
     p2.close()
 
@@ -384,7 +384,9 @@ def test_an_urdu_script_tail_is_dropped_from_a_reply_to_roman_urdu(repo):
     assert MunshiPlatform._latin_only("کھاتہ صاف ہے۔") == "کھاتہ صاف ہے۔"                  # all Urdu: left alone, never emptied
     text = "Bhatti sahab ka account dekhna hai zara"
     fake = _fake(routes={text: "hisaab"}, final={text: "Bhatti sahab ka khata 58,000 hai. کوئی اور مدد؟"})
-    r = MunshiPlatform(repo, model=fake).handle_message("t", "clerk", text)
+    p = MunshiPlatform(repo, model=fake)
+    p.manager = _NoRoute()          # the rules now read 'account' as khata themselves: put this one in front of the model on purpose
+    r = p.handle_message("t", "clerk", text)
     assert r.text == "Bhatti sahab ka khata 58,000 hai."
 
 

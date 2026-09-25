@@ -9,8 +9,9 @@ in code, against the message it answers, with the same deterministic layer the o
   WHO       the customer / supplier the MESSAGE names must resolve confidently (resolve.py's rule) to the
             id in the arguments. Ambiguous -> ask which, naming the candidates; a different id -> ask which
             of the two; two customers in one message -> ask for one at a time. A message that names nobody
-            may lean on the thread's history only through a pronoun ('isko', 'uska'), exactly like the
-            offline layer; otherwise ask.
+            may lean on the conversation only through a pronoun or possessive ('isko', 'uska', 'their' --
+            llm.followup.PRONOUN, the offline layer's own test) or through the ID the platform's topic memory
+            added to it for a plain follow-up ('confirm payment' right after a turn about Haji Sons); otherwise ask.
   HOW MUCH  order lines must equal what parse.py reads from the message when it reads any (and a message
             parse.py finds problems in -- a correction, a range, an unknown product -- is asked about);
             an amount must equal amount_in(); every other quantity, amount, delta or price must be a number
@@ -52,6 +53,7 @@ from munshi.llm.parse import (
     warehouses_in,
 )
 from munshi.llm.resolve import Candidate, Resolution
+from munshi.llm.stub_model import ASK_KEY, ask_meta
 from munshi.llm.text import is_urdu
 from munshi.safety.risk import RiskTier, risk_of
 
@@ -70,6 +72,18 @@ def set_history(lines: list[str]):
 
 def reset_history(token) -> None:
     _HISTORY.reset(token)
+
+
+# The conversation's topic (llm/followup.py), set by the platform around a model-engine turn.
+_TOPIC: ContextVar[dict | None] = ContextVar("munshi_guard_topic", default=None)
+
+
+def set_topic(topic: dict | None):
+    return _TOPIC.set(dict(topic) if topic else None)
+
+
+def reset_topic(token) -> None:
+    _TOPIC.reset(token)
 
 
 CUSTOMER_TOOLS = {"create_order", "record_payment", "credit_note", "draft_reminder", "log_promise", "get_customer_khata"}
@@ -150,10 +164,20 @@ class _Ctx:
 
 
 def _recent_entity(ctx: _Ctx, kind: str) -> str:
-    """The thread-history resolution the offline layer uses: only for a pronoun ('isko', 'uska', 'ye wala'), the
-    most recent customer / supplier named in the last few lines of this conversation."""
-    from munshi.agents.specialists import _PRONOUN
-    if not _PRONOUN(ctx.text):
+    """The thread-history resolution the offline layer uses: only for a pronoun or possessive ('isko', 'uska', 'their',
+    'اس نے' -- llm.followup.PRONOUN, the SAME predicate the offline rules use), the customer / supplier the conversation
+    is about: the platform's topic memory when it has one (the same memory the offline rules lean on), else the most
+    recent one named in the last few lines of this conversation. Plain follow-ups that name nobody -- 'confirm
+    payment' right after a turn about Haji Sons -- are accepted exactly when llm.followup.augment() (what the
+    platform runs for the offline rules) would lean on the topic for them."""
+    from munshi.llm.followup import PRONOUN, augment
+    topic = _TOPIC.get()
+    if topic:
+        # the very function the platform uses to give the offline rules the remembered entity
+        _, used = augment(ctx.text, topic, ctx.repo)
+        if used and used.get("kind") == kind:
+            return str(used.get("id") or "")
+    if not PRONOUN(ctx.text):
         return ""
     pat = r"\bC-\d{3,}\b" if kind == "customer" else r"\bS-\d{3,}\b"
     res = customer_resolution if kind == "customer" else supplier_resolution
@@ -401,6 +425,9 @@ class EntityGuard(AgentMiddleware):
                 log.warning("guard refused %s(%s) for %r: %s", tc["name"], json.dumps(tc.get("args"), default=str)[:200], text[:80], q)
                 kw = {k: v for k, v in (ai.additional_kwargs or {}).items() if k not in ("tool_calls", "function_call")}
                 meta = dict(ai.response_metadata or {}) | {GUARD_KEY: {"tool": tc["name"], "args": tc.get("args") or {}, "question": q}}
+                am = ask_meta(q)
+                if am:                                          # one missing piece: the next message may simply answer it
+                    meta[ASK_KEY] = am
                 blocked = ai.model_copy(update={"content": q, "tool_calls": [], "invalid_tool_calls": [], "additional_kwargs": kw, "response_metadata": meta})
                 return {"messages": [blocked]}
         return None

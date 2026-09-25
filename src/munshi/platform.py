@@ -66,7 +66,11 @@ from munshi.channels import build_channel, deliver_outbox
 from munshi.domain.models import discounted_paisa, to_paisa, to_rupees, today_iso
 from munshi.domain.repository import MunshiRepository
 from munshi.domain.seed import seeded_repository
-from munshi.llm.stub_model import not_understood
+from munshi.llm import answers
+from munshi.llm import followup as FU
+from munshi.llm import replies as RP
+from munshi.llm.parse import customer_resolution, supplier_resolution
+from munshi.llm.stub_model import ask_of, not_understood
 from munshi.llm.text import is_urdu
 from munshi.observability.tracing import TurnTrace, configure_tracking, trace_turn
 from munshi.safety.middleware import DEFERRED_KEY
@@ -80,6 +84,14 @@ MODEL_APPROVAL_PREFIX = "L"          # approval ids raised by the model engine; 
 # said instead of a model reply that claims an action no tool took
 NOTHING_DONE = "Nothing was recorded -- I couldn't turn that into an action."
 NOTHING_DONE_UR = "کچھ درج نہیں ہوا۔"
+# A reply to a tool result is a readable sentence (llm/answers.py) followed by this marker and the raw result: the
+# app folds the raw part away under "details"; the eval and anyone debugging a turn still have every field.
+DETAILS = "\n\nDone -- "
+
+
+def visible(text: str) -> str:
+    """The part of a reply a person reads (without the folded details block)."""
+    return str(text or "").split(DETAILS, 1)[0]
 
 
 def engine_of(approval_id: str) -> str:
@@ -158,6 +170,8 @@ class Reply:
     model_calls: int = 0                        # real-model requests this turn made (0 when the rules answered)
     model_tokens: int = 0                       # tokens those requests used, as the provider reported them
     model_error: str | None = None              # the model failed and the rules' reply was used instead
+    ask: dict | None = None                     # the one missing piece this reply asks for ({"slot", "candidates"}), if any
+    tool: str | None = None                     # the (last) tool the specialist called this turn, if any
 
 
 # ====================================================================== approval cards
@@ -731,7 +745,7 @@ class MunshiPlatform:
         self._checkpointer = checkpointer
         # the rules engine: always there, always first
         self.specialists = {name: build(self.ops, self.repo, None, checkpointer) for name, build in BUILDERS.items()}
-        self.manager = build_manager(None)
+        self.manager = build_manager(None, self.repo)
         # the model engine: only with a real model, only for what the rules didn't understand
         self.model = model if is_real_model(model) else None
         self.llm_specialists: dict | None = None
@@ -741,6 +755,8 @@ class MunshiPlatform:
             self.llm_manager = build_manager(self.model)
         self._resume_only: dict = {}
         self.cards = CardBuilder(self.repo, self.ops)
+        self._from_chat: dict | None = None     # the remembered customer/supplier this turn's message leaned on (named on its card)
+        self._topic: dict | None = None         # this turn's remembered topic (handed to the model guard)
 
     def close(self) -> None:
         if self._ckpt_conn is not None:
@@ -800,29 +816,119 @@ class MunshiPlatform:
     def _trace(self, agent: str, role: str, text: str):
         return trace_turn(agent, role, text) if self.enable_tracing else nullcontext(TurnTrace(agent_name=agent, role=role, user_text=text))
 
+    def _readable(self, msgs: list, i: int) -> str | None:
+        """The readable sentence for the tool result at msgs[i] (a ToolMessage), in the language of the message it
+        answers; None if there is no formatter for it."""
+        tm = msgs[i]
+        args = next((tc.get("args") or {} for m in reversed(msgs[:i]) if isinstance(m, AIMessage) for tc in (m.tool_calls or [])
+                     if tc.get("id") == tm.tool_call_id), {})
+        human = next((str(m.content) for m in reversed(msgs[:i]) if isinstance(m, HumanMessage)), "")
+        return answers.render(str(tm.name or ""), str(tm.content), self.repo, human, args)
+
     def _final_text(self, result: dict) -> str:
-        msg = result["messages"][-1]
+        msgs = result["messages"]
+        msg = msgs[-1]
         content = msg.content if isinstance(msg.content, str) else str(msg.content)
+        # the offline model's one-line summary of a tool result ("Done -- {json}"): a sentence, with the raw result folded after it
+        if isinstance(msg, AIMessage) and content.startswith("Done -- ") and len(msgs) >= 2 and isinstance(msgs[-2], ToolMessage):
+            nice = self._readable(msgs, len(msgs) - 2)
+            if nice:
+                raw = content[len("Done -- "):]
+                return nice + (DETAILS + raw if raw.lstrip()[:1] in ("{", "[") else "")
         return content or "Done."
+
+    # ------------------------------------------------------------------ conversation memory (llm/followup.py)
+    _MEMO_ROWS = 16
+
+    def _memory(self, thread_id: str, role: str) -> tuple[dict | None, dict | None]:
+        """This role's open question and topic on this thread, if still fresh. Stored in the chat log's meta (the
+        munshi's reply rows), so a restart loses nothing; another role's turns never touch it."""
+        for r in reversed(self.repo.chat_history(thread_id, self._MEMO_ROWS)[:-1]):
+            memo = (r.get("meta") or {}).get("memo") if r.get("role") == "munshi" else None
+            if not memo or memo.get("role") != role:
+                continue
+            ask, topic = memo.get("ask"), memo.get("topic")
+            ask = ask if ask and FU.fresh(ask.get("at")) and int(ask.get("left", 0)) >= 0 else None
+            topic = topic if topic and FU.fresh(topic.get("at")) else None
+            return ask, topic
+        return None, None
 
     def handle_message(self, thread_id: str, role: str, text: str, user: str = "") -> Reply:
         # Every write this turn makes -- including any tool the agent runs on a worker thread -- is `user`'s.
         with self._lock, self.repo.acting_as(user):
             self.repo.add_chat(thread_id, role, text, {"user": user})
-            with self._trace("manager", role, text) as tr:
-                reply, meta, understood = self._turn(RULES, thread_id, role, text, user, tr)
-                if not understood and self.hybrid:
-                    reply, meta = self._model_turn(thread_id, role, text, user, tr, reply, meta)
-                self.repo.add_chat(thread_id, "munshi", reply.text, meta)
-                return reply
+            try:
+                ask, topic = self._memory(thread_id, role)
+            except Exception:
+                log.exception("couldn't read the conversation memory of %s", thread_id)
+                ask, topic = None, None
+            run, force, used, answered = text, None, None, False
+            try:
+                done = FU.answer(ask, text, self.repo) if ask else None
+                if done:                        # the message answers the open question: the original request, completed
+                    run, force = done[0], done[1] or ask.get("specialist")
+                    used, answered = ask.get("used"), True
+                else:
+                    run, used = FU.augment(text, topic, self.repo)
+            except Exception:
+                log.exception("follow-up reading failed on %r", text[:80])
+                run, force, used, answered = text, None, None, False
+            self._from_chat = used if used and used.get("kind") in ("customer", "supplier") else None
+            self._topic = topic
+            try:
+                with self._trace("manager", role, text) as tr:
+                    reply, meta, understood = self._turn(RULES, thread_id, role, run, user, tr, force=force)
+                    if not understood and self.hybrid:
+                        # the model reads the message as the user wrote it (a completed open question: the whole request),
+                        # with the remembered customer in its context note; the guard accepts that customer by the same rule
+                        reply, meta = self._model_turn(thread_id, role, run if answered else text, user, tr, reply, meta)
+                    meta = meta | ({"completed": run} if answered else {"read_as": run} if run != text else {})
+                    try:
+                        meta["memo"] = self._remember(role, text, run, reply, ask, topic, used, answered)
+                    except Exception:
+                        log.exception("couldn't update the conversation memory of %s", thread_id)
+                    self.repo.add_chat(thread_id, "munshi", reply.text, meta)
+                    return reply
+            finally:
+                self._from_chat = self._topic = None
+
+    def _remember(self, role: str, text: str, run: str, reply: Reply, ask: dict | None, topic: dict | None, used: dict | None,
+                  answered: bool) -> dict:
+        """What this role's conversation carries into its next message: the open question (if this reply asked
+        one, or an unanswered one survives a bit of small talk) and the topic."""
+        at = FU.now().isoformat()
+        new_ask = None
+        if reply.ask and not reply.pending:
+            new_ask = dict(reply.ask) | {"text": run, "specialist": reply.specialist, "at": at, "left": FU.MAX_CHATTER, "used": used}
+        elif ask and not answered and not reply.pending and reply.specialist in (None, "help") and int(ask.get("left", 0)) > 0:
+            new_ask = dict(ask) | {"left": int(ask.get("left", 0)) - 1}
+        intent = {"get_stock": "stock", "list_orders": "orders"}.get(reply.tool or "")
+        if intent == "stock" and not FU.entities(run, self.repo).get("product"):
+            intent = None
+        whole = FU.WHOLE_BUSINESS(text) and not FU.PRONOUN(text)
+        new_topic = FU.next_topic(topic, run, self.repo, role, reply.pending.args if reply.pending else None, whole, intent)
+        return {"role": role, "ask": new_ask, "topic": new_topic}
+
+    def _bare_entity(self, text: str) -> str | None:
+        """A message that is only a customer's or a supplier's name ('haji sons', 'Fauji?'): their khata."""
+        for res, spec in ((customer_resolution(text, self.repo), "order"), (supplier_resolution(text, self.repo), "khareed")):
+            if res.ok and res.other is None and not FU._leftover(text, lambda w, n=res.name: FU._is_name_word(w, n) or w in ("aur", "and", "?")):
+                return spec
+        return None
 
     def _turn(self, engine: str, thread_id: str, role: str, text: str, user: str, tr, config: dict | None = None,
-              context: list | None = None) -> tuple[Reply, dict, bool]:
+              context: list | None = None, force: str | None = None) -> tuple[Reply, dict, bool]:
         """One engine's go at a message: (reply, chat-log meta, understood). `understood` is False only when the
         engine's manager routed nowhere or, in hybrid mode, the rules specialist ended on the explicit
-        NOT_UNDERSTOOD outcome."""
+        NOT_UNDERSTOOD outcome. `force` names the specialist when the message completes that specialist's own
+        open question (the request goes back to whoever asked)."""
         manager = self.manager if engine == RULES else self.llm_manager
-        specialist = classify(manager, text, role, config=config, context=context)
+        specialist = force if force in BUILDERS and (engine == RULES or force != "help") else classify(manager, text, role, config=config, context=context)
+        if specialist is None and engine == RULES:
+            try:
+                specialist = self._bare_entity(text)
+            except Exception:
+                log.exception("bare-name routing failed on %r", text[:80])
         tr.specialist = specialist
         if specialist is None:
             return Reply(CLARIFY, None, None, thread_id, engine=engine), {"specialist": None}, False
@@ -849,8 +955,13 @@ class MunshiPlatform:
         result = bundle.agent.invoke({"messages": [*(context or []), HumanMessage(text)], "role": role}, config=cfg | (config or {}))
         if engine == RULES and self.hybrid and not result.get("__interrupt__") and not_understood(result["messages"][-1]):
             return Reply(self._final_text(result), specialist, None, thread_id, engine=engine), {"specialist": specialist}, False
+        msgs = result.get("messages") or []
+        h = max((i for i, m in enumerate(msgs) if isinstance(m, HumanMessage)), default=-1)
+        called = [tc["name"] for m in msgs[h + 1:] if isinstance(m, AIMessage) for tc in (m.tool_calls or [])]
+        ask = ask_of(msgs[-1]) if msgs and not result.get("__interrupt__") else None
         reply = self._settle(bundle, specialist, thread_id, role, user, result, tr, engine=engine, config=config)
-        reply.engine = engine
+        reply.engine, reply.tool = engine, (called[-1] if called else None)
+        reply.ask = ask if reply.pending is None else None
         return reply, {"specialist": specialist} | ({"approval_id": reply.pending.approval_id} if reply.pending else {}), True
 
     # ------------------------------------------------------------------ the model engine
@@ -872,6 +983,9 @@ class MunshiPlatform:
         except Exception:
             log.exception("hints failed")
             read = ""
+        fc = self._from_chat
+        if fc:
+            read = (read + " " if read else "") + f"This message is about the {fc['kind']} of the conversation: {fc['name']} = {fc['id']}."
         rows = self.repo.chat_history(thread_id, self._CONTEXT_LINES + 1)[:-1]
         lines = "\n".join(f"{'munshi' if r['role'] == 'munshi' else 'user'}: {str(r['text'])[:240]}" for r in rows)
         earlier = f"\nEarlier in this chat, for context only -- act on the next message:\n{lines}" if rows else ""
@@ -937,6 +1051,7 @@ class MunshiPlatform:
         provider error, a malformed reply -- gives the rules' own reply instead; never a stack trace."""
         calls = _ModelCalls()
         token = guard.set_history(self._history_lines(thread_id))
+        ttoken = guard.set_topic(self._topic)
         try:
             reply, meta, _ = self._turn(MODEL, thread_id, role, text, user, tr, config={"callbacks": [calls]}, context=self._context(thread_id, text))
             if reply.specialist is None:                   # the model routed nowhere either: the rules' answer stands
@@ -948,6 +1063,12 @@ class MunshiPlatform:
                 claim = reply.text
                 reply = Reply(f"{NOTHING_DONE_UR if is_urdu(text) else NOTHING_DONE} {fallback.text}", reply.specialist, None, thread_id, engine=MODEL)
                 meta = {"specialist": reply.specialist, "claim_blocked": claim[:200]}
+            elif reply.pending is None and reply.waiting is None and self._raw(reply.text):
+                # the model returned nothing, or the tool's raw data: say it in a sentence instead
+                nice = self._last_tool_sentence(self._bundle(MODEL, reply.specialist), self._cfg(thread_id, role, reply.specialist, MODEL))
+                if nice:
+                    meta = meta | {"model_text_replaced": reply.text[:200]}
+                    reply.text = nice
             elif reply.pending is None and not is_urdu(text):
                 trimmed = self._latin_only(reply.text)
                 if trimmed != reply.text:
@@ -960,8 +1081,25 @@ class MunshiPlatform:
             reply.model_error = meta["model_error"] = type(e).__name__
         finally:
             guard.reset_history(token)
+            guard.reset_topic(ttoken)
         reply.model_calls, reply.model_tokens = calls.n, calls.tokens
         return reply, meta | {"engine": reply.engine, "model_calls": calls.n, "model_tokens": calls.tokens}
+
+    @staticmethod
+    def _raw(text: str) -> bool:
+        """A reply that is empty, a bare 'Done.', or raw data rather than prose."""
+        t = str(text or "").strip()
+        return not t or t in ("Done.", "Done") or t[:1] in ("{", "[") or t.startswith("Done -- ")
+
+    def _last_tool_sentence(self, bundle, cfg: dict) -> str | None:
+        """The readable sentence for the last tool result of this turn on a model-engine thread, if any."""
+        try:
+            msgs = bundle.agent.get_state(cfg).values.get("messages", [])
+        except Exception:
+            return None
+        h = max((i for i, m in enumerate(msgs) if isinstance(m, HumanMessage)), default=-1)
+        i = max((i for i, m in enumerate(msgs) if i > h and isinstance(m, ToolMessage) and m.status != "error"), default=-1)
+        return self._readable(msgs, i) if i >= 0 else None
 
     def _heal_model_threads(self, thread_id: str, role: str) -> None:
         """After a failed model turn, leave no model-engine thread of this conversation holding a tool call with
@@ -1044,7 +1182,11 @@ class MunshiPlatform:
         tr.required_approval = True; tr.tool_called = tool
         skipped = f"(Skipped: {problems[0]}.) " if problems else ""
         effect = f" {card['effect']}" if card["effect"] else ""
-        txt = f"{lead}{skipped}{bundle.title} {'next ' if lead else ''}wants to: {self._headline(card)}.{effect} Needs {pa.needs_role} approval.{later}"
+        # a card whose customer/supplier came from the conversation, not from this message, says so plainly
+        fc = self._from_chat
+        note = f" -- {RP.t('from_chat', False, name=fc['name'])}" if fc and not lead and fc.get("id") in (
+            str(req["args"].get("customer_id") or ""), str(req["args"].get("supplier_id") or "")) else ""
+        txt = f"{lead}{skipped}{bundle.title} {'next ' if lead else ''}wants to: {self._headline(card)}{note}.{effect} Needs {pa.needs_role} approval.{later}"
         return Reply(txt, specialist, pa, thread_id)
 
     # ------------------------------------------------------------------ cards
@@ -1251,7 +1393,10 @@ class MunshiPlatform:
             return Reply("Rejected. Nothing was done.", pa.specialist, None, pa.thread_id, model_error=type(e).__name__)
         from munshi.llm.stub_model import StubToolCallingModel
         summary = StubToolCallingModel._summary(str(out.content)).content      # the offline one-line summary ("Done -- ...", redacted)
-        return Reply(f"Approved. {summary}"[:600], pa.specialist, None, pa.thread_id, model_error=type(e).__name__)
+        nice = self._readable(msgs, msgs.index(out))
+        if nice and summary.startswith("Done -- "):
+            summary = nice + DETAILS + summary[len("Done -- "):]
+        return Reply(f"Approved. {summary}"[:600] if not nice else f"Approved. {summary}", pa.specialist, None, pa.thread_id, model_error=type(e).__name__)
 
     def pending_items(self, thread_id: str | None = None) -> list[PendingApproval]:
         """Pending approvals, oldest first."""

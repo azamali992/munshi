@@ -244,11 +244,14 @@
   V.driver = V.stops;
 
   // ================================================================ chat + approvals
+  const DETAILS = '\n\nDone -- ';   // platform.DETAILS: a readable reply, then its raw result (folded under "details")
   function renderMsg(m) {
     if (m.role === 'munshi' || m.role === 'bot') {
       const who = m.meta?.specialist ? m.meta.specialist + ' munshi' : 'munshi';
       let text = m.text, extra = '';
-      if (text.startsWith('Done -- ')) { const raw = text.slice(8); try { const o = JSON.parse(raw); text = summarize(o); extra = `<details><summary class="hint">details</summary><pre class="json">${esc(JSON.stringify(o, null, 1))}</pre></details>`; } catch { text = raw; } }
+      const cut = text.indexOf(DETAILS);   // a readable reply with the raw result folded after it
+      if (cut > 0) { const raw = text.slice(cut + DETAILS.length); text = text.slice(0, cut); let o = raw; try { o = JSON.stringify(JSON.parse(raw), null, 1); } catch { /* keep raw */ } extra = `<details><summary class="hint">details</summary><pre class="json">${esc(o)}</pre></details>`; }
+      else if (text.startsWith('Done -- ')) { const raw = text.slice(8); try { const o = JSON.parse(raw); text = summarize(o); extra = `<details><summary class="hint">details</summary><pre class="json">${esc(JSON.stringify(o, null, 1))}</pre></details>`; } catch { text = raw; } }
       return `<div class="msg bot"><span class="who">${esc(who)}${m.meta?.resolved ? ' · ' + (m.meta.approved ? t('approved') : t('reject')) : ''}</span>${esc(text)}${extra}</div>`;
     }
     return `<div class="msg me">${esc(m.text)}${m.meta?.user && m.meta.user !== state.me?.name ? `<span class="who">${esc(m.meta.user)}</span>` : ''}</div>`;
@@ -397,7 +400,7 @@
       try {
         const r = await post('/api/approvals/' + aid, { approve, note });
         const label = approve ? t('approved') : act === 'withdraw' ? t('withdrawn') : t('rejected');
-        box.outerHTML = `<div class="msg bot"><span class="who">${esc(r.specialist)} munshi · ${esc(label)}</span>${esc(r.text.startsWith('Done -- ') ? (() => { try { return summarize(JSON.parse(r.text.slice(8))); } catch { return r.text.slice(8); } })() : r.text)}</div>`;
+        box.outerHTML = `<div class="msg bot"><span class="who">${esc(r.specialist)} munshi · ${esc(label)}</span>${esc(r.text.indexOf(DETAILS) > 0 ? r.text.slice(0, r.text.indexOf(DETAILS)) : r.text.startsWith('Done -- ') ? (() => { try { return summarize(JSON.parse(r.text.slice(8))); } catch { return r.text.slice(8); } })() : r.text)}</div>`;
         APPROVALS.delete(aid); toast(label);
       }
       catch (err) { toast(err.message, 4000); box.querySelectorAll('button').forEach(x => x.disabled = false); }
