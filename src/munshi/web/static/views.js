@@ -297,10 +297,62 @@
     if (o.moves) return `${o.name}: ` + o.levels.map(l => `${l.warehouse_id} ${l.available} available`).join(', ') + `\n` + o.moves.slice(0, 5).map(m => `• ${day(m.created_at)} ${m.kind} ${m.delta > 0 ? '+' : ''}${m.delta} (${m.ref})`).join('\n');
     return JSON.stringify(o).slice(0, 300);
   }
+  // ---------------------------------------------------------------- approval cards
+  // The server sends each sentence as a template key + structured vars (and the English text as a fallback),
+  // so the same card reads in English or Urdu. Names, ids and figures are always Latin script: each goes in its
+  // own LTR isolate with the UI font, so it never picks up the Nastaliq face or reorders inside Urdu text.
+  const APPROVALS = new Map();                                   // approval_id -> last payload rendered (for the confirm sheet)
+  const ltr = s => `<bdi class="ltr" dir="ltr">${esc(s)}</bdi>`;
+  const money = v => ltr(fmt(v).replace(' ', '\u00a0'));        // "Rs" never wraps away from its amount
+  // a translatable word: this language's k_<word>, else its plain key (order statuses are already translated), else English
+  const word = k => { const L = window.MUNSHI_I18N[state.lang] || {}; return L['k_' + k] ?? L[k] ?? window.MUNSHI_I18N.en['k_' + k] ?? String(k).replace(/_/g, ' '); };
+  const cardVar = v => {
+    if (Array.isArray(v)) return v.map(c => ltr(`${c.name} ${num(c.before)} → ${num(c.after)}`)).join(state.lang === 'ur' ? '، ' : ', ');
+    if (v && typeof v === 'object') return 'rs' in v ? money(v.rs) : 'k' in v ? esc(word(v.k)) : '';
+    if (typeof v === 'number') return ltr(num(v));
+    return ltr(v ?? '');
+  };
+  const fill = (tpl, vars) => esc(tpl).replace(/\{(\w+)\}/g, (m, k) => (vars && k in vars ? cardVar(vars[k]) : m));
+  const cardText = (key, vars, fallback) => { const k = 'ap.' + key; const tpl = key ? t(k) : k; return tpl === k ? esc(fallback || '') : fill(tpl, vars); };
+  const ago = iso => {
+    const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+    if (!isFinite(s)) return esc(when(iso));
+    const n = s < 60 ? 0 : s < 3600 ? Math.floor(s / 60) : s < 86400 ? Math.floor(s / 3600) : Math.floor(s / 86400);
+    return fill(t(s < 60 ? 'ago_now' : s < 3600 ? 'ago_min' : s < 86400 ? 'ago_hr' : 'ago_day'), { n });
+  };
+  const ownerStep = p => (p.card?.needs_role || p.needs_role) === 'owner' || p.needs_role_now === 'owner' || p.tier === 'high_risk';
+  function linesTable(c) {
+    const ls = c.lines || []; if (!ls.length) return '';
+    const rate = ls.some(l => l.unit_price !== null && l.unit_price !== undefined), amt = ls.some(l => l.line_total !== null && l.line_total !== undefined);
+    const unit = u => (u === 'days' || u === 'units') ? ` <span class="u">${esc(t('u_' + u))}</span>` : '';
+    return `<table class="ap-lines"><thead><tr><th scope="col">${esc(t('ap_item'))}</th><th scope="col" class="n">${esc(t('quantity'))}</th>${rate ? `<th scope="col" class="n">${esc(t('rate'))}</th>` : ''}${amt ? `<th scope="col" class="n">${esc(t('amount'))}</th>` : ''}</tr></thead>
+      <tbody>${ls.map(l => `<tr><td><bdi class="ltr" dir="ltr">${esc(l.name)}</bdi></td><td class="n">${ltr(num(l.qty))}${unit(l.unit)}</td>${rate ? `<td class="n">${l.unit_price === null ? '—' : money(l.unit_price)}</td>` : ''}${amt ? `<td class="n">${l.line_total === null ? '—' : money(l.line_total)}</td>` : ''}</tr>`).join('')}</tbody>
+      ${c.total !== null && c.total !== undefined && amt ? `<tfoot><tr><th scope="row" colspan="${1 + (rate ? 2 : 1)}">${esc(t('total'))}</th><td class="n">${money(c.total)}</td></tr></tfoot>` : ''}</table>`;
+  }
   function renderApproval(p) {
-    return `<div class="approval" data-aid="${esc(p.approval_id)}"><div class="h"><span>${esc(p.specialist)} munshi · ${esc(p.tool.replace(/_/g, ' '))}</span>${tierPill(p.tier)}</div>
-      <div class="s">${esc(p.summary)}</div>${p.requested_by ? meta(`asked by ${esc(p.requested_by)} · ${when(p.created_at)}`) : ''}
-      <div class="btnrow"><button class="btn primary" data-act="approve" ${p.can_approve ? '' : 'disabled'}>${esc(t('approve'))}</button><button class="btn danger" data-act="reject" ${can('approvals:decide') ? '' : 'disabled'}>${esc(t('reject'))}</button>${p.can_approve ? '' : `<span class="hint" style="align-self:center">${esc(t('needs'))} ${esc(p.needs_role)}</span>`}</div></div>`;
+    APPROVALS.set(p.approval_id, p);
+    const c = p.card || { title: p.summary, lines: [], warnings: [], facts: [] };
+    const id = 'ap-' + esc(p.approval_id); const hi = ownerStep(p);
+    const tier = `<span class="ap-tier ${hi ? 'hi' : 'lo'}"><span aria-hidden="true">${hi ? '▲' : '●'}</span> ${esc(t(hi ? 'ap_tier_owner' : 'ap_tier_clerk'))}</span>`;
+    const facts = (c.facts || []).map(f => `<b>${esc(t(f.key))}</b><span>${f.value && typeof f.value === 'object' ? cardVar(f.value) : `<bdi>${esc(f.value)}</bdi>`}</span>`).join('');
+    const who = c.requested_by || p.requested_by;
+    const asked = fill(t('ap_asked_by'), { name: who || t(p.requested_by_role) }).replace('{ago}', ago(p.created_at));
+    const blocked = !p.can_approve ? `<p class="ap-blocked"><span aria-hidden="true">⏳</span> ${esc(p.blocked_code && t('blk_' + p.blocked_code) !== 'blk_' + p.blocked_code ? t('blk_' + p.blocked_code) : (p.blocked_reason || t('ap_waiting')))}</p>` : '';
+    const approveBtn = p.can_approve ? `<button type="button" class="btn primary" data-act="approve">${esc(t('approve'))}</button>` : '';
+    const noBtn = p.can_withdraw ? `<button type="button" class="btn" data-act="withdraw">${esc(t('withdraw'))}</button>`
+      : (p.can_reject ?? can('approvals:decide')) ? `<button type="button" class="btn danger" data-act="reject">${esc(t('reject'))}</button>` : '';
+    return `<section class="approval${hi ? ' hi' : ''}" data-aid="${esc(p.approval_id)}" role="region" aria-labelledby="${id}-t">
+      <div class="ap-top">${tier}<span class="ap-src">${esc(p.specialist)} munshi</span></div>
+      ${p.still_waiting ? `<p class="ap-still">${esc(t('ap_still'))}</p>` : ''}
+      <h3 class="ap-title" id="${id}-t">${cardText(c.title_key, c.title_vars, c.title || p.summary)}</h3>
+      ${linesTable(c)}
+      ${c.effect ? `<p class="ap-effect">${cardText(c.effect_key, c.effect_vars, c.effect)}</p>` : ''}
+      ${(c.warnings || []).map(w => `<p class="ap-warn"><span aria-hidden="true">⚠</span><span>${cardText(w.key, w.vars, w.text)}</span></p>`).join('')}
+      ${facts ? `<div class="kv ap-facts">${facts}</div>` : ''}
+      ${c.quote ? `<div class="quote"><bdi>${esc(c.quote)}</bdi></div>` : ''}
+      <p class="ap-meta">${asked}${c.approver ? ` · ${cardText(c.approver.key, c.approver.vars, c.approver.text)}` : ''}</p>
+      ${blocked}
+      ${approveBtn || noBtn ? `<div class="ap-actions">${approveBtn}${noBtn}</div>` : ''}</section>`;
   }
   const CHIPS = { owner: ['Profit this month', 'Kaun kitna baqi hai?', 'Restock WH-MULTAN 100 urea received', 'Credit note Rana Brothers 5000 damaged bags', 'Pay Fauji 100000 by bank', 'Digest'],
     clerk: ['Chaudhry Farms ko 20 urea aur 5 dap bhej do', 'Suggest dispatch for today', 'Received 100 urea from Fauji at 3600', 'Chaudhry Farms paid 20000 jazzcash', 'Expense diesel 5000', 'Remind everyone over 30 days'],
@@ -324,7 +376,13 @@
       e.preventDefault(); const txt = $('#txt').value.trim(); if (!txt || state.chatBusy) return;
       $('#txt').value = ''; msgs.insertAdjacentHTML('beforeend', renderMsg({ role: 'me', text: txt })); scrollEnd();
       state.chatBusy = true; const thinking = document.createElement('div'); thinking.className = 'msg bot'; thinking.innerHTML = '<span class="who">manager</span>…'; msgs.appendChild(thinking);
-      try { const r = await post('/api/chat', { thread_id: state.thread, text: txt }); thinking.remove(); msgs.insertAdjacentHTML('beforeend', r.pending ? renderApproval(r.pending) : renderMsg({ role: 'munshi', text: r.text, meta: { specialist: r.specialist } })); }
+      try {
+        const r = await post('/api/chat', { thread_id: state.thread, text: txt }); thinking.remove();
+        // a message held behind an earlier card brings that card down to here, so it can be decided without scrolling
+        if (r.pending) $$(`[data-aid="${CSS.escape(r.pending.approval_id)}"]`, msgs).forEach(x => x.remove());
+        msgs.insertAdjacentHTML('beforeend', r.pending ? renderApproval(r.pending) : renderMsg({ role: 'munshi', text: r.text, meta: { specialist: r.specialist } }));
+        if (r.pending?.still_waiting) toast(t('ap_still_toast'));
+      }
       catch (err) { thinking.remove(); msgs.insertAdjacentHTML('beforeend', renderMsg({ role: 'munshi', text: '⚠ ' + err.message })); }
       state.chatBusy = false; scrollEnd(); refreshBadge();
     };
@@ -332,14 +390,28 @@
   };
   async function onApprovalClick(e) {
     const b = e.target.closest('[data-act]'); if (!b) return;
-    const box = b.closest('[data-aid]'); const aid = box.dataset.aid; const approve = b.dataset.act === 'approve';
+    const box = b.closest('[data-aid]'); const aid = box.dataset.aid; const act = b.dataset.act; const approve = act === 'approve';
+    const p = APPROVALS.get(aid) || {}; const c = p.card || {};
     const run = async note => {
       box.querySelectorAll('button').forEach(x => x.disabled = true);
-      try { const r = await post('/api/approvals/' + aid, { approve, note }); box.outerHTML = `<div class="msg bot"><span class="who">${esc(r.specialist)} munshi · ${approve ? esc(t('approved')) : esc(t('reject'))}</span>${esc(r.text.startsWith('Done -- ') ? (() => { try { return summarize(JSON.parse(r.text.slice(8))); } catch { return r.text.slice(8); } })() : r.text)}</div>`; toast(approve ? t('approved') : t('reject')); }
+      try {
+        const r = await post('/api/approvals/' + aid, { approve, note });
+        const label = approve ? t('approved') : act === 'withdraw' ? t('withdrawn') : t('rejected');
+        box.outerHTML = `<div class="msg bot"><span class="who">${esc(r.specialist)} munshi · ${esc(label)}</span>${esc(r.text.startsWith('Done -- ') ? (() => { try { return summarize(JSON.parse(r.text.slice(8))); } catch { return r.text.slice(8); } })() : r.text)}</div>`;
+        APPROVALS.delete(aid); toast(label);
+      }
       catch (err) { toast(err.message, 4000); box.querySelectorAll('button').forEach(x => x.disabled = false); }
       refreshBadge();
     };
-    if (approve) return run('');
+    if (approve && !ownerStep(p)) return run('');
+    if (approve) {   // an owner-level action is never one tap: restate what it does and how much, then a deliberate Yes
+      const title = cardText(c.title_key, c.title_vars, c.title || p.summary);
+      const amount = c.total !== null && c.total !== undefined && (c.lines || []).length ? `<p class="ap-sum">${esc(t('total'))}: ${money(c.total)}</p>` : '';
+      sheet(t('ap_confirm_title'), `<p class="ap-q">${fill(t('ap_confirm_q'), {}).replace('{title}', title)}</p>${amount}${c.effect ? `<p class="ap-effect">${cardText(c.effect_key, c.effect_vars, c.effect)}</p>` : ''}${(c.warnings || []).map(w => `<p class="ap-warn"><span aria-hidden="true">⚠</span><span>${cardText(w.key, w.vars, w.text)}</span></p>`).join('')}`,
+        async () => { await run(''); }, t('ap_confirm_yes'));
+      return;
+    }
+    if (act === 'withdraw') return confirmSheet(t('withdraw_title'), t('withdraw_q'), async () => { await run('withdrawn by the requester'); }, t('withdraw'));
     sheet(t('reject'), field(t('reason'), 'note', 'maxlength="200"'), async d => { await run(d.note || ''); }, t('reject'));
   }
   V.approvals = async () => {

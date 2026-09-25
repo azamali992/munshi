@@ -125,8 +125,10 @@ def test_manager_routes_every_domain(p):
              "Chaudhry Farms paid 5000": "hisaab", "expense diesel 2000": "hisaab", "credit note Rana Brothers 500 damaged": "hisaab",
              "restock WH-MULTAN 100 urea received": "godown", "transfer 20 urea WH-MULTAN WH-VEHARI": "godown", "broken promises": "wasooli",
              "cancel ORD-XXXXXXXX not needed": "order", "stops for DSP-XXXXXXXX": "delivery"}
-    for text, want in cases.items():
-        assert p.handle_message("m", "owner", text).specialist == want, text
+    # one thread per case: this pins the manager's routing, not what happens to a message sent while an
+    # earlier case's card is still waiting (a read-only question then goes to the Report munshi)
+    for i, (text, want) in enumerate(cases.items()):
+        assert p.handle_message(f"m{i}", "owner", text).specialist == want, text
 
 
 def test_big_order_escalates_to_owner(p):

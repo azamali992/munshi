@@ -85,8 +85,20 @@ class DepositIn(BaseModel):
     amount_counted: float = Field(ge=0)
 
 
-def _pending_out(c: Ctx, p: dict) -> dict:
-    return p | {"can_approve": role_may_approve(c.role, p["tool"]) and (c.role == "owner" or p["needs_role"] == "clerk")}
+def _pending_out(c: Ctx, pa, **extra) -> dict:
+    """A pending approval for THIS viewer. Every stored field and `summary` as before, plus:
+      card            the human-readable card (platform.CardBuilder)
+      can_approve     whether an Approve tap would be accepted -- the same check /api/approvals/{id}
+                      makes (platform.decision_refusal -> safety.risk.approval_refusal), so the requester
+                      never sees an Approve button that then 403s
+      blocked_reason  why not, in plain words (None when can_approve); blocked_code is its stable key
+      can_reject      may this viewer decide at all (reject / withdraw)
+      can_withdraw    the viewer asked for it and may take it back (a reject by the requester)"""
+    view = c.platform.viewer_decision(pa, c.role, c.who)
+    decide = c.principal.can("approvals:decide")
+    if not decide and view["can_approve"]:
+        view |= {"can_approve": False, "blocked_code": "not_approver", "blocked_reason": "Waiting for the office to approve."}
+    return c.platform.pending_out(pa) | view | {"can_reject": decide, "can_withdraw": decide and view["is_requester"]} | extra
 
 
 # ---------------------------------------------------------------- four-eyes for direct taps
@@ -139,10 +151,17 @@ def _confirm_needs(c: Ctx, o: Order) -> tuple[str, str]:
 @router.post("/chat")
 def chat(body: ChatIn, c: Ctx = Depends(context("chat"))):
     r = c.platform.handle_message(body.thread_id, c.role, body.text.strip(), user=c.who)
-    pend = None
+    return {"text": r.text, "specialist": r.specialist, "pending": _reply_card(c, r)}
+
+
+def _reply_card(c: Ctx, r) -> dict | None:
+    """The card to show under a chat reply: the one this turn raised, or -- when the message was held
+    behind an earlier card -- that card, marked still_waiting so it can be decided right there."""
     if r.pending:
-        pend = _pending_out(c, asdict(r.pending) | {"summary": r.pending.describe()})
-    return {"text": r.text, "specialist": r.specialist, "pending": pend}
+        return _pending_out(c, r.pending, still_waiting=False)
+    if r.waiting:
+        return _pending_out(c, r.waiting, still_waiting=True)
+    return None
 
 
 @router.get("/chat/{thread_id}")
@@ -152,7 +171,7 @@ def history(thread_id: str, c: Ctx = Depends(context("chat"))):
 
 @router.get("/approvals")
 def approvals(c: Ctx = Depends(context("approvals:read"))):
-    return [_pending_out(c, p) for p in c.platform.list_pending()]
+    return [_pending_out(c, pa) for pa in c.platform.pending_items()]
 
 
 @router.get("/approvals/history")
@@ -179,8 +198,10 @@ def read_notifications(c: Ctx = Depends(context("notifications"))):
 @router.get("/badge")
 def badge(c: Ctx = Depends(context("notifications"))):
     """One cheap call the app polls: pending approvals I can act on, unread notifications, my stops."""
-    pend = c.platform.list_pending() if c.principal.can("approvals:read") else []
-    out = {"approvals": len([p for p in pend if role_may_approve(c.role, p["tool"])]), "unread": len(c.repo.notifications(c.role, unread_only=True))}
+    # counts only cards this person could actually approve: a clerk's own request is not "waiting for them"
+    pend = c.platform.pending_items() if c.principal.can("approvals:decide") else []
+    mine = [pa for pa in pend if role_may_approve(c.role, pa.tool) and c.platform.decision_refusal(pa, c.role, c.who) is None]
+    out = {"approvals": len(mine), "unread": len(c.repo.notifications(c.role, unread_only=True))}
     if c.role == "driver":
         out["stops_pending"] = sum(1 for p in c.repo.list_plans(status="approved") for s in c.repo.list_stops(p.plan_id) if s.status == "pending")
     return out
@@ -343,5 +364,4 @@ async def voice(thread_id: str = "main", audio: UploadFile = File(...), c: Ctx =
                                                         language="ur" if os.environ.get("VOICE_LANG", "auto") == "ur" else None)
     text = tr.text.strip()
     r = c.platform.handle_message(thread_id, c.role, text, user=c.who)
-    return {"transcript": text, "text": r.text, "specialist": r.specialist,
-            "pending": _pending_out(c, asdict(r.pending) | {"summary": r.pending.describe()}) if r.pending else None}
+    return {"transcript": text, "text": r.text, "specialist": r.specialist, "pending": _reply_card(c, r)}
