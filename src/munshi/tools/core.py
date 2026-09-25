@@ -67,12 +67,19 @@ class MunshiTools:
     def list_vehicles(self) -> list[dict]:
         return [asdict(v) for v in self.repo.list_vehicles()]
 
+    @staticmethod
+    def _stop_view(s) -> dict:
+        """A stop as an agent may see it. The customer's delivery code is the customer's alone: an agent
+        tool result is shown to the model and echoed to whoever is chatting, and the driver has these
+        tools, so the code must never appear in it (the HTTP routes blank it for drivers the same way)."""
+        return asdict(s) | {"otp": None}
+
     def get_plan(self, plan_id: str) -> dict:
         p = self.repo.get_plan(plan_id)
-        return asdict(p) | {"stops": [asdict(s) for s in self.repo.list_stops(plan_id)]}
+        return asdict(p) | {"stops": [self._stop_view(s) for s in self.repo.list_stops(plan_id)]}
 
     def list_stops(self, plan_id: str) -> list[dict]:
-        return [asdict(s) | {"customer_name": self.repo.get_customer(s.customer_id).name} for s in self.repo.list_stops(plan_id)]
+        return [self._stop_view(s) | {"customer_name": self.repo.get_customer(s.customer_id).name} for s in self.repo.list_stops(plan_id)]
 
     def aging_report(self, limit: int = 30) -> list[dict]:
         return self.repo.aging()[:max(1, min(int(limit or 30), 200))]

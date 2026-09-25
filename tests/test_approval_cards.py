@@ -369,7 +369,9 @@ def test_a_read_only_question_while_a_card_waits_goes_to_the_report_munshi(p):
     audit = len(p.repo.audit_log(1000))
     for q in ("what is Chaudhry Farms balance?", "Chaudhry Farms ka khata kitna hai?", "dap kitna hai?", "top customers this month?"):
         r = p.handle_message("t", "clerk", q, user="Bilal Hussain")
-        assert r.specialist == "report" and r.pending is None and r.waiting is None, q
+        # answered by whichever munshi owns the question (a stock question is Godown's, not Report's) --
+        # never by the paused order munshi, never held behind the card, never a new card
+        assert r.specialist not in (None, "order") and r.pending is None and r.waiting is None, q
     assert order.calls == 0 and list(p.pending) == [first.pending.approval_id]
     assert len(p.repo.audit_log(1000)) == audit                 # nothing written
     # the paused order graph is intact: approving it still creates exactly the order on the card
