@@ -7,7 +7,9 @@ in code, against the message it answers, with the same deterministic layer the o
 (llm/resolve.py, llm/parse.py):
 
   WHO       the customer / supplier the MESSAGE names must resolve confidently (resolve.py's rule) to the
-            id in the arguments. Ambiguous -> ask which, naming the candidates; a different id -> ask which
+            id in the arguments (including the business's learned names, 'Bhatti sahab' -> C-007: the resolver
+            applies them for the rules and for this check alike, so a model call is accepted on a learned name in
+            exactly the cases the rules would card it). Ambiguous -> ask which, naming the candidates; a different id -> ask which
             of the two; two customers in one message -> ask for one at a time. A message that names nobody
             may lean on the conversation only through a pronoun or possessive ('isko', 'uska', 'their' --
             llm.followup.PRONOUN, the offline layer's own test) or through the ID the platform's topic memory

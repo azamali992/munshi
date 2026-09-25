@@ -204,6 +204,8 @@ def _stub(repo=None) -> StubToolCallingModel:
                    "baqi", "baaki", "udhaar", "udhar", "hisaab", "hisab", "outstanding", "owe", "owes", "pakka", "mansookh", "dikhao",
                    "بھیج", "بھیجو", "آرڈر", "کھاتہ", "حساب", "بیلنس", "باقی", "ادھار", "چاہیے", "منسوخ"), "route_to_order"),
         R(_rx(r"\b(dena|dene) hai|kitne paise"), "route_to_order"),
+        # the same order again ('same as last time', 'wahi dobara'): the order desk repeats a customer's last order (or asks)
+        R(contains("same as last time", "same again", "wahi dobara", "wohi dobara", "wahi phir se", "وہی دوبارہ"), "route_to_order"),
         R(_rx(r"\bko\s+\d|\d+\s*(bori|bag|bags|katte|katta|carton|peti|dozen)\b|\d+\s*(بوری|کٹے)"), "route_to_order"),
         R(_rx(r"^\W*(aur|and|or)\b.*\b(ka|ki|ke)\W*$"), "route_to_order"),                  # 'aur Haji Sons ka?'
         R(_rx(r"\bord-[a-z0-9]+"), "route_to_order"),                                      # 'ORD-... ka status kya hai'

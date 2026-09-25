@@ -254,14 +254,28 @@ class _Fixture:
         self.p.close()
 
 
+def _thread(rec: dict, label: str | None) -> str:
+    """The record's thread, or -- for multi-conversation records -- its named conversation ('d1', 'd2': another chat,
+    typically another day, of the same business)."""
+    return "g-" + rec["id"] + (f"-{label}" if label else "")
+
+
 def score_record(p, ctx: dict, rec: dict) -> dict:
-    """Play the record's context turns, then the message itself, and score what the platform did."""
-    thread = "g-" + rec["id"]
+    """Play the record's context turns, then the message itself, and score what the platform did.
+
+    Optional, for records about memory that outlives a conversation: a context turn or the record may name its
+    `thread` (a label: each label is a separate conversation of the same business) and its `user` (who is typing);
+    a context turn may name the `approver` of its card; a context step {"add_customer": {"id", "name"}} adds a
+    customer to the books at that point."""
+    thread = _thread(rec, rec.get("thread"))
     for c in rec["context"]:
-        r = p.handle_message(thread, c["role"], fill(c["text"], ctx))
+        if "add_customer" in c:
+            p.repo.upsert_customer(Customer(c["add_customer"]["id"], c["add_customer"]["name"], "", "standard", 300_000, "R-VEHARI"))
+            continue
+        r = p.handle_message(_thread(rec, c.get("thread")), c["role"], fill(c["text"], ctx), user=c.get("user", ""))
         txt = r.text
         if r.pending and c.get("approve") is not None:
-            txt = p.resolve(r.pending.approval_id, c["approve"], "owner").text
+            txt = p.resolve(r.pending.approval_id, c["approve"], "owner", user=c.get("approver", "")).text
         m = re.search(r"(ORD-[A-Z0-9]{8})", txt)
         if m:
             ctx["LAST_ORD"] = m.group(1)
@@ -271,7 +285,7 @@ def score_record(p, ctx: dict, rec: dict) -> dict:
     before = {(e, s): _thread_len(p, thread, rec["role"], s, e, specs) for e, specs in engines(p) for s in specs}
     t0 = time.monotonic()
     try:
-        reply = p.handle_message(thread, rec["role"], text)
+        reply = p.handle_message(thread, rec["role"], text, user=rec.get("user", ""))
         err = None
     except Exception as e:           # a crash is a failure, and an unsafe one only if it wrote
         reply, err = None, f"{type(e).__name__}: {e}"

@@ -26,7 +26,7 @@ from datetime import date, timedelta
 
 from munshi.domain.repository import MunshiRepository
 from munshi.llm import numbers as N
-from munshi.llm.resolve import Resolution, resolve_customer, resolve_supplier
+from munshi.llm.resolve import Resolution, learned, resolve_customer, resolve_supplier
 from munshi.llm.text import edit_distance, fold, is_urdu, words
 
 # ------------------------------------------------------------------ vocabulary (all folded before use)
@@ -109,6 +109,12 @@ def catalogue(repo: MunshiRepository) -> Catalogue:
             ws = tuple(t for t in words(k) if not t.isdigit() and t not in ("kg", "ml", "l", "m", "g"))
             if ws:
                 raw.setdefault(ws, set()).add(p.sku)
+    # names this business taught ('nali' -> DRIP-100): only a phrase no product's name, alias or spelling variant
+    # already uses -- a real name always wins over a learned one, and never becomes ambiguous because of it
+    for a in learned(repo, "product"):
+        ws = tuple(t for t in words(fold(a["phrase"])) if not t.isdigit())
+        if ws and ws not in raw and a["entity_id"] in units:
+            raw[ws] = {a["entity_id"]}
     phrases = {k: next(iter(v)) for k, v in raw.items() if len(v) == 1}
     singles = {k[0]: v for k, v in phrases.items() if len(k) == 1 and len(k[0]) >= 4 and k[0].isascii()}
     nouns = frozenset(k[0] for k in phrases)
@@ -608,14 +614,16 @@ def parse_items(text: str, repo: MunshiRepository) -> list[dict]:
     return [] if (ln.problems or ln.orphans) else [{"sku": x.sku, "qty": x.qty} for x in ln.lines]
 
 
-def customer_resolution(text: str, repo: MunshiRepository) -> Resolution:
+def customer_resolution(text: str, repo: MunshiRepository, memory: bool = True) -> Resolution:
+    """Who the message names, as a customer: by ID, phone or name, then the business's learned names
+    (resolve.with_memory). `memory=False` reads names only."""
     _, pr, ln = _prepared(text, repo)
-    return resolve_customer(pr.folded, repo, exclude=_exclusions(pr, ln), tokens=pr.tokens)
+    return resolve_customer(pr.folded, repo, exclude=_exclusions(pr, ln), tokens=pr.tokens, memory=memory)
 
 
-def supplier_resolution(text: str, repo: MunshiRepository) -> Resolution:
+def supplier_resolution(text: str, repo: MunshiRepository, memory: bool = True) -> Resolution:
     _, pr, ln = _prepared(text, repo)
-    return resolve_supplier(pr.folded, repo, exclude=_exclusions(pr, ln), tokens=pr.tokens)
+    return resolve_supplier(pr.folded, repo, exclude=_exclusions(pr, ln), tokens=pr.tokens, memory=memory)
 
 
 def parse_customer(text: str, repo: MunshiRepository) -> str | None:
