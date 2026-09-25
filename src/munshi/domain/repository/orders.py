@@ -32,12 +32,16 @@ class OrdersMixin(MasterDataMixin):
         if not r: raise NotFoundError(f"no such order: {order_id}")
         return self._order_from_row(r)
 
-    def list_orders(self, status: str | None = None, customer_id: str | None = None, limit: int = 100, day: str | None = None) -> list[Order]:
+    def list_orders(self, status: str | None = None, customer_id: str | None = None, limit: int = 100, day: str | None = None,
+                    since: str | None = None) -> list[Order]:
+        """Newest first. `day` (one date) and `since` (that date onwards) are Pakistan business days (YYYY-MM-DD),
+        compared with the business date of the stored UTC created_at, never its UTC date prefix."""
         q, a = "SELECT * FROM orders", []
         conds = []
         if status: conds.append("status=?"); a.append(status)
         if customer_id: conds.append("customer_id=?"); a.append(customer_id)
         if day: conds.append(f"{sql_business_date('created_at')}=?"); a.append(day)
+        if since: conds.append(f"{sql_business_date('created_at')}>=?"); a.append(since)
         if conds: q += " WHERE " + " AND ".join(conds)
         q += " ORDER BY created_at DESC, rowid DESC LIMIT ?"; a.append(limit)
         return [self._order_from_row(r) for r in self._all(q, tuple(a))]

@@ -57,10 +57,9 @@ class ReportsMixin(CollectionsMixin):
         }
 
     def _orders_on(self, day: str, limit: int = 500) -> list[Order]:
-        """Orders booked on a Pakistan business day. (OrdersMixin.list_orders(day=...)
-        filters on the UTC date prefix, which is a day behind between 00:00 and 05:00 PKT.)"""
-        rows = self._all("SELECT * FROM orders WHERE " + sql_business_date("created_at") + "=? ORDER BY created_at DESC, rowid DESC LIMIT ?", (day, limit))
-        return [self._order_from_row(r) for r in rows]
+        """Orders booked on a Pakistan business day (all statuses; the digest splits out the cancelled ones).
+        The same business-day filter as the orders list tool, so "aaj ke orders" and the digest agree."""
+        return self.list_orders(day=day, limit=limit)
 
     def _credit_notes(self, start: str, end: str) -> list:
         """Credit notes POSTED in [start, end] (Pakistan business day of the posting, not of any invoice they
