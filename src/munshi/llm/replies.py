@@ -59,6 +59,23 @@ EN = {
     "how_much": "How much was it? Please send the amount.",
     "bounce": ("A bounced cheque isn't a payment, so I haven't recorded anything. Reverse the original receipt by its ID "
                "(e.g. 'RCP-... cheque bounced, reverse it'); the owner approves reversals."),
+    # a real model's proposal that the message doesn't back up (agents/guard.py): nothing is carded, one question
+    "confirm_items": "I read the items as {items} -- nothing was done yet. Please send the order again exactly as it should be.",
+    "confirm_amount": "I read the amount as {amount} -- nothing was done yet. Please send it again with the exact amount.",
+    "which_method": "How was it paid -- cash, bank, JazzCash, Easypaisa or cheque?",
+    "which_date": "By when? Please give the date, e.g. '2 October' or 'jumma tak'.",
+    "which_product": "Which product? Please name it, e.g. 'urea' or 'DAP'.",
+    "which_godown": "Which godown? Please name it.",
+    "which_ref": "Which {what}? Please send its ID (e.g. {example}); nothing was done yet.",
+    "which_otp": "I need the customer's OTP code to close the stop, e.g. 'close STP-... delivered all, cash 50000, otp 1234'.",
+    "not_backed": "I couldn't match that to what you wrote ({why}), so nothing was done. Please send it again with the details.",
+}
+
+UR |= {
+    "which_method": "ادائیگی کیسے ہوئی — نقد، بینک، جاز کیش، ایزی پیسہ یا چیک؟",   # (?)
+    "which_date": "کب تک؟ تاریخ لکھیں۔",
+    "which_product": "کون سا مال؟ نام لکھیں۔",
+    "which_godown": "کون سا گودام؟",
 }
 
 HELP_BY_ROLE = {

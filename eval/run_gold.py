@@ -62,6 +62,29 @@ WRITE_TOOLS = {n for n, t in RISK_REGISTRY.items() if t != RiskTier.READ_ONLY}
 # The help desk answers greetings, refusals and "didn't understand" with no tools at all:
 # for routing it is the same outcome as the manager routing nowhere.
 NO_SPECIALIST = {None, "help"}
+LOOKUPS = {"find_customer", "find_supplier", "search_products"}
+_URDU = re.compile(r"[\u0600-\u06FF]")
+
+
+def with_defaults(call: dict | None) -> dict | None:
+    """The call as it runs: arguments left out take the tool's defaults (a model may omit method='cash'; the
+    offline rules always pass it). Scoring the literal arguments would call an identical action wrong."""
+    if not call:
+        return call
+    import inspect
+
+    from munshi.tools.core import MunshiTools
+    fn = getattr(MunshiTools, call["name"], None)
+    if fn is None:
+        return call
+    defaults = {n: prm.default for n, prm in inspect.signature(fn).parameters.items()
+                if prm.default is not inspect.Parameter.empty and n != "self"}
+    return {"name": call["name"], "args": defaults | dict(call["args"] or {})}
+
+
+def script_mismatch(text: str, reply: str) -> bool:
+    """Roman/English in, Urdu script out (or the reverse): the reply isn't in the user's script."""
+    return bool(_URDU.search(text)) != bool(_URDU.search(reply or ""))
 
 
 def next_friday() -> str:
@@ -113,27 +136,46 @@ def agent_writes(p) -> int:
     return sum(1 for a in p.repo.audit_log(5000) if a["actor"] in AGENT_ACTORS)
 
 
-def _thread_len(p, thread, role, specialist) -> int:
+def engines(p) -> list[tuple[str, dict]]:
+    """(engine, specialists) for each engine the platform runs: the rules, and the model when one is configured."""
+    return [("rules", p.specialists)] + ([("model", p.llm_specialists)] if getattr(p, "llm_specialists", None) else [])
+
+
+def _cfg(p, thread, role, specialist, engine):
+    return p._cfg(thread, role, specialist, engine) if engine != "rules" else p._cfg(thread, role, specialist)
+
+
+def _thread_len(p, thread, role, specialist, engine: str = "rules", specs: dict | None = None) -> int:
     try:
-        return len(p.specialists[specialist].agent.get_state(p._cfg(thread, role, specialist)).values.get("messages", []))
+        specs = specs if specs is not None else p.specialists
+        return len(specs[specialist].agent.get_state(_cfg(p, thread, role, specialist, engine)).values.get("messages", []))
     except Exception:
         return 0
 
 
-def turn_tool_calls(p, thread, role, specialist, before: dict[str, int]) -> list[dict]:
-    """Tool calls the specialist emitted during the scored turn only (a turn the platform answered without
-    running the specialist -- e.g. 'an action is waiting for approval' -- has none)."""
-    if not specialist or specialist not in p.specialists:
+def _new_messages(p, thread, role, specialist, before: dict, engine: str) -> list:
+    specs = dict(engines(p)).get(engine) or {}
+    if not specialist or specialist not in specs:
         return []
-    msgs = p.specialists[specialist].agent.get_state(p._cfg(thread, role, specialist)).values.get("messages", [])
-    new = msgs[before.get(specialist, 0):]
-    if not any(isinstance(m, HumanMessage) for m in new):
-        return []
+    msgs = specs[specialist].agent.get_state(_cfg(p, thread, role, specialist, engine)).values.get("messages", [])
+    new = msgs[before.get((engine, specialist), 0):]
+    return new if any(isinstance(m, HumanMessage) for m in new) else []
+
+
+def turn_tool_calls(p, thread, role, specialist, before: dict, engine: str = "rules") -> list[dict]:
+    """Tool calls the specialist emitted during the scored turn only, on the engine that answered (a turn the
+    platform answered without running the specialist -- e.g. 'an action is waiting for approval' -- has none)."""
     calls = []
-    for m in new:
+    for m in _new_messages(p, thread, role, specialist, before, engine):
         if isinstance(m, AIMessage):
             calls += [{"name": c["name"], "args": c["args"]} for c in m.tool_calls]
     return calls
+
+
+def guard_refusals(p, thread, role, specialist, before: dict) -> list[dict]:
+    """Model tool calls the entity guard refused this turn (agents/guard.py)."""
+    from munshi.agents.guard import guard_refusal
+    return [g for m in _new_messages(p, thread, role, specialist, before, "model") if (g := guard_refusal(m))]
 
 
 def items_key(items):
@@ -212,7 +254,7 @@ def score_record(p, ctx: dict, rec: dict) -> dict:
     exp = fill(rec["expect"], ctx)
     text = fill(rec["text"], ctx)
     w0 = agent_writes(p)
-    before = {s: _thread_len(p, thread, rec["role"], s) for s in p.specialists}
+    before = {(e, s): _thread_len(p, thread, rec["role"], s, e, specs) for e, specs in engines(p) for s in specs}
     t0 = time.monotonic()
     try:
         reply = p.handle_message(thread, rec["role"], text)
@@ -222,9 +264,14 @@ def score_record(p, ctx: dict, rec: dict) -> dict:
     lat = (time.monotonic() - t0) * 1000
     executed = agent_writes(p) - w0
     spec = reply.specialist if reply else None
-    calls = turn_tool_calls(p, thread, rec["role"], spec, before) if reply else []
+    engine = getattr(reply, "engine", "rules") if reply else "rules"
+    calls = turn_tool_calls(p, thread, rec["role"], spec, before, engine) if reply else []
+    refused = guard_refusals(p, thread, rec["role"], spec, before) if reply and engine == "model" else []
     pending = reply.pending if reply else None
-    primary = {"name": pending.tool, "args": pending.args} if pending else (calls[0] if calls else None)
+    # the action is the card, else the first call that isn't a name lookup: a model looks the customer up
+    # (find_customer) before it acts, and scoring the lookup would call every correct model read wrong
+    acts = [c for c in calls if c["name"] not in LOOKUPS]
+    primary = with_defaults({"name": pending.tool, "args": pending.args} if pending else (acts[0] if acts else (calls[0] if calls else None)))
 
     r_ok = routing_ok(exp["specialist"], spec)
     want_tools = exp["tool"] if isinstance(exp["tool"], list) else ([exp["tool"]] if exp["tool"] else [])
@@ -249,7 +296,13 @@ def score_record(p, ctx: dict, rec: dict) -> dict:
             "got_args": primary["args"] if primary else None, "pending": bool(pending), "executed_writes": executed,
             "routing_ok": r_ok, "tool_ok": tool_ok, "args_ok": args_ok, "arg_errs": arg_errs, "correct": correct,
             "unsafe": unsafe, "wrong_entity_read": wrong_read, "error": err, "reply": (reply.text if reply else "")[:200],
-            "latency_ms": round(lat, 1)}
+            "latency_ms": round(lat, 1), "engine": engine, "model_calls": getattr(reply, "model_calls", 0) if reply else 0,
+            "model_tokens": getattr(reply, "model_tokens", 0) if reply else 0,
+            "model_error": getattr(reply, "model_error", None) if reply else None,
+            "reached_model": bool(reply) and (getattr(reply, "model_calls", 0) > 0 or bool(getattr(reply, "model_error", None))),
+            "guard_refused": [f"{g['tool']}({json.dumps(g['args'], ensure_ascii=False, default=str)[:120]})" for g in refused],
+            "claim_blocked": bool(reply) and reply.text.startswith(("Nothing was recorded", "کچھ درج نہیں ہوا")),
+            "script_mismatch": bool(reply) and engine == "model" and script_mismatch(text, reply.text)}
 
 
 def run(corpus: Path, fresh: bool = False) -> tuple[list[dict], float]:
@@ -314,6 +367,17 @@ def score(rows, elapsed) -> dict:
         "wrong_entity_reads": sum(r["wrong_entity_read"] for r in rows),
         "crashes": sum(1 for r in rows if r["error"]),
         "p50_latency_ms": sorted(r["latency_ms"] for r in rows)[n // 2] if rows else None,
+        "p95_latency_ms": sorted(r["latency_ms"] for r in rows)[min(n - 1, int(n * 0.95))] if rows else None,
+        # cost / latency visibility for the hybrid: how many messages the rules couldn't read and the model saw
+        "reached_model": sum(r.get("reached_model", False) for r in rows),
+        "answered_by_model": sum(r.get("engine") == "model" for r in rows),
+        "model_calls": sum(r.get("model_calls", 0) for r in rows),
+        "model_tokens": sum(r.get("model_tokens", 0) for r in rows),
+        "model_errors": sum(1 for r in rows if r.get("model_error")),
+        "guard_refusals": sum(len(r.get("guard_refused") or []) for r in rows),
+        "claims_blocked": sum(bool(r.get("claim_blocked")) for r in rows),
+        "model_script_mismatch": sum(bool(r.get("script_mismatch")) for r in rows),
+        "model_turn_p50_latency_ms": (lambda xs: xs[len(xs) // 2] if xs else None)(sorted(r["latency_ms"] for r in rows if r.get("reached_model"))),
     }
     by = defaultdict(lambda: [0, 0])
     for r in rows:
@@ -347,6 +411,13 @@ def print_report(name: str, s: dict, rows: list[dict], verbose: bool = True) -> 
     for r in rows:
         if r["wrong_entity_read"]:
             print(f"    {r['id']} {r['text'][:60]!r} -> {r['got_tool']} {r['got_args']}")
+    print("\n  REACHED THE MODEL (the rules didn't understand):")
+    for r in rows:
+        if r.get("reached_model"):
+            print(f"    {r['id']} [{r['role']}] {r['text'][:60]!r} -> {r['engine']} {r['got_specialist']}/{r['got_tool']} calls={r['model_calls']} "
+                  f"{r['latency_ms']:.0f}ms ok={r['correct']}" + (f" ERROR={r['model_error']}" if r.get("model_error") else "")
+                  + (f" GUARD-REFUSED={r['guard_refused']}" if r.get("guard_refused") else "") + (" CLAIM-BLOCKED" if r.get("claim_blocked") else "")
+                  + (" SCRIPT-MISMATCH" if r.get("script_mismatch") else "") + f" | {r['reply'][:80]!r}")
     print("\n  OTHER FAILURES (safe):")
     for r in rows:
         if not r["correct"] and not r["unsafe"] and not r["wrong_entity_read"]:

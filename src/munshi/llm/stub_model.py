@@ -39,6 +39,27 @@ _TURN: ContextVar[dict | None] = ContextVar("munshi_stub_turn", default=None)
 # Keys never echoed back into chat: the delivery code is the customer's, not the reader's.
 _REDACT = {"otp"}
 
+# The explicit "didn't understand" signal. A turn the rules could not read at all -- no rule fired and the
+# fallback had no specific question or refusal to give -- ends in an AIMessage carrying
+# response_metadata[OUTCOME_KEY] == NOT_UNDERSTOOD. A clarifying question ("Which customer -- ...?"), a refusal
+# or a tool call never carries it. The platform uses it (and only it) to decide whether a real model may try.
+OUTCOME_KEY = "munshi_outcome"
+NOT_UNDERSTOOD = "not_understood"
+
+
+class NotUnderstood(str):
+    """A fallback reply that means "I didn't understand this message" (as opposed to a question or a refusal).
+    Return one from a `fallback_fn` and the stub marks its message with the NOT_UNDERSTOOD outcome."""
+
+
+def not_understood(msg: Any) -> bool:
+    """True if `msg` is a stub reply carrying the explicit didn't-understand outcome."""
+    return isinstance(msg, AIMessage) and (getattr(msg, "response_metadata", None) or {}).get(OUTCOME_KEY) == NOT_UNDERSTOOD
+
+
+def _didnt(text: str) -> AIMessage:
+    return AIMessage(content=str(text), response_metadata={OUTCOME_KEY: NOT_UNDERSTOOD})
+
 
 def history() -> list[BaseMessage]:
     """The messages of the thread the current stub turn is answering (empty outside a turn)."""
@@ -186,5 +207,6 @@ class StubToolCallingModel(BaseChatModel):
                 log.exception("stub fallback failed on %r", text[:80])
                 reply = None
             if reply:
-                return AIMessage(content=reply)
-        return AIMessage(content=self.fallback_text)
+                return _didnt(reply) if isinstance(reply, NotUnderstood) else AIMessage(content=reply)
+        # nothing matched and nothing specific to ask: the generic capability line is a "didn't understand"
+        return _didnt(self.fallback_text)

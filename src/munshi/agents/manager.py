@@ -23,7 +23,7 @@ from typing import Literal
 
 from langchain.agents import create_agent
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 
 from munshi.llm.numbers import UNIT_WORDS, normalize_numbers
@@ -175,18 +175,44 @@ def _stub() -> StubToolCallingModel:
     ], fallback_text=CLARIFY)
 
 
+_MODEL_MANAGER_PROMPT = ("You are the Manager at a distribution business in Pakistan. Messages come in Urdu script, Roman Urdu or English, "
+                         "often with customer, supplier and product names. Read the message and call exactly one route_to_* tool for the munshi "
+                         "who handles it. Never do the work yourself. If it is small talk or not about the business, call no tool. "
+                         "Customers buy from us; suppliers sell to us (a note may say which a name is -- trust it). A customer's account, khata or "
+                         "balance, or money a customer paid us, is hisaab (or order for an order); an order for goods is order; what we owe or pay a "
+                         "supplier, or goods a supplier delivered, is khareed; reminders, overdue lists and promises to pay are wasooli; totals, sales, "
+                         "profit and rankings over a period are report.")
+
+
+class _ModelRouter:
+    """A real model's routing in ONE request: bind the route tools, read the first route it calls. (An agent loop
+    would spend a second request just to acknowledge the route.) Same invoke/result shape as the agent."""
+
+    def __init__(self, model: BaseChatModel) -> None:
+        self.model = model.bind_tools(_ROUTES)
+        self.routes = {t.name: t for t in _ROUTES}
+
+    def invoke(self, inputs: dict, config: dict | None = None) -> dict:
+        msg = self.model.invoke([SystemMessage(_MODEL_MANAGER_PROMPT), *inputs["messages"]], config=config)
+        out = [*inputs["messages"], msg]
+        for tc in getattr(msg, "tool_calls", None) or []:
+            if tc["name"] in self.routes:
+                out.append(ToolMessage(self.routes[tc["name"]].invoke({}), tool_call_id=tc["id"] or tc["name"], name=tc["name"]))
+                break
+        return {"messages": out}
+
+
 def build_manager(model: BaseChatModel | None = None):
     # The stub can also send to the help desk; a real model gets the seven business routes and,
     # when it routes nowhere, the platform asks which area the message is about.
     if model is None:
         return create_agent(_stub(), tools=_STUB_ROUTES, state_schema=MunshiState,
                             system_prompt="You are the Manager at a distribution business. Read the message and call exactly one route_to_* tool for the munshi who handles it. Never do the work yourself.")
-    return create_agent(model, tools=_ROUTES, state_schema=MunshiState,
-                        system_prompt="You are the Manager at a distribution business. Read the message and call exactly one route_to_* tool for the munshi who handles it. Never do the work yourself.")
+    return _ModelRouter(model)
 
 
-def classify(manager, text: str, role: str = "clerk") -> Specialist | None:
-    result = manager.invoke({"messages": [HumanMessage(text)], "role": role})
+def classify(manager, text: str, role: str = "clerk", config: dict | None = None, context: list | None = None) -> Specialist | None:
+    result = manager.invoke({"messages": [*(context or []), HumanMessage(text)], "role": role}, config=config)
     for m in result["messages"]:
         if isinstance(m, ToolMessage) and isinstance(m.content, str) and m.content.startswith("ROUTE:"):
             return m.content.split(":", 1)[1]  # type: ignore[return-value]

@@ -188,7 +188,9 @@ class ScriptedModel(BaseChatModel):
 
 
 def _scripted(p, plan):
-    p.specialists["order"] = build_order_munshi(p.ops, p.repo, ScriptedModel(plan=plan, calls_seen=[]))
+    # guarded=False: these tests drive the approval gate itself with arbitrary scripted calls; the entity guard
+    # that sits in front of it for a real model is tested in test_hybrid.py
+    p.specialists["order"] = build_order_munshi(p.ops, p.repo, ScriptedModel(plan=plan, calls_seen=[]), guarded=False)
     return p
 
 
