@@ -7,6 +7,9 @@
   Whisper endpoint. The platform still answers every message it can with the
   deterministic language layer first; the model only sees what that layer
   didn't understand (see platform.MunshiPlatform).
+- LLM_PROVIDER=gemini: Google Gemini via langchain-google-genai. Needs GOOGLE_API_KEY
+  (Google AI Studio). Default model gemini-flash-latest; gemini-3.5-flash-lite is faster.
+  Same hybrid: the model only sees what the deterministic layer didn't understand.
 
 Request limits (env, all optional):
   LLM_TIMEOUT_S         per-request timeout in seconds (default 30)
@@ -21,6 +24,7 @@ import os
 from langchain_core.language_models.chat_models import BaseChatModel
 
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
+DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
 
 
 def _float_env(name: str, default: float) -> float:
@@ -58,4 +62,12 @@ def build_chat_model(provider: str | None = None) -> BaseChatModel | None:
         effort = os.environ.get("LLM_REASONING_EFFORT", "low" if model.startswith("openai/gpt-oss") else "none").strip().lower()
         extra = {"reasoning_effort": effort} if effort and effort != "none" else {}
         return ChatGroq(model=model, api_key=key, temperature=0, request_timeout=lim["timeout_s"], max_retries=lim["max_retries"], **extra)
+    if provider == "gemini":
+        key = os.environ.get("GOOGLE_API_KEY")
+        if not key:
+            raise ValueError("LLM_PROVIDER=gemini needs GOOGLE_API_KEY (Google AI Studio: https://aistudio.google.com/apikey). See .env.example.")
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        lim = request_limits()
+        return ChatGoogleGenerativeAI(model=os.environ.get("LLM_MODEL", DEFAULT_GEMINI_MODEL), google_api_key=key, temperature=0,
+                                      timeout=lim["timeout_s"], max_retries=lim["max_retries"])
     raise ValueError(f"unknown LLM_PROVIDER {provider!r}")

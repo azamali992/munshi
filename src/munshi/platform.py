@@ -915,7 +915,8 @@ class MunshiPlatform:
     def _final_text(self, result: dict) -> str:
         msgs = result["messages"]
         msg = msgs[-1]
-        content = msg.content if isinstance(msg.content, str) else str(msg.content)
+        # Gemini (and other providers) return a list of content parts; .text joins the text parts in order
+        content = msg.content if isinstance(msg.content, str) else str(msg.text)
         # the offline model's one-line summary of a tool result ("Done -- {json}"): a sentence, with the raw result folded after it
         if isinstance(msg, AIMessage) and content.startswith("Done -- ") and len(msgs) >= 2 and isinstance(msgs[-2], ToolMessage):
             nice = self._readable(msgs, len(msgs) - 2)
@@ -1602,8 +1603,8 @@ class MunshiPlatform:
         ask = ask_of(msgs[-1]) if msgs else None
         named = customer_resolution(text, self.repo).status != "none" or supplier_resolution(text, self.repo).status != "none"
         reply = Reply(txt, specialist, None, thread_id, waiting=pa)
-        if named and msgs and isinstance(msgs[-1], AIMessage) and not not_understood(msgs[-1]) and str(msgs[-1].content).strip():
-            reply.text = f"{txt}\n\nYour new message: {msgs[-1].content}"
+        if named and msgs and isinstance(msgs[-1], AIMessage) and not not_understood(msgs[-1]) and str(msgs[-1].text).strip():
+            reply.text = f"{txt}\n\nYour new message: {msgs[-1].text}"
             reply.ask = ask
         tr.response_text = reply.text
         return reply, {"specialist": specialist, "waiting_on": pa.approval_id}, True

@@ -392,6 +392,27 @@ def test_an_urdu_script_tail_is_dropped_from_a_reply_to_roman_urdu(repo):
     assert r.text == "Bhatti sahab ka khata 58,000 hai."
 
 
+def test_a_reply_in_content_parts_is_shown_as_plain_text(repo):
+    """Observed on Gemini: the reply arrives as a list of content parts and was shown to the user raw,
+    "[{'type': 'text', 'text': 'Bhai, kaunsi cheez ...'}]"."""
+    text = "Bhatti sahab ka account dekhna hai zara"
+
+    class Parts(FakeChat):
+        def _generate(self, messages, stop=None, run_manager=None, **kw):
+            out = super()._generate(messages, stop, run_manager, **kw)
+            msg = out.generations[0].message
+            if not msg.tool_calls and isinstance(msg.content, str) and msg.content:
+                out.generations[0].message = AIMessage(content=[{"type": "text", "text": msg.content}])
+            return out
+
+    fake = Parts(routes={text: "hisaab"}, final={text: "Bhai, Bhatti Kisan Store ka khata Rs 58,000 hai."}, requests=[])
+    p = MunshiPlatform(repo, model=fake)
+    p.manager = _NoRoute()
+    r = p.handle_message("t", "clerk", text)
+    assert r.text == "Bhai, Bhatti Kisan Store ka khata Rs 58,000 hai."
+    assert "'type'" not in r.text and not r.text.startswith("[")
+
+
 def test_the_model_is_handed_what_code_read(repo):
     from munshi.agents.guard import hints
     assert hints("Malik Seeds ka maal: makai aath", repo) == "Code read this message as: customer Malik Seeds = C-012; items 8 x SEED-MAIZE."
