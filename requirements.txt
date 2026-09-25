@@ -4,6 +4,7 @@ langgraph>=1.2,<2
 langgraph-checkpoint-sqlite>=3.0
 langchain-groq>=1.1,<2
 groq>=0.37
+langchain-google-genai>=4.4,<5
 fastapi>=0.120
 uvicorn[standard]>=0.40
 pydantic>=2.10
