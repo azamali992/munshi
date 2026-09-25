@@ -44,6 +44,7 @@ RISK_REGISTRY: dict[str, RiskTier] = {
     "top_customers": RiskTier.READ_ONLY,
     # order desk
     "create_order": RiskTier.LOW_RISK,
+    "update_order": RiskTier.LOW_RISK,      # edit a DRAFT's lines: what create_order asks for, asked again -- same tier
     "confirm_order": RiskTier.LOW_RISK,
     "cancel_order": RiskTier.LOW_RISK,
     # godown

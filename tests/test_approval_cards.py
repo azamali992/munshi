@@ -353,12 +353,19 @@ class _Spy:
 
 def test_a_write_while_a_card_waits_returns_that_card_and_leaves_the_graph_alone(p):
     first = p.handle_message("t", "clerk", "Chaudhry Farms ko 20 urea aur 5 dap bhej do", user="Bilal Hussain")
-    spy = p.specialists["order"].agent = _Spy(p.specialists["order"].agent)
-    r = p.handle_message("t", "clerk", "Rana Brothers ko 3 zinc bhej do", user="Bilal Hussain")
+    main = p._cfg("t", "clerk", "order")
+    before = p.specialists["order"].agent.get_state(main)
+    # a message that can't stand on its own is held behind the card; the paused graph is never invoked
+    r = p.handle_message("t", "clerk", "ok confirm the order", user="Bilal Hussain")
     assert r.pending is None and r.waiting is not None and r.waiting.approval_id == first.pending.approval_id
     assert r.text.startswith("Still waiting for approval: Create order for Chaudhry Farms, Rs 108,250 — another clerk or the owner needs to approve")
-    assert spy.calls == 0 and list(p.pending) == [first.pending.approval_id]
-    # the held message didn't disturb the card: it still approves and does what it said
+    # an independent order gets its own card on its own graph lane -- still never through the paused graph
+    other = p.handle_message("t", "clerk", "Rana Brothers ko 3 zinc bhej do", user="Bilal Hussain")
+    assert other.pending is not None and other.pending.args["customer_id"] == "C-005"
+    after = p.specialists["order"].agent.get_state(main)
+    assert after.values["messages"] == before.values["messages"] and after.interrupts
+    assert sorted(p.pending) == sorted([first.pending.approval_id, other.pending.approval_id])
+    # the held messages didn't disturb the card: it still approves and does exactly what it said
     n = len(p.repo.list_orders())
     p.resolve(first.pending.approval_id, True, "owner", user="Sultan Ahmed")
     assert len(p.repo.list_orders()) == n + 1 and p.repo.list_orders()[0].total == 108250.0
@@ -380,17 +387,19 @@ def test_a_read_only_question_while_a_card_waits_goes_to_the_report_munshi(p):
     assert p.repo.list_orders()[0].customer_id == "C-002"
 
 
-@pytest.mark.parametrize("text", ["yes confirm it", "cancel that and book 5 dap", "Rana Brothers ko 3 zinc bhej do", "ok confirm the order"])
-def test_anything_that_might_be_a_write_stays_held(p, text):
+@pytest.mark.parametrize("text", ["yes confirm it", "cancel that and book 5 dap", "ok confirm the order", "Chaudhry Farms ko 20 urea bhej do"])
+def test_anything_that_cant_stand_on_its_own_stays_held(p, text):
     p.handle_message("t", "clerk", "Chaudhry Farms ko 20 urea bhej do", user="Bilal Hussain")
     r = p.handle_message("t", "clerk", text, user="Bilal Hussain")
-    assert r.waiting is not None and r.specialist == "order"
+    assert r.waiting is not None and r.specialist == "order" and r.pending is None
 
 
-def test_a_salesman_has_no_report_munshi_so_his_question_stays_held_with_the_card(p):
-    p.handle_message("s", "salesman", "Rana Brothers ko 5 dap bhej do", user="Imran Khan")
+def test_a_salesmans_question_while_his_card_waits_is_answered_and_the_card_stays(p):
+    # (was: held behind his own card, and told to approve it -- which a salesman can't)
+    first = p.handle_message("s", "salesman", "Rana Brothers ko 5 dap bhej do", user="Imran Khan")
     r = p.handle_message("s", "salesman", "Rana Brothers ka balance kitna hai?", user="Imran Khan")
-    assert r.waiting is not None and r.waiting.tool == "create_order"
+    assert r.pending is None and r.tool == "get_customer_khata" and "Rana Brothers" in r.text
+    assert list(p.pending) == [first.pending.approval_id]
 
 
 # ================================================================== over HTTP: the viewer's buttons
@@ -457,7 +466,7 @@ def test_salesman_sees_waiting_for_the_office(api):
 def test_http_reply_while_a_card_waits_carries_the_card(api):
     c, h = api
     first = c.post("/api/chat", json={"thread_id": "t", "text": "Chaudhry Farms ko 20 urea bhej do"}, headers=h["clerk"]).json()["pending"]
-    r = c.post("/api/chat", json={"thread_id": "t", "text": "Rana Brothers ko 3 zinc bhej do"}, headers=h["clerk"]).json()
+    r = c.post("/api/chat", json={"thread_id": "t", "text": "ok confirm the order"}, headers=h["clerk"]).json()
     assert r["pending"]["approval_id"] == first["approval_id"] and r["pending"]["still_waiting"] is True
     assert r["pending"]["card"]["title"] == "Create order for Chaudhry Farms" and r["pending"]["can_approve"] is False
     assert "Still waiting for approval" in r["text"]

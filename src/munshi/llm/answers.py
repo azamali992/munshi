@@ -67,6 +67,8 @@ class _Ctx:
     def __init__(self, repo, text: str, args: dict) -> None:
         self.repo, self.text, self.args = repo, text or "", dict(args or {})
         self.lang = lang_of(self.text)
+        # 'for all the products?', 'sab dikhao', 'puri list': the whole list, never cut to the top few
+        self.all = bool(re.search(r"\b(all|sab|sabhi|saare|sare|saari|sari|tamam|puri|poori|pura|poora|full|complete|every|mukammal)\b|سب|تمام|پوری", fold(self.text)))
 
     def t(self, en: str, ru: str | None = None, ur: str | None = None, **kw) -> str:
         s = {"en": en, "ru": ru or en, "ur": ur or en}[self.lang]
@@ -114,9 +116,10 @@ class _Ctx:
         return "; ".join(p for p in parts if p)
 
 
-def _listing(c: _Ctx, rows: list, fmt: Callable[[Any], str]) -> str:
-    shown = [fmt(r) for r in rows[:TOP]]
-    return c.join(shown) + (c.more(len(rows) - TOP) if len(rows) > TOP else ".")
+def _listing(c: _Ctx, rows: list, fmt: Callable[[Any], str], top: int | None = None) -> str:
+    top = len(rows) if c.all else (top or TOP)
+    shown = [fmt(r) for r in rows[:top]]
+    return c.join(shown) + (c.more(len(rows) - top) if len(rows) > top else ".")
 
 
 # ------------------------------------------------------------------ reads
@@ -124,10 +127,19 @@ def _stock(d, c: _Ctx) -> str:
     rows = [r for r in d or [] if isinstance(r, dict)]
     if not rows:
         return c.t("No stock is recorded yet.", "Abhi koi stock darj nahi.", "ابھی کوئی اسٹاک درج نہیں۔")
+    # 'aur vehari mei?' / 'sirf vehari ka': only the godown the question names
+    try:
+        from munshi.llm.parse import warehouses_in
+        named = warehouses_in(c.text, c.repo) if c.text else []
+    except Exception:
+        named = []
+    if len(named) == 1 and any(r.get("warehouse_id") == named[0] for r in rows):
+        rows = [r for r in rows if r.get("warehouse_id") == named[0]]
     by: dict[str, list] = {}
     for r in rows:
         by.setdefault(r.get("sku"), []).append(r)
     many_godowns = len({r.get("warehouse_id") for r in rows}) > 1
+    only = c.godown(named[0]) if len(named) == 1 and not many_godowns else ""
 
     def one(sku, levels):
         total = sum(int(x.get("available") or 0) for x in levels)
@@ -137,10 +149,17 @@ def _stock(d, c: _Ctx) -> str:
             where = "" if where == " ()" else where
         reserved = sum(int(x.get("reserved") or 0) for x in levels)
         res = c.t(", {r} reserved", ", {r} reserved", "، {r} ریزرو", r=_n(reserved)) if reserved else ""
-        return f"{c.product(sku)}: {_n(total)}" + c.t(" available", " available", " دستیاب") + res + where
+        low = ""
+        try:
+            p = c.repo.get_product(sku)
+            if getattr(p, "min_stock", 0) and total <= p.min_stock:
+                low = c.t(" -- LOW (reorder level {m})", " -- KAM hai (reorder {m})", " — کم ہے (ری آرڈر {m})", m=_n(p.min_stock))
+        except Exception:
+            pass
+        return f"{c.product(sku)}: {_n(total)}" + c.t(" available", " available", " دستیاب") + res + where + low
     if len(by) == 1:
         sku, levels = next(iter(by.items()))
-        return c.t("Stock -- ", "Stock -- ", "اسٹاک — ") + one(sku, levels) + "."
+        return c.t("Stock -- ", "Stock -- ", "اسٹاک — ") + (f"{only}: " if only else "") + one(sku, levels) + "."
     order = sorted(by.items(), key=lambda kv: c.product(kv[0]))
     head = c.t("Stock available now, {n} products: ", "Is waqt stock, {n} products: ", "اس وقت اسٹاک، {n} اشیاء: ", n=len(order))
     return head + _listing(c, order, lambda kv: one(*kv))
@@ -166,7 +185,14 @@ def _khata(d, c: _Ctx) -> str:
         s += c.t(" Last payment {amt} on {day}.", " Aakhri payment {amt}, {day}.", " آخری ادائیگی {amt}، {day}۔", amt=rs(-float(p["amount"])), day=_day(p.get("created_at")))
     pr = (d or {}).get("promise")
     if isinstance(pr, dict) and pr.get("amount"):
-        s += c.t(" Promised {amt} by {day}.", " {amt} ka wada, {day} tak.", " {day} تک {amt} کا وعدہ۔", amt=rs(pr["amount"]), day=pr.get("promised_date") or pr.get("date") or "")
+        s += c.t(" Promised {amt} by {day}.", " {amt} ka wada, {day} tak.", " {day} تک {amt} کا وعدہ۔", amt=rs(pr["amount"]),
+                 day=_day(pr.get("promised_date") or pr.get("date") or ""))
+    elif re.search(r"\b(wada|waada|promise)\b|وعدہ", fold(c.text)):
+        s += c.t(" No open promise to pay is on record.", " Koi khula wada darj nahi.", " کوئی کھلا وعدہ درج نہیں۔")
+    limit = float(cust.get("credit_limit") or 0)
+    if limit and re.search(r"\blimit\b|\bcredit\b|حد", fold(c.text)):
+        s += c.t(" Credit limit {lim}; room left {room}.", " Credit limit {lim}; abhi {room} ki gunjaish.", " کریڈٹ کی حد {lim}؛ ابھی {room} کی گنجائش۔",
+                 lim=rs(limit), room=rs(max(0.0, limit - bal)))
     return s
 
 
@@ -177,6 +203,11 @@ def _aging(d, c: _Ctx) -> str:
     total = sum(float(r.get("balance") or 0) for r in rows)
     head = c.t("{n} customers owe {amt} in all, most overdue first: ", "{n} customers ke kul {amt} baqi hain, sab se purane pehle: ",
                "{n} گاہکوں کے ذمے کل {amt} باقی ہیں، سب سے پرانے پہلے: ", n=len(rows), amt=rs(total))
+    if re.search(r"sab se (zyada|ziada|zaida)|\b(most|largest|biggest|highest)\b|سب سے زیادہ", fold(c.text)):
+        # 'sab se zyada kis ka he': the answer is the largest balance, read from the rows in code -- then the list
+        top = max(rows, key=lambda r: float(r.get("balance") or 0))
+        head = c.t("{w} owes the most: {a}. ", "Sab se zyada {w} ke baqi hain: {a}. ", "سب سے زیادہ {w} کے ذمے ہیں: {a}۔ ", w=top.get("name"),
+                   a=rs(top.get("balance"))) + head
     return head + _listing(c, rows, lambda r: f"{r.get('name')} {rs(r.get('balance'))}" + (c.t(" ({d} days)", " ({d} din)", " ({d} دن)", d=int(r["days_overdue"])) if r.get("days_overdue") else ""))
 
 
@@ -208,17 +239,28 @@ def _order(d, c: _Ctx) -> str:
 
 
 def _payments_block(d, c: _Ctx) -> str:
-    pays = [p for p in (d or {}).get("payments") or [] if isinstance(p, dict)]
+    rows = [p for p in (d or {}).get("payments") or [] if isinstance(p, dict)]
+    # a reversal (a bounced cheque) is not a payment: it is neither counted nor listed as one, but it is said
+    revs = [p for p in rows if p.get("reversal_of") or float(p.get("amount") or 0) < 0]
+    cancelled = {p.get("reversal_of") for p in revs if p.get("reversal_of")}
+    # payments still in effect: not a reversal, and not the payment a reversal cancelled (the domain's payment_count)
+    pays = [p for p in rows if not p.get("reversal_of") and float(p.get("amount") or 0) > 0 and p.get("entry_id") not in cancelled]
     start, end = (d or {}).get("start"), (d or {}).get("end")
     from munshi.domain.models import business_today
     today = business_today().isoformat()
     when = c.t("today", "aaj", "آج") if start == end == today else (_day(start) if start == end else f"{_day(start)} - {_day(end)}")
+    rv = (d or {}).get("reversals") if isinstance((d or {}).get("reversals"), dict) else {}
+    n_rev = int(rv.get("count") or len(revs))
+    amt_rev = abs(float(rv.get("amount") if rv.get("amount") is not None else sum(float(p.get("amount") or 0) for p in revs)))
+    rev_txt = c.t(" {n} payment(s) reversed (e.g. a bounced cheque): {a}.", " {n} payment reverse hui (maslan cheque bounce): {a}.",
+                  " {n} ادائیگی واپس ہوئی (مثلاً چیک باؤنس): {a}۔", n=n_rev, a=rs(amt_rev)) if n_rev else ""
     if not pays:
-        return c.t("No customer payments recorded {w}.", "{w} koi customer payment darj nahi hui.", "{w} کسی گاہک کی ادائیگی درج نہیں ہوئی۔", w=when)
+        return c.t("No customer payments recorded {w}.", "{w} koi customer payment darj nahi hui.", "{w} کسی گاہک کی ادائیگی درج نہیں ہوئی۔", w=when) + rev_txt
     total = sum(float(p.get("amount") or 0) for p in pays)
+    n = len(pays)
     head = c.t("Payments received {w}: {amt} in {n} payment(s): ", "{w} {n} payments aayin, kul {amt}: ", "{w} {n} ادائیگیاں آئیں، کل {amt}: ",
-               w=when, amt=rs(total), n=len(pays))
-    return head + _listing(c, pays, lambda p: f"{p.get('name')} {rs(p.get('amount'))} ({p.get('method') or 'cash'})")
+               w=when, amt=rs(total), n=n)
+    return head + _listing(c, pays, lambda p: f"{p.get('name')} {rs(p.get('amount'))} ({p.get('method') or 'cash'})") + rev_txt
 
 
 def _collection(d, c: _Ctx) -> str:
@@ -242,6 +284,16 @@ def _cashbook(d, c: _Ctx) -> str:
             o=rs(d.get("total_out")), n=rs(d.get("net")))
     if ins:
         s += c.t(" Cash payments: ", " Cash payments: ", " نقد ادائیگیاں: ") + _listing(c, ins, lambda x: f"{x.get('who')} {rs(x.get('amount'))}")
+    outs = [x for x in d.get("cash_out") or [] if isinstance(x, dict)]
+    if outs and re.search(r"\b(kharch\w*|expense\w*|gaye|out)\b|خرچ", fold(c.text)):
+        s += c.t(" Paid out: ", " Kharche: ", " خرچے: ") + _listing(c, outs, lambda x: f"{x.get('who')} {rs(x.get('amount'))}")
+    # driver cash that should have come in and didn't: a memo beside the drawer figure (never inside `net`), always said
+    short = float(d.get("total_shortfall") or 0)
+    if short:
+        who = ", ".join(dict.fromkeys(str(x.get("who") or "") for x in d.get("shortfalls") or [] if isinstance(x, dict) and x.get("who")))
+        s += c.t(" Driver cash short {a}{w}.", " Driver ka cash {a} short{w}.", " ڈرائیور کی نقدی {a} کم{w}۔", a=rs(short), w=f" ({who})" if who else "")
+    elif re.search(r"\b(driver|short|pura|poora)\b|ڈرائیور", fold(c.text)):
+        s += c.t(" No driver cash is short.", " Driver ka cash pura hai, kuch short nahi.", " ڈرائیور کی نقدی پوری ہے۔")
     return s
 
 
@@ -286,7 +338,29 @@ def _sales(d, c: _Ctx) -> str:
     cust = [x for x in d.get("by_customer") or [] if isinstance(x, dict)]
     if cust:
         s += c.t(" Biggest buyers: ", " Sab se zyada: ", " سب سے زیادہ: ") + _listing(c, cust[:3], lambda x: f"{x.get('name')} {rs(x.get('revenue'))}")
-    return s
+    prods = [x for x in d.get("by_product") or [] if isinstance(x, dict)]
+    if prods and re.search(r"\b(cheez|cheezen|product|products|maal|item|items|bik\w*|seller)\b|چیز|مال", fold(c.text)):
+        key = lambda x: float(x.get("revenue") or x.get("qty") or 0)  # noqa: E731
+        s += c.t(" Best sellers: ", " Sab se zyada bikne wali: ", " سب سے زیادہ بکنے والی: ") + _listing(
+            c, sorted(prods, key=key, reverse=True)[:3], lambda x: f"{x.get('name') or c.product(x.get('sku'))} {rs(x.get('revenue'))}")
+    return s + _caveat(d, c)
+
+
+def _caveat(d: dict, c: _Ctx) -> str:
+    """When some sales have no cost on record, the margin is overstated: say so, with the margin on the costed sales only,
+    instead of presenting (say) 100% as fact."""
+    if d.get("margin_reliable") is not False:
+        return ""
+    miss = d.get("cost_missing") or {}
+    costed = d.get("costed_margin_pct")
+    cm = c.t(" Margin on the sales that do have a cost: {p}%.", " Jin ki laagat maloom hai un par margin: {p}%.", " جن کی لاگت معلوم ہے ان پر منافع: {p}%۔",
+             p=costed) if costed is not None else ""
+    if c.lang == "en" and d.get("caveat"):
+        return f" Note: {str(d['caveat']).rstrip('.')}." + cm
+    return c.t(" Note: {amt} of sales ({n} bill(s)) have no cost on record, so the margin above is too high.",
+               " Note: {amt} ki sale ({n} bill) ki laagat darj nahi, is liye upar wala munafa zyada dikh raha hai.",
+               " نوٹ: {amt} کی سیل ({n} بل) کی لاگت درج نہیں، اس لیے اوپر کا منافع زیادہ دکھ رہا ہے۔",
+               amt=rs(miss.get("revenue")), n=int(miss.get("count") or 0)) + cm
 
 
 def _profit(d, c: _Ctx) -> str:
@@ -295,7 +369,7 @@ def _profit(d, c: _Ctx) -> str:
                "{a} se {b}: sale {rev}, maal ki laagat {cogs}, gross munafa {gm}, kharche {ex}, net munafa {net}.",
                "{a} سے {b}: سیل {rev}، مال کی لاگت {cogs}، مجموعی منافع {gm}، خرچے {ex}، خالص منافع {net}۔",
                a=_day(d.get("start")), b=_day(d.get("end")), rev=rs(d.get("revenue")), cogs=rs(d.get("cost_of_goods")), gm=rs(d.get("gross_margin")),
-               ex=rs(d.get("expenses")), net=rs(d.get("net")))
+               ex=rs(d.get("expenses")), net=rs(d.get("net"))) + _caveat(d, c)
 
 
 def _valuation(d, c: _Ctx) -> str:
@@ -357,12 +431,39 @@ def _suggest(d, c: _Ctx) -> str:
         + (f" on {c.vehicle(r['vehicle_id'])} ({r['vehicle_id']})" if r.get("vehicle_id") else f" -- {r.get('note')}")))
 
 
+def _one_stop(s: dict, c: _Ctx) -> str:
+    """One stop the way a driver needs it at the door: who, where, what was loaded, and the bill for it."""
+    who = s.get("customer_name") or c.customer(s.get("customer_id"))
+    out = c.t("{w} (stop {n}, {st})", "{w} (stop {n}, {st})", "{w} (اسٹاپ {n}، {st})", w=who, n=s.get("sequence"), st=s.get("status"))
+    if s.get("items"):
+        out += c.t(": {i}", ": {i}", ": {i}", i=c.items(s["items"]))
+    if s.get("order_total") is not None:
+        out += c.t(" -- bill {a}, collect up to {a}", " -- bill {a}, zyada se zyada {a} lene hein", " — بل {a}", a=rs(s["order_total"]))
+    if s.get("address"):
+        out += c.t(". Address: {a}", ". Address: {a}", "۔ پتہ: {a}", a=s["address"])
+    if float(s.get("cash_collected") or 0):
+        out += c.t(", cash taken {x}", ", cash liya {x}", "، نقد {x}", x=rs(s["cash_collected"]))
+    return out + "."
+
+
 def _stops(d, c: _Ctx) -> str:
     rows = [r for r in d or [] if isinstance(r, dict)]
     if not rows:
         return c.t("No stops on this plan.", "Is plan mein koi stop nahi.", "اس پلان میں کوئی اسٹاپ نہیں۔")
+    # a question about one customer's stop ('kitne paise lene hein chaudhry farms se', 'address kya he'): just theirs
+    try:
+        from munshi.llm.parse import customer_resolution
+        who = customer_resolution(c.text, c.repo) if c.text else None
+    except Exception:
+        who = None
+    if who is not None and who.ok:
+        mine = [s for s in rows if s.get("customer_id") == who.id]
+        if len(mine) == 1:
+            return _one_stop(mine[0], c)
     return c.t("Stops, in order: ", "Stops, tarteeb se: ", "اسٹاپ، ترتیب سے: ") + _listing(c, rows, lambda s: (
-        f"{s.get('sequence')}. {s.get('customer_name') or c.customer(s.get('customer_id'))} ({s.get('stop_id')}) -- {s.get('status')}"
+        f"{s.get('sequence')}. {s.get('customer_name') or c.customer(s.get('customer_id'))} -- {s.get('status')}"
+        + (f", {c.items(s['items'])}" if s.get("items") else "")
+        + (f", {rs(s['order_total'])}" if s.get("order_total") is not None else "")
         + (f", cash {rs(s['cash_collected'])}" if float(s.get("cash_collected") or 0) else "")))
 
 
@@ -405,6 +506,14 @@ def _created_order(d, c: _Ctx) -> str:
     return c.t("Draft order {id} saved for {who}: {items}, {amt}. Nothing is owed until it is delivered.",
                "Draft order {id} ban gaya ({who}): {items}, {amt}. Delivery tak kuch baqi nahi hota.",
                "ڈرافٹ آرڈر {id} بن گیا ({who}): {items}، {amt}۔", id=o.get("order_id"), who=o.get("customer_name") or c.customer(o.get("customer_id")),
+               items=c.items(o.get("items")), amt=rs(o.get("total")))
+
+
+def _changed_order(d, c: _Ctx) -> str:
+    o = d or {}
+    return c.t("Order {id} for {who} changed: {items}, {amt}. It is still a draft.",
+               "Order {id} ({who}) badal gaya: {items}, {amt}. Abhi draft hi hai.",
+               "آرڈر {id} ({who}) بدل گیا: {items}، {amt}۔ ابھی ڈرافٹ ہے۔", id=o.get("order_id"), who=o.get("customer_name") or c.customer(o.get("customer_id")),
                items=c.items(o.get("items")), amt=rs(o.get("total")))
 
 
@@ -516,10 +625,12 @@ def _reminder(d, c: _Ctx) -> str:
     d = d or {}
     if d.get("drafted") is False:
         return c.t("No reminder drafted: nothing is outstanding.", "Reminder nahi bana: kuch baqi nahi.", "یاد دہانی نہیں بنی: کچھ باقی نہیں۔")
-    return c.t("{tier} reminder {id} drafted for {w} about {a} ({st}): it goes out only when someone approves sending it.",
-               "{w} ke liye {tier} reminder {id} tayyar ({a}, {st}): bhejne ki manzoori par hi jayega.",
-               "{w} کے لیے {tier} یاد دہانی {id} تیار ({a}، {st})۔", tier=d.get("tier"), id=d.get("reminder_id"), w=c.customer(d.get("customer_id")),
-               a=rs(d.get("amount_due")), st=d.get("status"))
+    kw = {"tier": d.get("tier"), "id": d.get("reminder_id"), "w": c.customer(d.get("customer_id")), "a": rs(d.get("amount_due"))}
+    if d.get("status") == "sent":
+        return c.t("Reminder sent to {w} on WhatsApp about {a}.", "{w} ko {a} ka reminder WhatsApp par bhej diya.", "{w} کو {a} کی یاد دہانی واٹس ایپ پر بھیج دی۔", **kw)
+    return c.t("{tier} reminder drafted for {w} about {a}. Sending it is a separate approval.",
+               "{w} ke liye {tier} reminder tayyar ({a}). Bhejne ke liye alag manzoori chahiye.",
+               "{w} کے لیے {tier} یاد دہانی تیار ({a})۔ بھیجنے کی الگ منظوری ہوگی۔", **kw)
 
 
 def _reminders(d, c: _Ctx) -> str:
@@ -543,7 +654,7 @@ FORMATTERS: dict[str, Callable[[Any, _Ctx], str]] = {
     "payables_report": _payables, "supplier_khata": _supplier_khata, "list_suppliers": _suppliers, "broken_promises": _broken,
     "suggest_dispatch": _suggest, "list_stops": _stops, "get_plan": _plan, "find_customer": _find_customer, "find_supplier": _find_customer,
     "search_products": _search_products, "list_routes": _routes, "list_vehicles": _vehicles,
-    "create_order": _created_order, "confirm_order": _status_order, "cancel_order": _status_order, "allocate_order": _allocated,
+    "create_order": _created_order, "update_order": _changed_order, "confirm_order": _status_order, "cancel_order": _status_order, "allocate_order": _allocated,
     "create_dispatch_plan": _plan_made, "approve_dispatch_plan": _plan_made, "adjust_stock": _adjusted, "transfer_stock": _transferred,
     "close_stop": _closed, "record_deposit": _deposit, "record_payment": _payment, "record_expense": _expense, "credit_note": _credit,
     "reverse_ledger_entry": _reversed, "reverse_expense": _reversed, "reverse_purchase": _reversed, "reverse_supplier_entry": _reversed,

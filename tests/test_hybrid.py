@@ -345,8 +345,10 @@ def test_an_empty_tool_result_goes_back_as_text(repo):
 
 
 def test_a_claimed_action_that_never_happened_is_not_passed_on(repo):
-    """Observed on Groq: 'Green Valley ka payment record kar diya gaya: 25,000' with no tool call at all."""
-    text = "Green Valley ka banda aaya tha, raqam de gaya pachees hazar"
+    """Observed on Groq: 'Green Valley ka payment record kar diya gaya: 25,000' with no tool call at all.
+    (The message observed then -- 'Green Valley ka banda aaya tha, raqam de gaya pachees hazar' -- is now read by the rules
+    as a payment card; a message the rules still can't read stands in for it here, so the model is reached.)"""
+    text = "Green Valley wala scene set ho gaya"
     fake = _fake(routes={text: "hisaab"}, plan={text: [[("find_customer", {"text": "Green Valley"})]]},
                  final={text: "Green Valley ka payment record kar diya gaya: 25,000 PKR."})
     p = MunshiPlatform(repo, model=fake)

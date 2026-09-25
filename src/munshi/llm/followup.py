@@ -25,7 +25,7 @@ import re
 from datetime import datetime, timedelta
 
 from munshi.llm import numbers as N
-from munshi.llm.parse import amount_in, analyse_order, customer_resolution, date_in, ids_in, sku_in, supplier_resolution
+from munshi.llm.parse import amount_in, analyse_order, customer_resolution, date_in, ids_in, sku_in, supplier_resolution, warehouses_in
 from munshi.llm.resolve import GENERIC, _name_tokens, _token_matches
 from munshi.llm.stub_model import contains
 from munshi.llm.text import fold, words
@@ -40,6 +40,7 @@ PRONOUN = contains(
     "isko", "isse", "ise", "iska", "iski", "iske", "ye", "yeh", "yehi", "yahi", "wo", "woh", "usko", "use", "uska", "uski", "uske",
     "unka", "unki", "unke", "unko", "unhe", "unhen", "unhein", "unhon", "unhone", "unhon ne", "inka", "inki", "inke", "inko", "inhe", "inhein",
     "inhon", "inhone", "usi", "isi", "usne", "us ne", "is ne", "isne", "is ka", "is ki", "is ke", "us ka", "us ki", "us ke", "is ko", "us ko",
+    "unho", "unho ne", "unhoon", "unhoon ne", "inho", "inho ne",
     "this", "it", "that", "same", "same customer", "same party", "wala", "wali", "wale",
     # ('he' is left out on purpose: in Roman Urdu it is usually 'hai' -- "payment ki he?")
     "their", "theirs", "them", "they", "his", "him", "her", "this customer", "that customer", "this party",
@@ -59,13 +60,14 @@ def _strong_pronoun(text: str) -> bool:
 WHOLE_BUSINESS = contains(
     "kis", "kin", "kaun", "kon", "konse", "kaunse", "who", "which", "sab", "sabhi", "saare", "sare", "sary", "tamam", "all", "everyone", "everybody",
     "list", "total", "top", "report", "har", "aaj", "aj", "today", "todays", "today's", "customers", "costumers", "clients", "parties",
-    "suppliers", "companies", "profit", "sales", "month", "week", "mahine", "hafte",
+    "suppliers", "companies", "profit", "sales", "month", "week", "mahine", "hafte", "kitne orders", "kitne order", "orders kitne", "how many orders",
     "کس", "کون", "سب", "تمام", "لسٹ", "آج", "اج")
 
 _CUSTOMER_INTENT = contains(
     "payment", "payments", "paid", "pay", "jama", "diye", "diya", "wusool", "wasool", "khata", "balance", "hisaab", "hisab", "baqi", "baaki",
     "udhaar", "udhar", "outstanding", "owe", "owes", "orders", "order", "reminder", "remind", "yaad", "promise", "wada", "waada", "credit note",
-    "statement", "dena", "dene", "collection", "کھاتہ", "حساب", "بیلنس", "باقی", "ادھار", "ادائیگی", "جمع", "آرڈر", "وعدہ")
+    "statement", "dena", "dene", "collection", "bheje", "bheja", "bhejay", "jazzcash", "jazz cash", "easypaisa", "easy paisa", "cheque", "check",
+    "raqam", "limit", "credit limit", "address", "کھاتہ", "حساب", "بیلنس", "باقی", "ادھار", "ادائیگی", "جمع", "آرڈر", "وعدہ")
 _SUPPLIER_INTENT = contains("pay", "payment", "de do", "dedo", "de dein", "ada", "bill", "khata", "hisaab", "hisab", "balance", "dena", "owe",
                             "purchase", "maal", "ادائیگی", "حساب")
 _ELLIPSIS = re.compile(r"^\W*(aur|and|or|what about|how about|اور)\b", re.I)
@@ -84,6 +86,11 @@ _ORDINALS = {1: {"pehla", "pehle", "pehli", "pahla", "pahle", "pehlay", "first",
              2: {"doosra", "dusra", "doosre", "dusre", "doosri", "dusri", "second", "2", "2nd", "two", "do", "دوسرا", "دوسرے", "دوسری"},
              3: {"teesra", "tisra", "teesre", "teesri", "third", "3", "3rd", "three", "teen", "تیسرا", "تیسرے", "تیسری"}}
 _ORD_WORD = {fold(w): n for n, ws in _ORDINALS.items() for w in ws}
+_YES = frozenset(fold(w) for w in """haan han haa ha ji jee g yes yeah yep ok okay theek thik thek bilkul sahi done wahi wohi yahi yehi
+bana banao kar karo kardo chalo go ہاں جی ٹھیک بالکل وہی""".split())
+_YES_FILL = frozenset(fold(w) for w in """he hai hy do dein den dijiye de diya lo please plz pls wala wali wale ye yeh wo woh isi usi ko bhai sahab
+is it that one this the kar karo same ہے دو دیں""".split())
+_POINT = frozenset(fold(w) for w in "ye yeh wo woh wala wali wale isi usi yahi yehi wahi wohi this that یہ وہ".split())
 _CORRECTION = contains("correction", "correct", "adjust", "adjustment", "galti", "ghalti", "sahi karo", "sahi kar do", "theek karo", "theek kar do",
                        "count", "ginti", "درستی", "غلطی")
 
@@ -133,15 +140,52 @@ def ordinal(text: str) -> int | None:
 
 
 # ------------------------------------------------------------------ open questions
+def is_yes(text: str) -> bool:
+    """'haan', 'ji', 'theek he bana do', 'ok kar do', 'haan wahi', 'ye wala' -- a yes to the one option offered, and nothing else."""
+    toks = words(fold(text))
+    if not toks or len(toks) > 6 or not all(w in _YES or w in _YES_FILL or w in _FILLER for w in toks):
+        return False
+    return any(w in _YES or w in _POINT for w in toks)
+
+
+def by_name_word(text: str, cands: list[dict]) -> int | None:
+    """1-based pick when the answer's words fit exactly one offered option's name ('new wala' -> New Kisan Dost),
+    even words the resolver ignores ('new'); None if they fit none or several."""
+    toks = [w for w in words(fold(text)) if w not in _FILLER and w not in ("wala", "wali", "wale")]
+    if not toks or len(toks) > 3:
+        return None
+    hits = [i for i, c in enumerate(cands, 1) if all(any(_token_matches(t, n) or t == n for n in words(fold(str(c.get("name") or "")))) for t in toks)]
+    return hits[0] if len(hits) == 1 else None
+
+
+_SHOW_ALL = contains("sab dikhao", "sab dikha do", "sari list", "saari list", "puri list", "poori list", "pura dikhao", "poora dikhao", "baqi bhi",
+                     "baaki bhi", "aur dikhao", "show all", "all of them", "full list", "the rest", "more", "baqi", "sab", "all", "saare", "sare", "tamam",
+                     "باقی بھی", "سب دکھاؤ", "پوری لسٹ")
+
+
 def answer(ask: dict, text: str, repo) -> tuple[str, str | None] | None:
     """If `text` is only the piece `ask` asked for: (the original request with it added, the specialist to send it
     to or None for the one that asked). None when the message is anything more -- it is then handled as new."""
     slot, base = ask.get("slot"), str(ask.get("text") or "")
-    if not slot or not base or not str(text or "").strip():
+    if not slot or not str(text or "").strip():
+        return None
+    cands = ask.get("candidates") or []
+    if slot == "dispatch":                          # a dispatch suggestion: 'theek he, bana do' takes the only one, 'doosra' picks one
+        n = ordinal(text) or (1 if len(cands) == 1 and is_yes(text) else None)
+        return (str(cands[n - 1]["id"]), ask.get("specialist") or "godown") if n and 0 < n <= len(cands) else None
+    if slot == "split":                             # 'haan' to 'one card per customer?'
+        if cands and (is_yes(text) or (contains("dono", "donon", "both", "alag", "separate", "sab", "دونوں")(text) and len(words(fold(text))) <= 5
+                                       and not customer_resolution(text, repo).ok)):
+            return "split", ask.get("specialist") or "order"
+        return None
+    if not base:
+        return None
+    if slot == "more":                              # 'sab dikhao' / 'puri list' after a list that was cut short
+        if _SHOW_ALL(text) and len(words(fold(text))) <= 5 and not customer_resolution(text, repo).ok:
+            return f"{base} sab", None
         return None
     if slot in ("customer", "supplier"):
-        cands = ask.get("candidates") or []
-        n = ordinal(text)
+        n = ordinal(text) or (1 if len(cands) == 1 and is_yes(text) else None) or by_name_word(text, cands)
         if n is not None:
             return (f"{base} {cands[n - 1]['id']}", None) if 0 < n <= len(cands) else None
         res = (customer_resolution if slot == "customer" else supplier_resolution)(text, repo)
@@ -155,6 +199,11 @@ def answer(ask: dict, text: str, repo) -> tuple[str, str | None] | None:
         a = amount_in(text)
         if a.amount is None or _leftover(text, lambda w: w in _MONEY_WORDS):
             return None
+        first = amount_in(base)
+        if first.amount is None and first.problem.startswith("which amount"):
+            # 'which amount? I see 4512, 50000' -> '50000': the other figures in the request were not the amount
+            keep = N._fmt(a.amount)
+            base = re.sub(r"(?<![\w.])\d[\d,]*(?:\.\d+)?(?![\w.])", lambda m: m.group(0) if m.group(0).replace(",", "") == keep else " ", base)
         return f"{base} {text.strip()}", None
     if slot == "date":
         if not date_in(text) or _leftover(text, lambda w: bool(date_in(w)) or w in ("tak", "ko", "pe", "tomorrow", "kal", "parson", "din", "day")):
@@ -166,13 +215,20 @@ def answer(ask: dict, text: str, repo) -> tuple[str, str | None] | None:
             return None
         return f"{base} {text.strip()}", None
     if slot == "order":
+        n = ordinal(text) or (1 if len(cands) == 1 and is_yes(text) else None)
+        if n is not None and cands:
+            return (f"{base} {cands[n - 1]['id']}", None) if 0 < n <= len(cands) else None
         oid = ids_in(text, "ORD")
         if len(oid) != 1 or _leftover(text, lambda w: w in ("ord", "order", "wala")):
             return None
         return f"{base} {oid[0]}", None
     if slot == "otp":
-        m = re.fullmatch(r"\s*(?:otp|code|pin|او ٹی پی|کوڈ)?\s*(?:hai|is|:|-)?\s*(\d{4,6})\s*(?:hai|he)?\s*[.!]?\s*", fold(text))
-        return (f"{base} otp {m.group(1)}", None) if m else None
+        m = re.fullmatch(r"\W*(?:(?:sorry|maaf|ji|jee|acha|ok|galti|ghalti|ye lo|yeh lo|ye|yeh|sahi|asal|correct|right|new|naya|dusra|doosra)\W+)*"
+                         r"(?:otp|code|pin|او ٹی پی|کوڈ)?\s*(?:hai|he|is|:|-)?\s*(\d{4,6})\s*(?:hai|he|tha|hy)?\s*[.!]?\s*", fold(text))
+        if not m:
+            return None
+        clean = re.sub(r"(?i)\b(?:otp|o\.t\.p|code|pin)\s*(?:hai|is|:|#|-|=)?\s*\d{4,6}\b", " ", base)       # a wrong code tried before is replaced
+        return f"{clean.strip()} otp {m.group(1)}", None
     if slot == "product":
         if contains("all", "sab", "sabhi", "saare", "sare", "tamam", "every", "سب", "تمام")(text) and len(words(fold(text))) <= 6:
             return f"{base} {text.strip()}", None
@@ -226,6 +282,10 @@ def augment(text: str, topic: dict | None, repo) -> tuple[str, dict | None]:
     # a product follow-up: 'aur dap ka?' after a stock question, or 'iska stock' with a product in the topic
     if topic.get("intent") == "stock" and _ELLIPSIS.search(fold(text)) and named.get("product") and short:
         return f"{text} stock kitna hai", None
+    # ... or another godown: 'aur vehari mei?' / 'sirf vehari ka' right after 'multan mei urea kitni he'
+    if topic.get("intent") == "stock" and topic.get("product") and not named.get("product") and short and (
+            _ELLIPSIS.search(fold(text)) or contains("sirf", "only", "bas", "just")(text)) and warehouses_in(text, repo):
+        return f"{text} {topic['product']['sku']} stock kitna hai", {"kind": "product", "id": topic["product"]["sku"], "name": topic["product"]["name"]}
     if topic.get("product") and not named.get("product") and pron and _STOCKISH(text):
         return f"{text} {topic['product']['sku']}", {"kind": "product", **{"id": topic["product"]["sku"], "name": topic["product"]["name"]}}
     if WHOLE_BUSINESS(text) and not strong:

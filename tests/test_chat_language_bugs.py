@@ -261,10 +261,16 @@ def test_pronoun_with_nothing_to_refer_to_names_nothing(p):
 
 
 def test_confirm_by_customer_lists_their_open_orders_instead_of_guessing(p):
+    # (updated for the persona run's G2: with exactly ONE draft there is nothing to guess -- the card names it;
+    # with two or more, they are listed by what they contain and nothing is carded)
     o = p.repo.create_order("C-002", [{"sku": "UREA-50", "qty": 2}], "chat", "", "order_munshi")
     r = p.handle_message("t", "clerk", "confirm karo Chaudhry Farms ka order")
+    assert r.pending and r.pending.tool == "confirm_order" and r.pending.args["order_id"] == o.order_id
+    p.resolve(r.pending.approval_id, False, "owner")
+    p.repo.create_order("C-002", [{"sku": "DAP-50", "qty": 1}], "chat", "", "order_munshi")
+    r = p.handle_message("t2", "clerk", "confirm karo Chaudhry Farms ka order")
     _no_card(p, r)
-    assert o.order_id in r.text
+    assert "2 Urea 50kg" in r.text and "1 DAP 50kg" in r.text and "pehla" in r.text
 
 
 @pytest.mark.parametrize("follow_up,cid", [("uska balance kitna hai", "C-002"), ("aur Haji Sons ka?", "C-009")])
