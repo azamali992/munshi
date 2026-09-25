@@ -7,9 +7,9 @@ real business gets at signup."""
 from __future__ import annotations
 
 import json
-from datetime import date, timedelta
+from datetime import timedelta
 
-from munshi.domain.models import Customer, Product, Route, Supplier, Vehicle, Warehouse, to_paisa
+from munshi.domain.models import Customer, Product, Route, Supplier, Vehicle, Warehouse, business_today, to_paisa
 from munshi.domain.repository import MunshiRepository
 
 PRODUCTS = [
@@ -121,9 +121,12 @@ def seed(repo: MunshiRepository) -> MunshiRepository:
     for (cust, amt, _, _), lines in zip(HISTORY, HISTORY_LINES, strict=True):
         if sum(q * price[sku] for sku, q in lines) != to_paisa(amt): raise ValueError(f"seed lines for {cust} don't add up to {amt}")
         for sku, q in lines: sold[(godown[cust], sku)] = sold.get((godown[cust], sku), 0) + q
+    # "N days ago" counts Pakistan business days (never the host OS date, which is a day behind on a UTC server
+    # from 00:00 to 05:00 PKT); the fixed UTC times below all fall on that same business day (10:00-21:00 PKT)
+    today = business_today()
     move = ("INSERT INTO stock_moves (move_id, warehouse_id, sku, delta, kind, ref, created_at, value_paisa, order_id) VALUES (?,?,?,?,?,?,?,?,?)")
     with repo._tx() as conn:
-        opened = f"{(date.today() - timedelta(days=OPENING_DAYS_AGO)).isoformat()}T05:00:00+00:00"
+        opened = f"{(today - timedelta(days=OPENING_DAYS_AGO)).isoformat()}T05:00:00+00:00"
         for wh, levels in STOCK.items():
             for sku, qty in levels.items():
                 units = qty + sold.get((wh, sku), 0)
@@ -133,7 +136,7 @@ def seed(repo: MunshiRepository) -> MunshiRepository:
                     conn.execute("INSERT INTO inventory_value (sku, value_paisa) VALUES (?, ?) ON CONFLICT(sku) DO UPDATE SET value_paisa = value_paisa + excluded.value_paisa",
                                  (sku, units * cost[sku]))
         for i, (cust, amt, days_ago, paid) in enumerate(HISTORY):
-            inv_day = date.today() - timedelta(days=days_ago)
+            inv_day = today - timedelta(days=days_ago)
             created = f"{inv_day.isoformat()}T10:00:00+00:00"
             due = (inv_day + timedelta(days=30)).isoformat()
             ref, wh = f"SEED-{i:02d}", godown[cust]
@@ -157,11 +160,11 @@ def seed(repo: MunshiRepository) -> MunshiRepository:
                              (f"PAY-SEED{i:02d}", cust, "payment", -to_paisa(paid), f"SEED-{i:02d}", None, f"{pay_day.isoformat()}T16:00:00+00:00", "bank", "office"))
         # a supplier bill partly paid, and a few expenses, so payables and the cashbook aren't empty
         sup = "INSERT INTO supplier_ledger (entry_id, supplier_id, kind, amount, ref, method, created_at) VALUES (?,?,?,?,?,?,?)"
-        conn.execute(sup, ("BIL-SEED00", "S-001", "bill", to_paisa(1_440_000), "PUR-SEED00", "", f"{(date.today() - timedelta(days=6)).isoformat()}T11:00:00+00:00"))
-        conn.execute(sup, ("SPY-SEED00", "S-001", "payment", -to_paisa(900_000), "PUR-SEED00", "bank", f"{(date.today() - timedelta(days=3)).isoformat()}T11:00:00+00:00"))
+        conn.execute(sup, ("BIL-SEED00", "S-001", "bill", to_paisa(1_440_000), "PUR-SEED00", "", f"{(today - timedelta(days=6)).isoformat()}T11:00:00+00:00"))
+        conn.execute(sup, ("SPY-SEED00", "S-001", "payment", -to_paisa(900_000), "PUR-SEED00", "bank", f"{(today - timedelta(days=3)).isoformat()}T11:00:00+00:00"))
         for j, (cat, amt, note) in enumerate([("fuel", 8500, "V-01 diesel"), ("loading", 1200, "godown labour"), ("utilities", 6400, "godown electricity")]):
             conn.execute("INSERT INTO expenses (expense_id, category, amount, note, method, paid_by, expense_date, created_at) VALUES (?,?,?,?,?,?,?,?)",
-                         (f"EXP-SEED{j:02d}", cat, to_paisa(amt), note, "cash", "Bilal", (date.today() - timedelta(days=j)).isoformat(), f"{(date.today() - timedelta(days=j)).isoformat()}T09:00:00+00:00"))
+                         (f"EXP-SEED{j:02d}", cat, to_paisa(amt), note, "cash", "Bilal", (today - timedelta(days=j)).isoformat(), f"{(today - timedelta(days=j)).isoformat()}T09:00:00+00:00"))
     return repo
 
 
