@@ -348,8 +348,58 @@ def _v5(conn: sqlite3.Connection) -> None:
         raise MigrationError(f"foreign key violations after V5: {[tuple(r) for r in bad[:5]]}")
 
 
+# ============================================================================ V6
+# Learned names: what the business's people confirmed they mean by a nickname ('Bhatti sahab' -> C-007), kept
+# across conversations and days (domain/repository/memory.py). Additive only: two new tables, nothing existing
+# changes, so a file that has never learned anything behaves exactly as before.
+#
+#  * learned_aliases: one row per (phrase, what it pointed to). A re-point never edits a row: the old row is closed
+#    (active=0, superseded_by, end_reason='repointed') and a new one opened with previous_entity_id, so the history of
+#    what a phrase meant, who taught it and when is never lost. Forgetting closes the row (end_reason='forgotten').
+#    At most one ACTIVE row per (entity_kind, phrase_norm) -- a partial unique index.
+#  * alias_card_links: what an approval card owes to memory ('used': the card's customer came from a learned name)
+#    or may teach it ('learn': the wording that named the card's customer). Settled when the card is decided: only an
+#    approved card, whose action ran and which raised no warnings, teaches.
+V6 = """
+CREATE TABLE IF NOT EXISTS learned_aliases (
+ alias_id INTEGER PRIMARY KEY,
+ phrase_norm TEXT NOT NULL CHECK (length(phrase_norm) BETWEEN 1 AND 80),
+ phrase TEXT NOT NULL,
+ entity_kind TEXT NOT NULL CHECK (entity_kind IN ('customer', 'supplier', 'product')),
+ entity_id TEXT NOT NULL,
+ source TEXT NOT NULL DEFAULT '',
+ taught_by TEXT NOT NULL DEFAULT '',
+ confirmed_by TEXT NOT NULL DEFAULT '',
+ taught_at TEXT NOT NULL,
+ uses INTEGER NOT NULL DEFAULT 0 CHECK (typeof(uses) = 'integer' AND uses >= 0),
+ last_used_at TEXT,
+ active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+ previous_entity_id TEXT,
+ superseded_by INTEGER REFERENCES learned_aliases(alias_id),
+ ended_at TEXT,
+ ended_by TEXT,
+ end_reason TEXT CHECK (end_reason IS NULL OR end_reason IN ('repointed', 'forgotten')));
+CREATE UNIQUE INDEX IF NOT EXISTS ux_learned_aliases_active ON learned_aliases(entity_kind, phrase_norm) WHERE active = 1;
+CREATE INDEX IF NOT EXISTS ix_learned_aliases_entity ON learned_aliases(entity_kind, entity_id);
+CREATE TABLE IF NOT EXISTS alias_card_links (
+ approval_id TEXT NOT NULL,
+ link TEXT NOT NULL CHECK (link IN ('used', 'learn')),
+ entity_kind TEXT NOT NULL CHECK (entity_kind IN ('customer', 'supplier', 'product')),
+ phrase_norm TEXT NOT NULL,
+ phrase TEXT NOT NULL,
+ entity_id TEXT NOT NULL,
+ alias_id INTEGER REFERENCES learned_aliases(alias_id),
+ previous_entity_id TEXT,
+ source TEXT NOT NULL DEFAULT '',
+ taught_by TEXT NOT NULL DEFAULT '',
+ created_at TEXT NOT NULL,
+ outcome TEXT,
+ settled_at TEXT,
+ PRIMARY KEY (approval_id, link, entity_kind, phrase_norm))
+"""
+
 Step = str | Callable[[sqlite3.Connection], None]
-MIGRATIONS: list[tuple[int, Step]] = [(1, V1), (2, V2), (3, V3), (4, V4), (5, _v5)]
+MIGRATIONS: list[tuple[int, Step]] = [(1, V1), (2, V2), (3, V3), (4, V4), (5, _v5), (6, V6)]
 
 
 def current_version(conn: sqlite3.Connection) -> int:

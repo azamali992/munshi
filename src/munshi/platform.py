@@ -68,8 +68,10 @@ from munshi.domain.repository import MunshiRepository
 from munshi.domain.seed import seeded_repository
 from munshi.llm import answers
 from munshi.llm import followup as FU
+from munshi.llm import memory as MEM
 from munshi.llm import replies as RP
-from munshi.llm.parse import customer_resolution, supplier_resolution
+from munshi.llm.answers import lang_of
+from munshi.llm.parse import catalogue, customer_resolution, prepare, supplier_resolution
 from munshi.llm.stub_model import ask_of, not_understood
 from munshi.llm.text import is_urdu
 from munshi.observability.tracing import TurnTrace, configure_tracking, trace_turn
@@ -398,19 +400,35 @@ class CardBuilder:
                 raw = pa.tool.replace("_", " ")
             body = {"title": _t("fallback", text=raw)}
         title, effect = body["title"], body.get("effect")
+        facts = list(body.get("facts", [])) + self._memory_facts(pa.approval_id)
         return base | {
             "title": title["text"], "title_key": title["key"], "title_vars": title["vars"],
             "effect": effect["text"] if effect else "", "effect_key": effect["key"] if effect else None, "effect_vars": effect["vars"] if effect else {},
             "lines": body.get("lines", []), "total": body.get("total"),
-            "facts": body.get("facts", []), "quote": body.get("quote"),
+            "facts": facts, "quote": body.get("quote"),
             "warnings": [{"code": w["key"][2:], "text": w["text"], "key": w["key"], "vars": w["vars"]} for w in body.get("warnings", [])],
             "fallback": fallback,
         }
 
+    def _memory_facts(self, approval_id: str) -> list[dict]:
+        """A card whose customer / supplier / product came from a learned name says so, in plain words, so the approver
+        can catch a wrong memory: 'Bhatti sahab = Bhatti Kisan Store (remembered)', or right after a re-point
+        'Bhatti sahab = Bhatti Traders (last time you meant Bhatti Kisan Store)'."""
+        out = []
+        for ln in (self._get(self.repo.card_links, str(approval_id or "")) or []):
+            if ln["link"] != "used":
+                continue
+            getter = {"customer": self.repo.get_customer, "supplier": self.repo.get_supplier, "product": self.repo.get_product}.get(ln["entity_kind"])
+            if getter is None:
+                continue
+            prev = self._name(getter, ln["previous_entity_id"]) if ln["previous_entity_id"] else None
+            out.append({"key": "note", "value": MEM.note_text(ln["phrase"], self._name(getter, ln["entity_id"]), prev)})
+        return out
+
     # ---------------------------------------------------------- order desk
     def _c_create_order(self, a: dict, pa) -> dict:
         cid = str(a.get("customer_id") or ""); cust = self._cust(cid); cname = cust.name if cust else cid
-        lines, warns, need = [], [], {}
+        lines, warns, need, negotiated = [], [], {}, []
         total_p = list_total_p = 0
         for it in a.get("items") or []:
             sku, qty = str(it.get("sku") or ""), int(it.get("qty") or 0)
@@ -420,6 +438,8 @@ class CardBuilder:
             list_p = to_paisa(p.unit_price)
             price_p = to_paisa(it["unit_price"]) if it.get("unit_price") not in (None, "", 0) else discounted_paisa(list_p, cust.discount_pct if cust else 0)
             lines.append(self._line(sku, qty, price_p))
+            if it.get("unit_price") not in (None, "", 0) and price_p != discounted_paisa(list_p, cust.discount_pct if cust else 0):
+                negotiated.append(f"{p.name} at {_en(_rs(price_p))} (negotiated; list {_en(_rs(discounted_paisa(list_p, cust.discount_pct if cust else 0)))})")
             total_p += qty * price_p; list_total_p += qty * list_p
             need[sku] = need.get(sku, 0) + qty
         if cust:
@@ -433,7 +453,9 @@ class CardBuilder:
         if limit and to_rupees(list_total_p) > limit:      # the same test _needs_role escalates on
             warns.append(_t("w_big_order", limit={"rs": limit}))
         warns += self._stock_warnings(need)
-        return {"title": _t("t_create_order", customer=cname), "effect": effect, "lines": lines, "total": to_rupees(total_p), "warnings": warns}
+        facts = [{"key": "note", "value": "; ".join(negotiated)}] if negotiated else []
+        return {"title": _t("t_create_order", customer=cname), "effect": effect, "lines": lines, "total": to_rupees(total_p), "warnings": warns,
+                "facts": facts}
 
     def _c_confirm_order(self, a: dict, pa) -> dict:
         oid = str(a.get("order_id") or ""); o = self._order(oid)
@@ -757,6 +779,8 @@ class MunshiPlatform:
         self.cards = CardBuilder(self.repo, self.ops)
         self._from_chat: dict | None = None     # the remembered customer/supplier this turn's message leaned on (named on its card)
         self._topic: dict | None = None         # this turn's remembered topic (handed to the model guard)
+        self._answered: dict | None = None      # the open question this turn's message answered, if it did (llm/followup.py)
+        self._said: str = ""                    # the text the engine now answering is reading (a card's wording, for memory)
 
     def close(self) -> None:
         if self._ckpt_conn is not None:
@@ -858,6 +882,15 @@ class MunshiPlatform:
         with self._lock, self.repo.acting_as(user):
             self.repo.add_chat(thread_id, role, text, {"user": user})
             try:
+                said = self._memory_command(role, text, user)
+            except Exception:
+                log.exception("memory command failed on %r", text[:80])
+                said = None
+            if said is not None:                # 'Bhatti sahab matlab Bhatti Traders hai', 'forget X', 'kya kya yaad hai'
+                reply = Reply(said[0], None, None, thread_id)
+                self.repo.add_chat(thread_id, "munshi", reply.text, {"specialist": None, "memory": said[1]})
+                return reply
+            try:
                 ask, topic = self._memory(thread_id, role)
             except Exception:
                 log.exception("couldn't read the conversation memory of %s", thread_id)
@@ -875,6 +908,7 @@ class MunshiPlatform:
                 run, force, used, answered = text, None, None, False
             self._from_chat = used if used and used.get("kind") in ("customer", "supplier") else None
             self._topic = topic
+            self._answered = ask if answered else None
             try:
                 with self._trace("manager", role, text) as tr:
                     reply, meta, understood = self._turn(RULES, thread_id, role, run, user, tr, force=force)
@@ -887,10 +921,18 @@ class MunshiPlatform:
                         meta["memo"] = self._remember(role, text, run, reply, ask, topic, used, answered)
                     except Exception:
                         log.exception("couldn't update the conversation memory of %s", thread_id)
+                    if answered and reply.pending is None:
+                        try:
+                            learned = self._learn_from_answer(role, user, ask, run, reply)
+                            if learned:
+                                meta["learned"] = learned
+                        except Exception:
+                            log.exception("couldn't learn from the answer on %s", thread_id)
                     self.repo.add_chat(thread_id, "munshi", reply.text, meta)
                     return reply
             finally:
-                self._from_chat = self._topic = None
+                self._from_chat = self._topic = self._answered = None
+                self._said = ""
 
     def _remember(self, role: str, text: str, run: str, reply: Reply, ask: dict | None, topic: dict | None, used: dict | None,
                   answered: bool) -> dict:
@@ -909,10 +951,148 @@ class MunshiPlatform:
         new_topic = FU.next_topic(topic, run, self.repo, role, reply.pending.args if reply.pending else None, whole, intent)
         return {"role": role, "ask": new_ask, "topic": new_topic}
 
+    # ------------------------------------------------------------------ memory across conversations (llm/memory.py)
+    # Learned names are taught ONLY by a human confirming who they meant: approving a card made from their wording
+    # (settled in resolve()), or -- owner / clerk -- picking from a "which one?" question, or saying so in chat.
+    # They are applied by the resolver (llm.resolve.with_memory), the same function the rules, the topic memory and
+    # the model guard all read with, so every engine agrees on them; and a card that relied on one names it.
+    def _resolution(self, kind: str, text: str, memory: bool = True):
+        return (customer_resolution if kind == "customer" else supplier_resolution)(text, self.repo, memory=memory)
+
+    def _entity_name(self, kind: str, rid: str) -> str:
+        try:
+            return {"customer": self.repo.get_customer, "supplier": self.repo.get_supplier, "product": self.repo.get_product}[kind](rid).name
+        except Exception:
+            return ""
+
+    def _answer_link(self, kind: str, rid: str, base: str, user: str) -> dict | None:
+        """The phrase a "which one?" question was about (in the request it asked about), when the answer picked one of
+        the options it offered: 'Malik ka khata' + 'doosra' -> ('Malik', C-012)."""
+        res = self._resolution(kind, base)
+        if res.status != "ambiguous" or rid not in {c.id for c in res.candidates}:
+            return None
+        phrase = MEM.phrase_of(base, prepare(base, catalogue(self.repo)).tokens, res.evidence, self._entity_name(kind, rid))
+        return MEM.learn_link(kind, rid, phrase, "answer", user) if phrase else None
+
+    def _memory_links(self, args: dict, text: str, role: str, user: str) -> list[dict]:
+        """What a card about to be raised owes to memory ('used': a learned name decided who it is for) or may teach it
+        ('learn': the wording that named them, learned only if the card is approved -- see resolve())."""
+        links: list[dict] = []
+        if not text:
+            return links
+        fc = self._from_chat
+        for kind, key in (("customer", "customer_id"), ("supplier", "supplier_id")):
+            rid = str(args.get(key) or "")
+            if not rid or (fc and fc.get("id") == rid):          # the conversation named them, not this wording
+                continue
+            res = self._resolution(kind, text)
+            if res.ok and res.id == rid and res.alias:
+                links.append(MEM.used_link(kind, res.alias))
+                continue
+            if res.ok and res.id == rid and res.candidates and res.candidates[0].via in ("name", "head"):
+                phrase = MEM.phrase_of(text, prepare(text, catalogue(self.repo)).tokens, res.evidence, res.name)
+                if phrase:
+                    links.append(MEM.learn_link(kind, rid, phrase, "card", user))
+                continue
+            ask = self._answered                                 # the card completes a "which one?" question
+            if ask and ask.get("slot") == kind and rid in {str(c.get("id")) for c in ask.get("candidates") or []}:
+                link = self._answer_link(kind, rid, str(ask.get("text") or ""), user)
+                if link:
+                    links.append(link)
+        skus = {str(i.get("sku")) for i in (args.get("items") or []) if isinstance(i, dict)}
+        if skus:
+            toks = prepare(text, catalogue(self.repo)).tokens
+            for a in self.repo.learned_aliases("product"):
+                ws = [w for w in MEM.words(MEM.fold(a["phrase"]))]
+                if a["entity_id"] in skus and ws and any(toks[i:i + len(ws)] == ws for i in range(len(toks) - len(ws) + 1)):
+                    links.append(MEM.used_link("product", {"alias_id": a["alias_id"], "phrase": a["phrase"], "phrase_norm": a["phrase_norm"],
+                                                           "id": a["entity_id"], "previous_id": a["previous_entity_id"] if not a["uses"] else None}))
+        return links
+
+    def _learn_from_answer(self, role: str, user: str, ask: dict, run: str, reply: Reply) -> dict | None:
+        """The owner or a clerk answered "which one?" and the munshi READ for the one they picked: that pick is a
+        confirmation, learned now. (When the answer leads to a card instead, the card's approval teaches it.)"""
+        kind = ask.get("slot")
+        if role not in MEM.TEACHERS or kind not in ("customer", "supplier") or not reply.tool or self._is_write(reply.tool):
+            return None
+        res = self._resolution(kind, run)
+        if not res.ok or not res.id:
+            return None
+        link = self._answer_link(kind, res.id, str(ask.get("text") or ""), user)
+        if not link:
+            return None
+        r = self.repo.learn_alias(link["phrase_norm"], link["phrase"], kind, res.id, "answer", taught_by=user or role, confirmed_by=user or role)
+        return {"phrase": link["phrase"], "kind": kind, "id": res.id, "status": r["status"]}
+
+    def _memory_command(self, role: str, text: str, user: str) -> tuple[str, dict] | None:
+        """(reply, meta) for a memory command -- teach / re-point, forget, list -- or None when the message isn't one."""
+        cmd = MEM.command_of(text)
+        if cmd is None:
+            return None
+        lang, who = lang_of(text), (user or role)
+        no = (MEM.say("not_allowed", lang), {"cmd": cmd.kind, "refused": "role"})
+        if cmd.kind == "list":
+            return (self._memory_list(lang), {"cmd": "list"}) if role in MEM.TEACHERS else no
+        if cmd.kind == "forget":
+            key = MEM.phrase_key(cmd.phrase)
+            if not any(a["phrase_norm"] == key for a in self.repo.learned_aliases()):
+                return (MEM.say("not_known", lang, phrase=cmd.phrase), {"cmd": "forget", "known": False}) if MEM.valid_phrase(cmd.phrase) else None
+            if role not in MEM.TEACHERS:
+                return no
+            closed = self.repo.forget_alias(key, by=who)
+            names = ", ".join(dict.fromkeys(self._entity_name(a["entity_kind"], a["entity_id"]) or a["entity_id"] for a in closed))
+            return MEM.say("forgot", lang, phrase=closed[0]["phrase"], name=names), {"cmd": "forget", "closed": [a["alias_id"] for a in closed]}
+        # teach / re-point
+        tgt = MEM.target_of(cmd.target, self.repo)
+        if tgt.problem == "unknown":
+            return (MEM.say("no_target", lang, target=cmd.target), {"cmd": "teach", "problem": "unknown"}) if MEM.valid_phrase(cmd.phrase) else None
+        if role not in MEM.TEACHERS:
+            return no
+        if not MEM.valid_phrase(cmd.phrase):
+            return MEM.say("bad_phrase", lang), {"cmd": "teach", "problem": "phrase"}
+        if tgt.problem:
+            return MEM.say("which_target", lang, target=cmd.target, options=" / ".join(tgt.options)), {"cmd": "teach", "problem": tgt.problem}
+        owner = MEM.phrase_owner(cmd.phrase, tgt.kind, self.repo)
+        if owner is not None and owner.id != tgt.id:
+            return MEM.say("taken", lang, phrase=cmd.phrase, owner=owner.name, name=tgt.name), {"cmd": "teach", "problem": "taken"}
+        r = self.repo.learn_alias(MEM.phrase_key(cmd.phrase), cmd.phrase, tgt.kind, tgt.id, "chat", taught_by=who, confirmed_by=who)
+        prev = r["previous"]
+        key = {"learned": "learned", "repointed": "repointed", "same": "same"}[r["status"]]
+        txt = MEM.say(key, lang, phrase=cmd.phrase, name=tgt.name,
+                      previous=(self._entity_name(prev["entity_kind"], prev["entity_id"]) or prev["entity_id"]) if prev else "")
+        return txt, {"cmd": "teach", "status": r["status"], "kind": tgt.kind, "id": tgt.id}
+
+    def _memory_list(self, lang: str) -> str:
+        rows = [a for a in self.repo.alias_history(500) if a["active"]]
+        if not rows:
+            return MEM.say("list_empty", lang)
+        out = [MEM.say("list_head", lang, n=len(rows))]
+        for a in sorted(rows, key=lambda a: (a["entity_kind"], a["phrase"].lower())):
+            prev = MEM.say("list_prev", lang, previous=self._entity_name(a["entity_kind"], a["previous_entity_id"]) or a["previous_entity_id"]) \
+                if a["previous_entity_id"] else ""
+            out.append(MEM.say("list_row", lang, phrase=a["phrase"], name=self._entity_name(a["entity_kind"], a["entity_id"]) or a["entity_id"],
+                               kind=a["entity_kind"], who=a["taught_by"] or "?", day=str(a["taught_at"])[:10], uses=a["uses"], prev=prev))
+        return "\n".join(out)
+
+    def _ran(self, bundle, cfg: dict, tool: str) -> bool:
+        """Did the approved call actually do its work (its tool result is not an error)?"""
+        try:
+            msgs = bundle.agent.get_state(cfg).values.get("messages", [])
+        except Exception:
+            return False
+        tm = next((m for m in reversed(msgs) if isinstance(m, ToolMessage) and m.name == tool), None)
+        return tm is not None and tm.status != "error" and not str(tm.content).lstrip().startswith('{"error"')
+
+    def _settle_memory(self, pa: PendingApproval, approve: bool, learnable: bool, why_not: str, by: str) -> None:
+        try:
+            self.repo.settle_card_links(pa.approval_id, approve, learnable, by=by, why_not=why_not)
+        except Exception:
+            log.exception("couldn't settle memory for %s", pa.approval_id)
+
     def _bare_entity(self, text: str) -> str | None:
         """A message that is only a customer's or a supplier's name ('haji sons', 'Fauji?'): their khata."""
         for res, spec in ((customer_resolution(text, self.repo), "order"), (supplier_resolution(text, self.repo), "khareed")):
-            if res.ok and res.other is None and not FU._leftover(text, lambda w, n=res.name: FU._is_name_word(w, n) or w in ("aur", "and", "?")):
+            if res.ok and res.other is None and not FU._leftover(text, lambda w, r=res: FU.is_res_word(w, r) or w in ("aur", "and", "?")):
                 return spec
         return None
 
@@ -922,6 +1102,7 @@ class MunshiPlatform:
         engine's manager routed nowhere or, in hybrid mode, the rules specialist ended on the explicit
         NOT_UNDERSTOOD outcome. `force` names the specialist when the message completes that specialist's own
         open question (the request goes back to whoever asked)."""
+        self._said = text
         manager = self.manager if engine == RULES else self.llm_manager
         specialist = force if force in BUILDERS and (engine == RULES or force != "help") else classify(manager, text, role, config=config, context=context)
         if specialist is None and engine == RULES:
@@ -1172,6 +1353,15 @@ class MunshiPlatform:
         pa = PendingApproval(aid, thread_id, specialist, tool, req["args"],
                              risk_of(tool).value, self._needs_role(tool, req["args"]), role, user)
         self.repo.save_approval(asdict(pa))
+        mem_notes: list[str] = []
+        if not lead:                                    # (a follow-up card after an approval has no wording of its own)
+            try:
+                links = self._memory_links(req["args"], self._said, role, user)
+                if links:
+                    self.repo.link_card(aid, links)
+                mem_notes = [f["value"] for f in self.cards._memory_facts(aid)]
+            except Exception:
+                log.exception("couldn't link card %s to memory", aid)
         later = ""
         if deferred:
             later = (" Only one action needing approval can be asked for at a time — not asked for yet: "
@@ -1186,6 +1376,8 @@ class MunshiPlatform:
         fc = self._from_chat
         note = f" -- {RP.t('from_chat', False, name=fc['name'])}" if fc and not lead and fc.get("id") in (
             str(req["args"].get("customer_id") or ""), str(req["args"].get("supplier_id") or "")) else ""
+        # ... and one whose customer / supplier / product came from a learned name names that memory
+        note += "".join(f" -- {n}" for n in mem_notes)
         txt = f"{lead}{skipped}{bundle.title} {'next ' if lead else ''}wants to: {self._headline(card)}{note}.{effect} Needs {pa.needs_role} approval.{later}"
         return Reply(txt, specialist, pa, thread_id)
 
@@ -1325,6 +1517,13 @@ class MunshiPlatform:
             engine = engine_of(pa.approval_id)              # resumed by the SAME engine that paused it
             bundle = self._bundle(engine, pa.specialist)
             cfg = self._cfg(pa.thread_id, pa.requested_by_role, pa.specialist, engine)
+            # memory learns only from an approved card that raised no warnings (read before the action changes the books)
+            warned = False
+            if approve:
+                try:
+                    warned = bool(self.card(pa).get("warnings"))
+                except Exception:
+                    warned = True
             calls = _ModelCalls()
             decision = {"type": "approve"} if approve else {"type": "reject", "message": note or f"rejected by {role}"}
             token = guard.set_history([str(r["text"]) for r in self.repo.chat_history(pa.thread_id, 12)]) if engine == MODEL else None
@@ -1353,6 +1552,7 @@ class MunshiPlatform:
                     except Exception as e:
                         reply = self._resume_failed(pa, approve, bundle, cfg, engine, e)
                         if reply is None:   # the graph state is gone (e.g. checkpoints wiped); the approval stays resolved but unexecuted
+                            self._settle_memory(pa, approve, False, "action failed", user or role)
                             txt = f"Couldn't resume that action ({type(e).__name__}); please ask the munshi again."
                             self.repo.add_chat(pa.thread_id, "munshi", txt, meta | {"error": True})
                             return Reply(txt, pa.specialist, None, pa.thread_id, engine=engine, model_calls=calls.n)
@@ -1360,6 +1560,8 @@ class MunshiPlatform:
                         with self.repo.acting_as(pa.requested_by):
                             reply = settle(result)
                     reply.engine, reply.model_calls, reply.model_tokens = engine, calls.n, calls.tokens
+                    ran = approve and self._ran(bundle, cfg, pa.tool)
+                    self._settle_memory(pa, approve, ran and not warned, "warnings" if warned else "action failed", user or role)
                     self.repo.add_chat(pa.thread_id, "munshi", reply.text, meta | ({"approval_id": reply.pending.approval_id} if reply.pending else {}))
                     if approve: self.deliver_messages()
                     return reply

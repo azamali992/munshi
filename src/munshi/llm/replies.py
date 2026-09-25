@@ -154,7 +154,9 @@ def t(key: str, urdu: bool, roman: bool = False, candidates: list[dict] | None =
 
 
 def _ordered(res: Resolution) -> list:
-    return sorted(res.candidates, key=lambda c: c.id)[:3]
+    """The options as a question lists them: by ID, or -- when the resolver ranked them for the asking user (the
+    customers they order for most, llm.resolve._rank) -- in that order. Ranking only orders; it never picks."""
+    return list(res.candidates)[:3] if getattr(res, "ranked", False) else sorted(res.candidates, key=lambda c: c.id)[:3]
 
 
 def options(res: Resolution, urdu: bool = False) -> str:

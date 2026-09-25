@@ -31,13 +31,23 @@ Confidence rule (accept only when it holds, otherwise return the candidates and 
 
 Tuned on eval/gold_corpus.jsonl: on the act messages that name a customer or
 supplier, every accepted resolution was the gold entity (see eval/run_gold.py
-entity_match and the WRONG-CARD rate)."""
+entity_match and the WRONG-CARD rate).
+
+Learned names (memory across conversations, `with_memory`): after the name
+reading, the business's learned phrases ('Bhatti sahab' -> C-007, taught only by a
+human's confirmation -- see platform.py) are matched as whole words (llm.text.token_key:
+spelling and script folded, honorifics unified). A learned phrase decides with
+confidence only where names don't: a fuller name of someone else in the message, or
+the phrase's own words naming someone else, win (the latter asks). The resolution
+carries `alias` so every card that relied on memory says so. resolve_customer and
+resolve_supplier are the ONE door every reader uses -- the offline rules, the topic
+memory, the model guard's WHO check -- so all of them agree on every learned name."""
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
 
-from munshi.llm.text import fold, has_urdu_word, romanize, skeleton, sounds_like, words
+from munshi.llm.text import fold, has_urdu_word, romanize, skeleton, sounds_like, token_key, words
 
 _STOP = """
 ko ka ki ke kay ne se sy par pe pr mein main mai me mn aur or and the a an of for to from by at in on with bhi hai hain hy he tha thi ho hua hui
@@ -78,6 +88,8 @@ class Resolution:
     candidates: list[Candidate] = field(default_factory=list)   # best first, at most 3
     other: Candidate | None = None   # a second, independent entity in the same message
     evidence: frozenset[int] = frozenset()
+    alias: dict | None = None        # the learned name that decided it (see with_memory), when memory decided it
+    ranked: bool = False             # candidates are in the asking user's order (most used first), not by id
 
     @property
     def ok(self) -> bool:
@@ -164,9 +176,119 @@ def resolve(folded: str, entities: list[tuple[str, str, str]], id_prefix: str, e
     return Resolution("ok", top.id, top.name, [top, *[c for c in eligible[1:] if c not in others]][:3], other, top.evidence)
 
 
-def resolve_customer(folded: str, repo, exclude=frozenset(), tokens=None) -> Resolution:
-    return resolve(folded, [(c.customer_id, c.name, c.phone) for c in repo.list_customers()], "C", exclude, tokens)
+# ------------------------------------------------------------------ learned names (memory across conversations)
+def learned(repo, kind: str) -> list[dict]:
+    """The business's active learned names of this kind (repository cache); none for a repository without memory."""
+    fn = getattr(repo, "learned_aliases", None)
+    if fn is None:
+        return []
+    try:
+        return fn(kind)
+    except Exception:                    # a memory problem must never stop a message being read by name
+        return []
 
 
-def resolve_supplier(folded: str, repo, exclude=frozenset(), tokens=None) -> Resolution:
-    return resolve(folded, [(s.supplier_id, s.name, s.phone) for s in repo.list_suppliers()], "S", exclude, tokens)
+def alias_hits(toks: list[str], exclude, aliases: list[dict]) -> list[tuple[frozenset[int], dict]]:
+    """Learned phrases present in the message as whole words, in order, on positions that are not something else
+    (product words, numbers): [(positions, alias row)], longest phrase first, never overlapping."""
+    keys = [None if (i in exclude or not t[:1].isalpha()) else token_key(t) for i, t in enumerate(toks)]
+    out: list[tuple[frozenset[int], dict]] = []
+    taken: set[int] = set()
+    for a in sorted(aliases, key=lambda a: (-len(a["phrase_norm"].split()), a["alias_id"])):
+        pk = a["phrase_norm"].split()
+        for i in range(len(keys) - len(pk) + 1):
+            span = range(i, i + len(pk))
+            if keys[i:i + len(pk)] == pk and not taken.intersection(span):
+                out.append((frozenset(span), a))
+                taken.update(span)
+                break
+    return sorted(out, key=lambda h: min(h[0]))
+
+
+def with_memory(base: Resolution, folded: str, entities: list[tuple[str, str, str]], id_prefix: str, exclude, toks: list[str],
+                aliases: list[dict], name_of=None) -> Resolution:
+    """The name reading (`base`) with the business's learned names applied. Precedence, first that applies:
+
+      * an explicit ID or phone number, or no learned phrase in the message: the name reading stands;
+      * the name reading already gives the learned entity: it stands (memory wasn't needed);
+      * the learned phrase is part of a FULLER name of someone else ('Malik' learned, 'Malik Agro Store' written):
+        that name stands -- the words were the name, not the nickname;
+      * the phrase's own words name someone else confidently (a customer added later called 'Zamindar Traders' for a
+        learned 'zamindar sahab'): the name wins and it ASKS, offering both;
+      * otherwise the learned name decides, with confidence ('Bhatti sahab' when there are two Bhattis), and the
+        resolution says so (`alias`) so the card can name the memory it relied on. Another customer named elsewhere
+        in the message is reported as `other` (two customers: ask), exactly as for names."""
+    if not aliases or (base.ok and base.candidates and base.candidates[0].via in ("id", "phone")):
+        return base
+    ids = {e[0]: e for e in entities}
+    hits = [h for h in alias_hits(toks, exclude, [a for a in aliases if a["entity_id"] in ids])]
+    if not hits:
+        return base
+    pos, a = hits[0]
+    tid, tname = a["entity_id"], ids[a["entity_id"]][1]
+    if base.ok and base.id == tid:
+        return base
+    if base.ok and base.id != tid and base.evidence > pos:
+        return base
+    mine = Candidate(tid, tname, 1.0, pos, via="alias")
+    allpos = frozenset(range(len(toks)))
+    own = resolve(folded, entities, id_prefix, frozenset(exclude) | (allpos - pos), toks)
+    if own.ok and own.id != tid:
+        return Resolution("ambiguous", None, "", [own.candidates[0], mine], None, pos)
+    if own.status == "ambiguous" and tid not in {c.id for c in own.candidates}:
+        return Resolution("ambiguous", None, "", [mine, *own.candidates][:3], None, pos)
+    other = None
+    second = next((h for h in hits[1:] if h[1]["entity_id"] != tid), None)
+    if second is not None:
+        other = Candidate(second[1]["entity_id"], ids[second[1]["entity_id"]][1], 1.0, second[0], via="alias")
+    else:
+        rest = resolve(folded, entities, id_prefix, frozenset(exclude) | pos, toks)
+        if rest.status in ("ok", "ambiguous") and rest.candidates:
+            top = rest.candidates[0]
+            if tid not in {c.id for c in rest.candidates} and (top.via == "head" or len(top.evidence) >= 2):
+                other = top
+    prev = a.get("previous_entity_id")
+    use = {"alias_id": a["alias_id"], "phrase": a["phrase"], "phrase_norm": a["phrase_norm"], "id": tid, "name": tname,
+           "previous_id": prev if prev and not a.get("uses") else None,
+           "previous_name": ((name_of(prev) if name_of else "") or prev) if prev and not a.get("uses") else None}
+    return Resolution("ok", tid, tname, [mine], other, pos, alias=use)
+
+
+def _rank(res: Resolution, repo) -> Resolution:
+    """A "which one?" question lists the options this user orders for most often first (never picks one)."""
+    if res.status != "ambiguous" or len(res.candidates) < 2:
+        return res
+    try:
+        usage = repo.customer_usage(repo._current_user())
+    except Exception:
+        return res
+    if not usage or not any(usage.get(c.id) for c in res.candidates):
+        return res
+    res.candidates = sorted(res.candidates, key=lambda c: (-usage.get(c.id, 0), c.id))
+    res.ranked = True
+    return res
+
+
+def resolve_customer(folded: str, repo, exclude=frozenset(), tokens=None, memory: bool = True) -> Resolution:
+    ents = [(c.customer_id, c.name, c.phone) for c in repo.list_customers()]
+    toks = tokens if tokens is not None else message_tokens(folded)
+    res = resolve(folded, ents, "C", exclude, toks)
+    if memory:
+        res = with_memory(res, folded, ents, "C", exclude, toks, learned(repo, "customer"), lambda i: _name(repo, "customer", i))
+        res = _rank(res, repo)
+    return res
+
+
+def resolve_supplier(folded: str, repo, exclude=frozenset(), tokens=None, memory: bool = True) -> Resolution:
+    ents = [(s.supplier_id, s.name, s.phone) for s in repo.list_suppliers()]
+    toks = tokens if tokens is not None else message_tokens(folded)
+    res = resolve(folded, ents, "S", exclude, toks)
+    return with_memory(res, folded, ents, "S", exclude, toks, learned(repo, "supplier"), lambda i: _name(repo, "supplier", i)) if memory else res
+
+
+def _name(repo, kind: str, rid: str) -> str:
+    """The name of what a learned phrase used to mean (for "last time you meant ..."); '' if it is gone."""
+    try:
+        return (repo.get_customer(rid) if kind == "customer" else repo.get_supplier(rid)).name
+    except Exception:
+        return ""

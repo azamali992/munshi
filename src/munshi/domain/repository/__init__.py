@@ -11,13 +11,14 @@ Split by bounded context; `MunshiRepository` is the composition:
     collections  aging (FIFO), reminders, promises
     reports      digest, sales, margin, stock ledger, valuation, slow stock, profit
     approvals    persisted human-in-the-loop approvals
+    memory       learned names (per business, across conversations) and order habits
 """
-from munshi.domain.repository.approvals import ApprovalsMixin
 from munshi.domain.repository.base import DOMAIN_ERRORS, CapacityError, CreditHoldError, InsufficientStockError, NotFoundError, OtpError, StateError, new_id
 from munshi.domain.repository.cash import EXPENSE_CATEGORIES, PAYMENT_METHODS
+from munshi.domain.repository.memory import MemoryMixin
 
 
-class MunshiRepository(ApprovalsMixin):
+class MunshiRepository(MemoryMixin):
     """One business's data. Open with a file path, or ":memory:" for tests."""
 
 
