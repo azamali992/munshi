@@ -511,6 +511,25 @@ def amount_in(text: str) -> AmountParse:
     return AmountParse(v)
 
 
+def numbers_said(text: str, repo: MunshiRepository | None = None) -> set[float]:
+    """Every number the message states -- spoken forms read ('dedh sau' -> 150, '50 hazar' -> 50000), lakh grouping
+    handled -- with IDs, OTPs, phone numbers, dates and times masked out. A quantity or amount a model passes must
+    be one of these: numbers are read from the message, never computed or recalled."""
+    s = _OTP_RE.sub(" ", fold(text))
+    s = _ID_RE.sub(" ", s)
+    s = _PHONE_RE.sub(" ", s)
+    s = _DATE_RE.sub(" ", s)
+    s = _TIME_RE.sub(" ", s)
+    nouns = catalogue(repo).nouns if repo is not None else frozenset()
+    return set(N.numbers_in(N.normalize_numbers(s, nouns | N.UNIT_WORDS)))
+
+
+def otp_in(text: str) -> str:
+    """The delivery code the message gives after 'otp' / 'code' / 'pin' ('' if none)."""
+    m = _OTP_RE.search(fold(text))
+    return m.group(1) if m else ""
+
+
 def is_bounce(text: str) -> bool:
     return bool(_BOUNCE.search(fold(text)))
 

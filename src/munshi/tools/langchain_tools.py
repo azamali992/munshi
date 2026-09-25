@@ -32,7 +32,9 @@ def build_tools(ops: MunshiTools) -> dict[str, BaseTool]:
     ops = _Guarded(ops)
     @tool
     def find_customer(text: str) -> dict:
-        """Find a customer by name, phone or ID. Returns their ID, tier, credit limit and outstanding balance."""
+        """Look up a customer by the name exactly as the user wrote it (Urdu script, Roman Urdu or English, any spelling), or a phone or ID.
+        Returns their ID, tier, credit limit and outstanding balance -- or, when several customers match, `ambiguous` with the candidates:
+        then ask the user which one. Always call this to get a customer_id; never ask the user for an ID and never guess one."""
         return ops.find_customer(text)
 
     @tool
@@ -42,7 +44,8 @@ def build_tools(ops: MunshiTools) -> dict[str, BaseTool]:
 
     @tool
     def search_products(text: str) -> list:
-        """Search the catalogue by name, alias (including Urdu names) or SKU."""
+        """Search the catalogue by one product word as the user wrote it (name, alias, Urdu name or SKU), e.g. 'urea', 'makai'.
+        Use the SKU it returns; never ask the user for a SKU."""
         return ops.search_products(text)
 
     @tool
@@ -97,7 +100,8 @@ def build_tools(ops: MunshiTools) -> dict[str, BaseTool]:
 
     @tool
     def create_order(customer_id: str, items: list[dict], source_text: str = "") -> dict:
-        """Create a draft order. items: [{"sku": "UREA-50", "qty": 20}]. The customer must confirm before it proceeds."""
+        """Create a draft order. customer_id comes from find_customer, SKUs from search_products; each qty is the number the user wrote.
+        items: [{"sku": "UREA-50", "qty": 20}]. The customer must confirm before it proceeds."""
         return ops.create_order(customer_id, items, source_text)
 
     @tool
@@ -163,7 +167,8 @@ def build_tools(ops: MunshiTools) -> dict[str, BaseTool]:
 
     @tool
     def record_payment(customer_id: str, amount: float, method: str = "cash", ref: str = "") -> dict:
-        """Record a payment received at the office or by bank/JazzCash/Easypaisa/cheque; posts to the khata and drafts a receipt."""
+        """Record a payment received at the office or by bank/JazzCash/Easypaisa/cheque; posts to the khata and drafts a receipt.
+        customer_id comes from find_customer; amount is the figure the user wrote (e.g. '50 hazar' = 50000); method only if the user said it."""
         return ops.record_payment(customer_id, amount, method, ref)
 
     @tool
@@ -178,7 +183,8 @@ def build_tools(ops: MunshiTools) -> dict[str, BaseTool]:
 
     @tool
     def find_supplier(text: str) -> dict:
-        """Find a supplier by name, phone or ID, with what we owe them."""
+        """Look up a supplier by the name exactly as the user wrote it (any script or spelling), or a phone or ID, with what we owe them.
+        When several match it returns `ambiguous` with the candidates: ask which one. Always call this to get a supplier_id; never ask the user for an ID."""
         return ops.find_supplier(text)
 
     @tool
