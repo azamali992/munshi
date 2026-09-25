@@ -260,6 +260,27 @@ class MunshiTools:
     def top_customers(self, days: int = 30) -> list[dict]:
         return self.repo.top_customers(days)
 
+    # ---------- read-only lookups for approval cards (never write; never exposed as agent tools) ----------
+    # Which record already reverses this one, per reversible table. The table and column names are fixed
+    # here, never taken from input, so the ids are the only bound parameters.
+    _REVERSIBLE = {"expense": ("expenses", "expense_id"), "purchase": ("purchases", "purchase_id"), "supplier_entry": ("supplier_ledger", "entry_id")}
+
+    def reversed_by(self, kind: str, record_id: str) -> str | None:
+        """The id of the record that already reverses `record_id`, or None."""
+        if kind == "ledger":
+            return self.repo.reversal_of_ledger(record_id)
+        table, col = self._REVERSIBLE[kind]
+        r = self.repo._one(f"SELECT {col} AS rid FROM {table} WHERE reversal_of=? LIMIT 1", (record_id,))
+        return r["rid"] if r else None
+
+    def supplier_entry(self, entry_id: str):
+        """One supplier-khata entry (SupplierLedgerEntry), or None if there is no such entry."""
+        r = self.repo._one("SELECT entry_id, supplier_id, kind, amount, ref, method, created_at, reversal_of FROM supplier_ledger WHERE entry_id=?", (entry_id,))
+        return self.repo._supplier_entry(r) if r else None
+
+    def purchase_exists(self, purchase_id: str) -> bool:
+        return self.repo._one("SELECT 1 FROM purchases WHERE purchase_id=?", (purchase_id,)) is not None
+
     # ---------- helpers ----------
     def _order(self, o) -> dict:
         d = asdict(o); d["total"] = o.total; d["load_units"] = o.load_units
