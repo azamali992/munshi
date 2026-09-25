@@ -96,6 +96,11 @@ def test_urdu_script_routes(results):
 # (eval/gold_followups.jsonl): answers to the munshi's own questions, remembered customers, whole-business questions,
 # stock coming in. Blind first run before the fix: 15.8% and 21.4% correct (0 wrong cards). Achieved after: 100% / 100%.
 FOLLOWUP_FLOORS = {"gold_user_session": 94.0, "gold_followups": 97.0}     # one message of margin on each
+# The owner-persona run (209 turns, Roman Urdu, typos, short replies; eval/gold_persona.jsonl, 57 reviewed turns built from
+# its failures): blind baseline on main 294920b was 7.1% correct with 9 WRONG cards (a duplicate order for an edit, two
+# customers merged into one card, a plan card '? on ?', ...). Achieved after the fix: 100%, 0 wrong cards. One message of margin.
+# gold_learned_memory (100%) and gold_hybrid_blind (offline rules: 95%) are gated here too, so none of them can slip unnoticed.
+FOLLOWUP_FLOORS |= {"gold_persona": 98.0, "gold_learned_memory": 96.0, "gold_hybrid_blind": 90.0}
 
 
 @pytest.fixture(scope="module")

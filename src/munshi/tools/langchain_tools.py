@@ -107,6 +107,13 @@ def build_tools(ops: MunshiTools) -> dict[str, BaseTool]:
         return ops.create_order(customer_id, items, source_text)
 
     @tool
+    def update_order(order_id: str, items: list[dict]) -> dict:
+        """Change a DRAFT order (never a confirmed one): items are ONLY the lines that change, each {"sku", "qty"} setting that
+        product's quantity on the draft (a product not on it is added); lines not listed stay as they are. Use this -- never
+        create_order -- when the user changes an order they already placed ('X ke order mei npk 15 kar do')."""
+        return ops.update_order(order_id, items)
+
+    @tool
     def confirm_order(order_id: str) -> dict:
         """Confirm a draft order after the customer has said yes."""
         return ops.confirm_order(order_id)
@@ -289,7 +296,7 @@ def build_tools(ops: MunshiTools) -> dict[str, BaseTool]:
 
     all_tools = [find_customer, get_customer_khata, search_products, get_stock, list_orders, get_order,
                  list_routes, list_vehicles, get_plan, list_stops, aging_report, get_digest, suggest_dispatch,
-                 create_order, confirm_order, cancel_order, allocate_order, create_dispatch_plan, approve_dispatch_plan,
+                 create_order, update_order, confirm_order, cancel_order, allocate_order, create_dispatch_plan, approve_dispatch_plan,
                  adjust_stock, transfer_stock, close_stop, record_deposit, credit_note, record_payment, record_expense, cashbook,
                  reverse_ledger_entry, reverse_expense,
                  find_supplier, list_suppliers, supplier_khata, payables_report, record_purchase, pay_supplier,

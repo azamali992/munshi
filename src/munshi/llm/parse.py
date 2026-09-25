@@ -59,16 +59,24 @@ _ID_RE = re.compile(r"(?<![a-z0-9-])(?:ord|dsp|stp|rem|rcp|crn|opb|rev|inv|exp|p
                     r"|(?<![a-z0-9-])[a-z]{1,4}-\d+[a-z0-9]*(?![a-z0-9])")
 _OTP_RE = re.compile(r"(?:otp|o\.t\.p|code|pin|او ٹی پی|اوٹی پی|کوڈ)\s*(?:hai|is|:|#|-|=)?\s*(\d{4,6})(?!\d)")
 _PHONE_RE = re.compile(r"(?<!\d)(?:\+?92|0)\d{2,3}[- ]?\d{7}(?!\d)")
-_DATE_RE = re.compile(r"(?<!\d)(?:\d{4}-\d{2}-\d{2}|\d{1,2}[/.]\d{1,2}[/.]\d{2,4})(?!\d)")
+_TAREEKH = r"(?:tareekh|tarikh|tareekh|taareekh|tarik|tareek|tarekh|تاریخ)"
+_DATE_RE = re.compile(r"(?<!\d)(?:\d{4}-\d{2}-\d{2}|\d{1,2}[/.]\d{1,2}[/.]\d{2,4}|\d{1,2}\s*" + _TAREEKH + r"(?!\w))(?!\d)")
+# a cheque / bank / transaction number is a reference, never an amount ('cheque no 004512', 'TID 88213')
+_REFNO_RE = re.compile(r"\b(?:cheque|check|chq|chek|tid|trx|txn|ref|transaction|slip|receipt)\s*(?:no\.?|number|num|#|:)?\s*#?\s*\d{3,}\b")
 _TIME_RE = re.compile(r"\[?\b\d{1,2}:\d{2}(?:\s?(?:am|pm))?\]?")
 _WEIGHT_RE = re.compile(r"(?<![\w.])\d+(?:\.\d+)?\s?(?:kg|kgs|kilo|kilos|ml|gm|gms|g|gram|grams)\b")
 _PRICE_RE = re.compile(r"(?:@|\bat\b|\brate\b|\bprice\b|\bqeemat\b|\bbhao\b)\s*(?:rs\.?\s*)?(\d+(?:\.\d+)?)"
-                       r"|(\d+(?:\.\d+)?)\s*(?:rs\.?\s*)?(?:rate|per bag|per bori|ka rate|ki rate|fi bori)\b")
+                       r"|(\d+(?:\.\d+)?)\s*(?:rs\.?\s*)?(?:rate|per bag|per bori|ka rate|ki rate|ke rate|ke rate pe|ke rate par|ki rate pe|fi bori)\b")
 _RANGE_RE = re.compile(r"(?<![\w.])\d+(?:\.\d+)?\s*(?:-|to|ya|or|یا)\s*\d+(?:\.\d+)?(?![\w.])")
 _NEG_RE = re.compile(r"(?:(?<=\s)|^)-\s?\d+(?:\.\d+)?")
 _TOKEN_RE = re.compile(r"x[a-z]+\d*x|[a-z]+|[؀-ۿ]+|\d+(?:\.\d+)?|[,.;:?!()%]")
 
 MASKS = {"xidx", "xotpx", "xmaskx", "xdatex", "xpricex", "xrangex", "xnegx"}
+# words that follow a number but are never a product: damage, dates, orders to buy, godown words ("couldn't find 'phati' in the
+# catalogue" was the answer to '6 bori phati hui thi')
+_NOT_PRODUCT = {fold(w) for w in """phati phata phat phate phatti kharab damage damaged toot tooti tuti gal gali geeli tareekh tarikh tarik taareekh date
+mangwa mangwao mangwana mangwani mangwa lo mangwalo godown gudam warehouse din days hafte mahine saal bori boriyan boriyon rate ke ki ka se tak
+bhej bhejo bhejna truck gaari gari aya aaya ayi aayi aye aaye dega denge diye diya liye liya chhoot chhot discount""".split()}
 MIN_PLAUSIBLE_LIMIT = 2000        # a line above max(this, 3 x stock on hand) is asked about, never carded
 _FILLER = {"of", "x"}
 _CONJ = {",", ".", "aur", "and", "&", "اور"}
@@ -139,6 +147,7 @@ def prepare(text: str, cat: Catalogue) -> Prepared:
         s = re.sub(rf"(?<![a-z0-9-]){re.escape(cat.sku_folded[i])}(?![a-z0-9-])", f" xsku{i}x ", s)
     otp_m = _OTP_RE.search(s)
     s = _OTP_RE.sub(" xotpx ", s)
+    s = _REFNO_RE.sub(" xmaskx ", s)
     s = _ID_RE.sub(" xidx ", s)
     s = _PHONE_RE.sub(" xmaskx ", s)
     s = _DATE_RE.sub(" xdatex ", s)
@@ -198,7 +207,11 @@ def mentions(tokens: list[str], cat: Catalogue) -> list[Mention]:
             if len(near) == 1:
                 hit = Mention(near.pop(), i, i + 1)
         if hit:
-            out.append(hit)
+            prev = out[-1] if out else None
+            if prev is not None and prev.sku == hit.sku and prev.end == hit.start:
+                prev.end = hit.end                  # 'cyper spray': two names of ONE product side by side are one mention
+            else:
+                out.append(hit)
             i = hit.end
         else:
             i += 1
@@ -267,6 +280,7 @@ def read_lines(tokens: list[str], cat: Catalogue, repo: MunshiRepository, ignore
         while j < len(tokens) and tokens[j] in cat.vocab and not any(x.start == j for x in ms):
             out.used.add(j)
             j += 1
+        m.end = j                                       # ... so 'gandum beej pandrah' is 15 of them
     befores = {id(m): _num_before(tokens, m) for m in ms}
     afters = {id(m): _num_after(tokens, m) for m in ms}
     label = {id(m): " ".join(tokens[m.start:m.end]) for m in ms}
@@ -403,10 +417,13 @@ def analyse_order(text: str, repo: MunshiRepository) -> OrderParse:
     cust = resolve_customer(pr.folded, repo, exclude=_exclusions(pr, ln), tokens=pr.tokens)
     problems = list(ln.problems)
     unknown = []
+    godown_words = {x for w in repo.list_warehouses() for x in words(fold(w.name)) + [fold(w.warehouse_id)]}
     for i in ln.orphans:
         note, what = orphan_note(pr.tokens, i)
         if pr.tokens[i + 1:i + 2] == ["%"] or what in ("percent", "discount", "off"):
             problems.append(f"a discount ('{pr.tokens[i]}%') -- discounts come from the customer's terms in Setup, not from the order message")
+        elif what and (what in godown_words or what in _NOT_PRODUCT):
+            problems.append(f"'{note}' -- what is this number for?")     # a godown, a date or an everyday word is never looked up as a product
         elif what:
             unknown.append(what)
             problems.append(f"'{note}' -- that isn't in the catalogue")
@@ -495,6 +512,7 @@ class AmountParse:
 
 def amount_in(text: str) -> AmountParse:
     s = _OTP_RE.sub(" ", fold(text))
+    s = _REFNO_RE.sub(" ", s)
     s = _ID_RE.sub(" ", s)
     s = _PHONE_RE.sub(" ", s)
     s = _DATE_RE.sub(" ", s)
@@ -522,6 +540,7 @@ def numbers_said(text: str, repo: MunshiRepository | None = None) -> set[float]:
     handled -- with IDs, OTPs, phone numbers, dates and times masked out. A quantity or amount a model passes must
     be one of these: numbers are read from the message, never computed or recalled."""
     s = _OTP_RE.sub(" ", fold(text))
+    s = _REFNO_RE.sub(" ", s)
     s = _ID_RE.sub(" ", s)
     s = _PHONE_RE.sub(" ", s)
     s = _DATE_RE.sub(" ", s)
@@ -568,6 +587,14 @@ def date_in(text: str, today: date | None = None) -> str | None:
     from munshi.domain.models import business_today
     today = today or business_today()
     t = fold(text)
+    m = re.search(r"(?<!\d)(\d{1,2})\s*" + _TAREEKH + r"(?!\w)", t)
+    if m:                                               # '30 tareekh tak': that day of this month, or of next month once it has passed
+        day = int(m.group(1))
+        y, mo = (today.year, today.month) if day >= today.day else ((today.year + 1, 1) if today.month == 12 else (today.year, today.month + 1))
+        try:
+            return date(y, mo, day).isoformat()
+        except ValueError:
+            return None
     for m in re.finditer(r"[a-z]+", t):                 # '2 october', 'october 2', '2nd oct'
         if m.group(0) not in _MONTHS:
             continue
