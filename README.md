@@ -111,6 +111,27 @@ owner     credit note Rana Brothers 5000 damaged bags → clerk tries to approve
 
 All 33 screens, captured by the CI walkthrough, are in [`docs/screens/`](docs/screens/).
 
+## Office console (`/office`)
+
+The phone app is chat-first; office data entry wants a big screen. `http://<server>/office` is a
+desktop-first console in the same app: same server, same phone + PIN sign-in (one session with the
+phone app), same permissions, same database and ledger rules. Laid out for 1280-1920px with a left
+nav and dense sortable tables; it folds to a top strip on a tablet. Owner and clerk only (a salesman or
+driver is sent to the phone app); owners and clerks find it under **More → Office console**.
+
+| Screen | What it does |
+|---|---|
+| Products & prices | Search/sort the catalogue (list price, cost and average cost for the owner, stock, low-stock flag). Owner: click a price to change it, or select rows for a bulk change (set / ± % / ± Rs) with an old → new preview before anything saves; add/edit in a side panel. Every price change -- from here, the phone app, a purchase or an import -- is kept in **price history** (old, new, when, who). |
+| Inventory | Stock by product × godown with totals, value at moving-average cost (owner) and a live check that stock equals the stock-ledger replay. Receive a purchase, transfer between godowns, adjust (owner). **Physical count**: type what you counted for a godown, preview the differences, and the owner posts them as adjustments ("stock count <date>") in one all-or-nothing step. Movement history per product with the balance after each move. |
+| Clients | Balance, days overdue, credit use and open orders for everyone; add/edit in a side panel (raising or removing a credit limit stays the owner's). A client's page: khata with running balance, open orders, statement link. |
+| Suppliers, Godowns | List/add/edit suppliers with what we owe and their khata; list/add godowns (owner). |
+| Import / export | The Excel template, import (row problems as a table) and export -- owner only. |
+
+Nothing in the console skips a rule: stock changes only through the stock ledger (never below zero),
+prices change only by the owner, and every write is audited with the signed-in person's name. It is
+plain HTML + ES modules under `src/munshi/web/static/office/` (no build step); the few API routes it
+adds are in `src/munshi/web/routes/office.py`. English only for now.
+
 ## Run it
 
 ```bash

@@ -11,7 +11,8 @@ account for 15 minutes. Change your PIN in **Settings**.
 **Create your business** (sign-in screen): business name, city, your name, mobile, PIN.
 Tick *sample data* to explore with Sultan Traders' numbers, or leave it off and start
 empty: add products and customers under **More**, or download the Excel template from
-**Setup → Import**, fill it in, upload it.
+**Setup → Import**, fill it in, upload it. Setting up many products or clients is quicker on
+a computer: see [Office console](#office-console-on-a-computer).
 
 ## Who sees what
 
@@ -69,6 +70,30 @@ top customers, and each product's movement history.
 backup, install on this phone, sign out. Owners also get **Staff** (add, edit, reset PIN,
 sign out of every phone) and **Setup** (business details, digest time, godowns, routes with
 stop order, vehicles with capacity, Excel import).
+
+## Office console (on a computer)
+
+For entering a lot of data, open **`<your Munshi address>/office`** on a computer or tablet (the owner
+and clerk also find it in the phone app under **More → Office console**). Sign in with the same phone
+number and PIN. It is the same business, the same numbers and the same rules -- just laid out in big
+tables:
+
+- **Products & prices** -- search and sort every product. The owner clicks a list price to change it
+  (Enter saves), or ticks several products and changes them together (set a price, ± %, ± Rs): a
+  preview shows old → new before anything is saved. Each product's side panel shows its **price
+  history** (who changed what, when), stock per godown and recent movements. The clerk can look but
+  not change prices.
+- **Inventory** -- stock per godown with totals (and its value, for the owner). **Receive purchase**,
+  **Transfer**, and (owner) **Adjust stock**. **Physical count**: pick the godown, type what you
+  counted (leave a row blank to skip it; Enter moves down), **Preview differences**, and the owner
+  **posts** them -- each difference becomes an adjustment named "stock count <date>". If stock moved
+  while you were counting (a van loaded), nothing is posted and you preview again. A count below
+  what is reserved for allocated orders is refused. **Movements** shows every in and out of a product
+  with the balance after each.
+- **Clients** -- balances, days overdue, credit used; add or edit a client. Raising or removing a
+  credit limit needs the owner. Open a client for their khata with running balance, open orders and
+  the **Statement**.
+- **Suppliers** (what we owe, their khata), **Godowns** (owner adds), **Import / export** (owner).
 
 ## Things to know
 
