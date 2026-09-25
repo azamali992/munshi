@@ -242,14 +242,19 @@ class CashMixin(DispatchMixin):
         """The customer was told this entry's amount and the balance after it (a WhatsApp receipt, an invoice at the
         door). Reversing it makes that balance wrong, so a correction goes out the same way, templated: what was
         cancelled, the reversal's number, and the balance now. Never the reason (free text is not sent to customers).
-        Nothing is sent for an entry the customer was never told about, or whose message failed."""
+        Nothing is sent for an entry the customer was never told about, or whose message failed.
+
+        This is the ONE place a reversal's customer message is queued (exactly one per reversal, whichever path
+        reversed it: the chat tool, the web form or a script). Callers must not queue their own on top of it."""
         if not self._customer_messages_for(r): return
         cust = self.get_customer(r["customer_id"])
+        if not (cust.phone or "").strip(): return
         what = {"payment": "Receipt", "invoice": "Invoice", "credit_note": "Credit note"}.get(r["kind"], "Entry")
         method = f", {r['method']}" if r["kind"] == "payment" and r["method"] else ""
+        why = " -- cheque returned unpaid" if r["kind"] == "payment" and (r["method"] or "") == "cheque" else ""
         self.queue_message("whatsapp", cust.phone,
                            f"{self.business_name}: Correction. {what} {r['entry_id']} (Rs {to_rupees(abs(int(r['amount']))):,.0f}{method}) has been cancelled "
-                           f"({rid}). Balance now Rs {self.outstanding(r['customer_id']):,.0f}.", rid)
+                           f"({rid}){why}. Balance now Rs {self.outstanding(r['customer_id']):,.0f}.", rid)
 
     # ------------------------------------------------------------ expenses
     @staticmethod
