@@ -10,7 +10,7 @@ import html
 import io
 from dataclasses import asdict
 
-from munshi.domain.models import to_paisa, to_rupees
+from munshi.domain.models import to_business_date, to_paisa, to_rupees
 from munshi.domain.repository import MunshiRepository, NotFoundError
 
 # Plain statement until the FBR e-invoicing integration (NTN/STRN, tax lines, QR code) exists.
@@ -87,7 +87,7 @@ th,td{{padding:8px 6px;border-bottom:1px solid #e5e5e5;text-align:left;vertical-
 @media print{{body{{background:#fff}}.sheet{{padding:0}}}}
 </style></head><body><div class="sheet">
 <div class="head"><div><h1>{esc(b['business_name'])}</h1><div class="muted">{esc(b.get('city',''))}{' · ' + esc(b['phone']) if b.get('phone') else ''}</div></div>
-<div style="text-align:right"><span class="badge">{esc(d['kind']).upper()}</span><div style="font-weight:700;margin-top:6px">{esc(d['number'])}</div><div class="muted">{esc(e['created_at'][:10])}</div></div></div>
+<div style="text-align:right"><span class="badge">{esc(d['kind']).upper()}</span><div style="font-weight:700;margin-top:6px">{esc(d['number'])}</div><div class="muted">{esc(to_business_date(e['created_at']).isoformat())}</div></div></div>
 <h2>Customer</h2><div><b>{esc(c['name'])}</b> · {esc(c['customer_id'])}<br><span class="muted">{esc(c.get('address') or '')}{' · ' if c.get('address') else ''}{esc(c['phone'])}</span></div>
 {lines_block}
 <div class="total">{esc(d['kind'])} amount: Rs {d['amount']:,.0f}</div>
@@ -116,7 +116,7 @@ def render_pdf(d: dict) -> bytes:
     muted = ParagraphStyle("m", parent=ss["Normal"], textColor=colors.HexColor("#666666"), fontSize=9)
     body = ss["Normal"]
     story = [Paragraph(html.escape(b["business_name"]), h), Paragraph(html.escape(f"{b.get('city', '')} {b.get('phone', '')}".strip()), muted), Spacer(1, 6),
-             Paragraph(f"<b>{d['kind'].upper()} {html.escape(d['number'])}</b> · {e['created_at'][:10]}", body), Spacer(1, 10),
+             Paragraph(f"<b>{d['kind'].upper()} {html.escape(d['number'])}</b> · {to_business_date(e['created_at']).isoformat()}", body), Spacer(1, 10),
              Paragraph(f"<b>{html.escape(c['name'])}</b> ({c['customer_id']})", body), Paragraph(html.escape(f"{c.get('address') or ''} {c['phone']}".strip()), muted), Spacer(1, 10)]
     if d["lines"]:
         data = [["Item", "Qty", "Rate", "Amount"]] + [[f"{l['name']} ({l['sku']})", f"{l['qty']} {l['unit']}", f"{l['unit_price']:,.0f}", f"{l['total']:,.0f}"] for l in d["lines"]]
@@ -156,7 +156,7 @@ def statement_html(repo: MunshiRepository, customer_id: str) -> str:
         deb = f"{e.amount:,.0f}" if amt_p > 0 else ""
         cred = f"{-e.amount:,.0f}" if amt_p < 0 else ""
         label = ("reversal of " + e.reversal_of) if e.reversal_of else e.kind.replace('_', ' ')
-        rows.append(f"<tr><td>{esc(e.created_at[:10])}</td><td>{esc(label)}<br><small>{esc(e.doc_no or e.entry_id)}</small></td><td class=n>{deb}</td><td class=n>{cred}</td><td class=n>{to_rupees(bal_p):,.0f}</td></tr>")
+        rows.append(f"<tr><td>{esc(to_business_date(e.created_at).isoformat())}</td><td>{esc(label)}<br><small>{esc(e.doc_no or e.entry_id)}</small></td><td class=n>{deb}</td><td class=n>{cred}</td><td class=n>{to_rupees(bal_p):,.0f}</td></tr>")
     return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Statement · {esc(c.name)}</title>
 <style>body{{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#f4f2ec}}.sheet{{max-width:720px;margin:0 auto;background:#fff;padding:26px}}table{{width:100%;border-collapse:collapse;font-size:13px}}th,td{{padding:7px 5px;border-bottom:1px solid #e5e5e5;text-align:left}}.n{{text-align:right;font-variant-numeric:tabular-nums}}th{{font-size:11px;color:#666;text-transform:uppercase}}</style></head>
 <body><div class="sheet"><h1 style="margin:0">{esc(b['business_name'])}</h1><p style="color:#666;margin:2px 0 14px">Statement of account · {esc(c.name)} ({esc(c.customer_id)})</p>
