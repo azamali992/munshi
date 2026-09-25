@@ -19,11 +19,11 @@ from datetime import timedelta
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, ToolMessage
 
-from munshi.agents.factory import AgentBundle, build_specialist
+from munshi.agents.factory import AgentBundle, build_specialist, is_real_model
 from munshi.domain.repository import MunshiRepository
 from munshi.llm import replies as RP
 from munshi.llm.parse import amount_in, analyse_close, analyse_order, customer_resolution, date_in, ids_in, int_in, is_bounce, method_in, sku_in, supplier_resolution, warehouses_in
-from munshi.llm.stub_model import Rule, StubToolCallingModel, contains, history, memo
+from munshi.llm.stub_model import NotUnderstood, Rule, StubToolCallingModel, contains, history, memo
 from munshi.llm.text import fold, is_urdu
 from munshi.tools.core import MunshiTools
 from munshi.tools.langchain_tools import build_tools
@@ -37,6 +37,12 @@ def _model(model, rules, fallback, prompt_fallbacks=(), fallback_fn=None):
 
 def _biz(repo: MunshiRepository) -> str:
     return repo.business_name
+
+
+def _lookups(model, *tools) -> list:
+    """Read-only name lookups a real model needs to turn a name into an ID itself (find_customer, search_products...).
+    The offline rules resolve names in code and never call them, so they are bound only for a real model."""
+    return list(tools) if is_real_model(model) else []
 
 
 # A reversal is only ever asked for against a named entry: the words alone are not enough.
@@ -147,7 +153,8 @@ def _period(text: str) -> tuple[str, str]:
 
 
 def _urdu_didnt(text: str) -> str | None:
-    return RP.t("didnt", True) if is_urdu(text) else None
+    """The explicit "didn't understand" outcome: Urdu wording for Urdu script, else the specialist's generic line."""
+    return NotUnderstood(RP.t("didnt", True)) if is_urdu(text) else None
 
 
 _KHATA = contains("khata", "balance", "outstanding", "baqi", "baaki", "udhaar", "udhar", "hisaab", "hisab", "owe", "owes", "dena hai", "dene hain",
@@ -156,7 +163,7 @@ _STOCKQ = contains("stock", "available", "kitna", "kitni", "kitne", "bachi", "pa
 
 
 # ------------------------------------------------------------------ Order
-def build_order_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChatModel | None = None, checkpointer=None) -> AgentBundle:
+def build_order_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChatModel | None = None, checkpointer=None, guarded: bool | None = None) -> AgentBundle:
     T = build_tools(ops); B = _biz(repo)
     read = [T["find_customer"], T["get_customer_khata"], T["search_products"], T["get_stock"], T["get_order"], T["list_orders"]]
     desk = read + [T["create_order"], T["confirm_order"], T["cancel_order"]]
@@ -227,13 +234,13 @@ def build_order_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChat
                [(lambda p: "cannot place orders" in p, "Drivers can't place orders or look up khata — please pass this to the office."),
                 (lambda p: "cannot confirm or cancel" in p, "Salesmen book drafts; the office confirms or cancels. Give me the customer and items to book.")],
                fallback)
-    return build_specialist("order", "Order Munshi", m, {"owner": desk, "clerk": desk, "salesman": booker, "driver": []}, prompts, checkpointer)
+    return build_specialist("order", "Order Munshi", m, {"owner": desk, "clerk": desk, "salesman": booker, "driver": []}, prompts, checkpointer, repo=repo, guarded=guarded)
 
 
 # ------------------------------------------------------------------ Godown
-def build_godown_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChatModel | None = None, checkpointer=None) -> AgentBundle:
+def build_godown_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChatModel | None = None, checkpointer=None, guarded: bool | None = None) -> AgentBundle:
     T = build_tools(ops); B = _biz(repo)
-    read = [T["get_stock"], T["list_orders"], T["get_order"], T["list_routes"], T["list_vehicles"], T["suggest_dispatch"], T["get_plan"]]
+    read = [T["get_stock"], T["list_orders"], T["get_order"], T["list_routes"], T["list_vehicles"], T["suggest_dispatch"], T["get_plan"]] + _lookups(model, T["search_products"])
     clerk = read + [T["allocate_order"], T["create_dispatch_plan"], T["approve_dispatch_plan"], T["transfer_stock"]]
     owner = clerk + [T["adjust_stock"]]
     prompts = {
@@ -294,11 +301,11 @@ def build_godown_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCha
                 (lambda p: "not allocate or plan" in p, "Salesmen can check stock; allocation and dispatch are the office's job."),
                 (lambda p: "view their plan" in p, "Drivers can see their stops with the Delivery Munshi: ask 'mera agla stop kaun sa hai'.")],
                fallback)
-    return build_specialist("godown", "Godown Munshi", m, {"owner": owner, "clerk": clerk, "salesman": [T["get_stock"]], "driver": [T["get_plan"]]}, prompts, checkpointer)
+    return build_specialist("godown", "Godown Munshi", m, {"owner": owner, "clerk": clerk, "salesman": [T["get_stock"]], "driver": [T["get_plan"]]}, prompts, checkpointer, repo=repo, guarded=guarded)
 
 
 # ------------------------------------------------------------------ Delivery
-def build_delivery_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChatModel | None = None, checkpointer=None) -> AgentBundle:
+def build_delivery_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChatModel | None = None, checkpointer=None, guarded: bool | None = None) -> AgentBundle:
     T = build_tools(ops); B = _biz(repo)
     tools = [T["get_plan"], T["list_stops"], T["get_order"], T["close_stop"]]
     prompts = {r: f"You are the Delivery Munshi for {B}, on the driver's phone. Show the stops in order and close each one with what was delivered, what came back, cash taken, and the customer's OTP. Never close a stop without the OTP." for r in ROLES}
@@ -351,7 +358,7 @@ def build_delivery_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseC
         return _urdu_didnt(t)
 
     m = _model(model, rules, "Tell me the plan ID to see stops, or close a stop: 'close STP-XXXX delivered all, cash 50000, OTP 1234'.", (), fallback)
-    return build_specialist("delivery", "Delivery Munshi", m, {"owner": tools, "clerk": tools, "salesman": [], "driver": tools}, prompts, checkpointer)
+    return build_specialist("delivery", "Delivery Munshi", m, {"owner": tools, "clerk": tools, "salesman": [], "driver": tools}, prompts, checkpointer, repo=repo, guarded=guarded)
 
 
 # ------------------------------------------------------------------ Hisaab
@@ -366,9 +373,9 @@ def _expense_category(t: str) -> str:
     return next((c for c, ws in _EXPENSE_CATS if contains(*ws)(t)), "misc")
 
 
-def build_hisaab_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChatModel | None = None, checkpointer=None) -> AgentBundle:
+def build_hisaab_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChatModel | None = None, checkpointer=None, guarded: bool | None = None) -> AgentBundle:
     T = build_tools(ops); B = _biz(repo)
-    read = [T["get_digest"], T["get_plan"], T["list_stops"], T["get_customer_khata"], T["cashbook"]]
+    read = [T["get_digest"], T["get_plan"], T["list_stops"], T["get_customer_khata"], T["cashbook"]] + _lookups(model, T["find_customer"])
     clerk = read + [T["record_deposit"], T["record_payment"], T["record_expense"]]
     owner = clerk + [T["credit_note"], T["reverse_ledger_entry"], T["reverse_expense"]]
     prompts = {
@@ -436,11 +443,11 @@ def build_hisaab_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCha
                 (lambda p: "don't record money" in p, "Payments are recorded by the office — tell the clerk."),
                 (lambda p: "don't record deposits" in p, "Drivers hand the cash to the cashier; the office records it.")],
                fallback)
-    return build_specialist("hisaab", "Hisaab Munshi", m, {"owner": owner, "clerk": clerk, "salesman": [], "driver": []}, prompts, checkpointer)
+    return build_specialist("hisaab", "Hisaab Munshi", m, {"owner": owner, "clerk": clerk, "salesman": [], "driver": []}, prompts, checkpointer, repo=repo, guarded=guarded)
 
 
 # ------------------------------------------------------------------ Khareed (purchases)
-def build_khareed_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChatModel | None = None, checkpointer=None) -> AgentBundle:
+def build_khareed_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChatModel | None = None, checkpointer=None, guarded: bool | None = None) -> AgentBundle:
     T = build_tools(ops); B = _biz(repo)
     read = [T["find_supplier"], T["list_suppliers"], T["supplier_khata"], T["payables_report"], T["get_stock"], T["search_products"]]
     clerk = read + [T["record_purchase"]]
@@ -503,14 +510,14 @@ def build_khareed_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCh
                [(lambda p: "need the owner" in p, "Supplier payments and reversals need the owner's approval."),
                 (lambda p: "don't handle purchases" in p, "Purchases are handled by the office.")],
                fallback)
-    return build_specialist("khareed", "Khareed Munshi", m, {"owner": owner, "clerk": clerk, "salesman": [], "driver": []}, prompts, checkpointer)
+    return build_specialist("khareed", "Khareed Munshi", m, {"owner": owner, "clerk": clerk, "salesman": [], "driver": []}, prompts, checkpointer, repo=repo, guarded=guarded)
 
 
 # ------------------------------------------------------------------ Wasooli
-def build_wasooli_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChatModel | None = None, checkpointer=None) -> AgentBundle:
+def build_wasooli_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChatModel | None = None, checkpointer=None, guarded: bool | None = None) -> AgentBundle:
     T = build_tools(ops); B = _biz(repo)
-    office = [T["aging_report"], T["get_customer_khata"], T["broken_promises"], T["draft_reminder"], T["draft_due_reminders"], T["send_reminder"], T["log_promise"]]
-    field = [T["aging_report"], T["get_customer_khata"], T["log_promise"]]
+    office = [T["aging_report"], T["get_customer_khata"], T["broken_promises"], T["draft_reminder"], T["draft_due_reminders"], T["send_reminder"], T["log_promise"]]         + _lookups(model, T["find_customer"])
+    field = [T["aging_report"], T["get_customer_khata"], T["log_promise"]] + _lookups(model, T["find_customer"])
     prompts = {
         "owner": f"You are the Wasooli Munshi for {B}. Age the receivables, draft templated reminders in the right tone for how overdue each account is, log promises to pay, and escalate the ones that slip. Never write free text to a customer; only approved templates go out.",
         "clerk": f"You are the Wasooli Munshi for {B}. Draft and send templated reminders after approval; log promises; flag broken ones.",
@@ -563,11 +570,11 @@ def build_wasooli_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCh
 
     m = _model(model, rules, "I can show aging, draft reminders for overdue accounts, send an approved reminder, log a promise to pay, or list broken promises.",
                [(lambda p: "don't run collections" in p, "Collections are run by the office.")], fallback)
-    return build_specialist("wasooli", "Wasooli Munshi", m, {"owner": office, "clerk": office, "salesman": field, "driver": []}, prompts, checkpointer)
+    return build_specialist("wasooli", "Wasooli Munshi", m, {"owner": office, "clerk": office, "salesman": field, "driver": []}, prompts, checkpointer, repo=repo, guarded=guarded)
 
 
 # ------------------------------------------------------------------ Report (read-only)
-def build_report_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChatModel | None = None, checkpointer=None) -> AgentBundle:
+def build_report_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChatModel | None = None, checkpointer=None, guarded: bool | None = None) -> AgentBundle:
     T = build_tools(ops); B = _biz(repo)
     tools = [T["get_digest"], T["sales_report"], T["profit_summary"], T["collection_report"], T["stock_ledger"], T["stock_valuation"], T["slow_stock"], T["top_customers"], T["payables_report"], T["aging_report"]]
     prompts = {
@@ -596,11 +603,11 @@ def build_report_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCha
     ]
     m = _model(model, rules, "Ask for sales, profit, collections, stock valuation, slow stock, top customers or a product's stock ledger.",
                [(lambda p: "for the office" in p, "Reports are for the office.")], lambda t, s: _urdu_didnt(t))
-    return build_specialist("report", "Report Munshi", m, {"owner": tools, "clerk": tools, "salesman": [], "driver": []}, prompts, checkpointer)
+    return build_specialist("report", "Report Munshi", m, {"owner": tools, "clerk": tools, "salesman": [], "driver": []}, prompts, checkpointer, repo=repo, guarded=guarded)
 
 
 # ------------------------------------------------------------------ Help desk (no tools, ever)
-def build_help_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChatModel | None = None, checkpointer=None) -> AgentBundle:
+def build_help_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChatModel | None = None, checkpointer=None, guarded: bool | None = None) -> AgentBundle:
     """Greetings, thanks, 'what can you do', and plain refusals of what no munshi may do. It has no tool for any
     role, and it always answers from the fixed, reviewed strings in llm/replies.py -- even when a real model is
     configured -- so a refusal can't be talked into something else and never depends on a provider being up."""
@@ -633,10 +640,10 @@ def build_help_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChatM
             return RP.t("ack", urdu)
         if M._OFFTOPIC(t):
             return RP.t("offtopic", urdu)
-        return RP.t("didnt", urdu, closest="an order or a khata question")
+        return NotUnderstood(RP.t("didnt", urdu, closest="an order or a khata question"))
 
     m = StubToolCallingModel(rules=[], fallback_text="", fallback_fn=reply)
-    return build_specialist("help", "Munshi", m, {r: [] for r in ROLES}, prompts, checkpointer)
+    return build_specialist("help", "Munshi", m, {r: [] for r in ROLES}, prompts, checkpointer, repo=repo, guarded=guarded)
 
 
 BUILDERS = {

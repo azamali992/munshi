@@ -19,6 +19,27 @@ card()            what the human reads before approving (CardBuilder): names,
 A message sent while a card waits never reaches the paused graph: a plain
 read-only question goes to the Report munshi; anything else gets the waiting
 card back (Reply.waiting) so it can be decided right there.
+
+Two engines, deterministic first. The RULES engine (manager + specialists on the
+offline language layer, llm/*) always runs first. With a real model configured
+(LLM_PROVIDER=groq) there is also a MODEL engine (the same specialists and tools on
+the real model, with agents.guard.EntityGuard checking every tool call against the
+message). A message goes to the model engine only when the rules engine explicitly
+did not understand it: its manager routed nowhere, or its specialist ended the turn
+with the stub's NOT_UNDERSTOOD outcome (llm.stub_model.not_understood). A card, a
+read, a refusal or a clarifying question from the rules engine is the reply, and no
+model is called. If the model call fails (timeout, rate limit, provider error) the
+rules engine's own reply is used. With no real model, only the rules engine exists
+and nothing here changes.
+
+The engines never share a paused graph. Model-engine checkpoints live under
+"{thread}:{role}:{specialist}:llm" (rules: "{thread}:{role}:{specialist}"; a rules key
+always ends in a specialist name, so the two can't collide), and a card raised by the
+model engine has an approval id starting with MODEL_APPROVAL_PREFIX ("L"; rules ids are
+upper-case hex, 0-9A-F). resolve() reads the engine off the id and resumes that
+engine's graph from the shared (SQLite) checkpointer, so it survives a restart -- even
+one with the model switched off (the model engine's graph is then rebuilt on the
+offline model just to finish the approved action).
 """
 from __future__ import annotations
 
@@ -32,22 +53,56 @@ from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.types import Command
 
+from munshi.agents import guard
+from munshi.agents.factory import is_real_model
 from munshi.agents.manager import CLARIFY, build_manager, classify
 from munshi.agents.specialists import BUILDERS
 from munshi.channels import build_channel, deliver_outbox
 from munshi.domain.models import discounted_paisa, to_paisa, to_rupees, today_iso
 from munshi.domain.repository import MunshiRepository
 from munshi.domain.seed import seeded_repository
+from munshi.llm.stub_model import not_understood
+from munshi.llm.text import is_urdu
 from munshi.observability.tracing import TurnTrace, configure_tracking, trace_turn
 from munshi.safety.middleware import DEFERRED_KEY
 from munshi.safety.risk import RiskTier, approval_refusal, approver_for, risk_of, same_person, stricter_role
 from munshi.tools.core import MunshiTools
 
 log = logging.getLogger("munshi.platform")
+
+RULES, MODEL = "rules", "model"
+MODEL_APPROVAL_PREFIX = "L"          # approval ids raised by the model engine; the rules engine's are hex (0-9A-F)
+# said instead of a model reply that claims an action no tool took
+NOTHING_DONE = "Nothing was recorded -- I couldn't turn that into an action."
+NOTHING_DONE_UR = "کچھ درج نہیں ہوا۔"
+
+
+def engine_of(approval_id: str) -> str:
+    """Which engine raised this approval (and so which graph resumes it)."""
+    return MODEL if str(approval_id).startswith(MODEL_APPROVAL_PREFIX) else RULES
+
+
+class _ModelCalls(BaseCallbackHandler):
+    """Counts chat-model requests in one turn (cost/latency visibility)."""
+
+    def __init__(self) -> None:
+        self.n = 0
+        self.tokens = 0
+
+    def on_chat_model_start(self, serialized, messages, **kwargs) -> None:
+        self.n += 1
+
+    def on_llm_end(self, response, **kwargs) -> None:
+        try:
+            usage = (response.llm_output or {}).get("token_usage") or {}
+            self.tokens += int(usage.get("total_tokens") or 0)
+        except Exception:
+            pass
 
 
 @dataclass
@@ -99,6 +154,10 @@ class Reply:
     pending: PendingApproval | None = None      # a card THIS turn raised
     thread_id: str | None = None
     waiting: PendingApproval | None = None      # an earlier card this message is held behind (nothing new was asked for)
+    engine: str = RULES                         # which engine produced the reply: rules | model
+    model_calls: int = 0                        # real-model requests this turn made (0 when the rules answered)
+    model_tokens: int = 0                       # tokens those requests used, as the provider reported them
+    model_error: str | None = None              # the model failed and the rules' reply was used instead
 
 
 # ====================================================================== approval cards
@@ -669,8 +728,18 @@ class MunshiPlatform:
             self._ckpt_conn = sqlite3.connect(checkpoint_path, check_same_thread=False)
             checkpointer = SqliteSaver(self._ckpt_conn)
             checkpointer.setup()
-        self.specialists = {name: build(self.ops, self.repo, model, checkpointer) for name, build in BUILDERS.items()}
-        self.manager = build_manager(model)
+        self._checkpointer = checkpointer
+        # the rules engine: always there, always first
+        self.specialists = {name: build(self.ops, self.repo, None, checkpointer) for name, build in BUILDERS.items()}
+        self.manager = build_manager(None)
+        # the model engine: only with a real model, only for what the rules didn't understand
+        self.model = model if is_real_model(model) else None
+        self.llm_specialists: dict | None = None
+        self.llm_manager = None
+        if self.model is not None:
+            self.llm_specialists = {name: build(self.ops, self.repo, self.model, checkpointer) for name, build in BUILDERS.items() if name != "help"}
+            self.llm_manager = build_manager(self.model)
+        self._resume_only: dict = {}
         self.cards = CardBuilder(self.repo, self.ops)
 
     def close(self) -> None:
@@ -707,10 +776,26 @@ class MunshiPlatform:
                 pass
         return need
 
-    def _cfg(self, thread_id: str, role: str, specialist: str) -> dict:
+    def _cfg(self, thread_id: str, role: str, specialist: str, engine: str = RULES) -> dict:
         # Role is part of the checkpoint key: a driver and a clerk on the same
         # conversation never share a specialist's memory or its pending action.
-        return {"configurable": {"thread_id": f"{thread_id}:{role}:{specialist}"}}
+        # So is the engine: the model engine's graphs live under their own ':llm' keys.
+        return {"configurable": {"thread_id": f"{thread_id}:{role}:{specialist}" + (":llm" if engine == MODEL else "")}}
+
+    @property
+    def hybrid(self) -> bool:
+        return self.llm_specialists is not None
+
+    def _bundle(self, engine: str, specialist: str):
+        if engine == RULES:
+            return self.specialists[specialist]
+        if self.llm_specialists is not None and specialist in self.llm_specialists:
+            return self.llm_specialists[specialist]
+        # A model-engine card, but no model configured now (e.g. restarted offline): the same graph -- same
+        # tools, same approval gate and guard -- on the offline model, only to finish the approved action.
+        if specialist not in self._resume_only:
+            self._resume_only[specialist] = BUILDERS[specialist](self.ops, self.repo, None, self._checkpointer, guarded=True)
+        return self._resume_only[specialist]
 
     def _trace(self, agent: str, role: str, text: str):
         return trace_turn(agent, role, text) if self.enable_tracing else nullcontext(TurnTrace(agent_name=agent, role=role, user_text=text))
@@ -725,40 +810,189 @@ class MunshiPlatform:
         with self._lock, self.repo.acting_as(user):
             self.repo.add_chat(thread_id, role, text, {"user": user})
             with self._trace("manager", role, text) as tr:
-                specialist = classify(self.manager, text, role)
-                tr.specialist = specialist
-                if specialist is None:
-                    self.repo.add_chat(thread_id, "munshi", CLARIFY, {"specialist": None})
-                    return Reply(CLARIFY, None, None, thread_id)
-
-                # A thread can only hold one pending action per specialist per role, and a paused graph is
-                # NEVER invoked with a new message. A plain read-only question goes to the Report munshi
-                # instead (its own thread namespace, no write tools for any role); anything else is
-                # answered with the card it is waiting behind, so it can be decided right there.
-                held = sorted((p for p in self.repo.pending_approvals(thread_id) if p["specialist"] == specialist and p["requested_by_role"] == role),
-                              key=lambda p: p["created_at"])
-                if held:
-                    if self._read_only_question(text) and self._report_answers(role, thread_id):
-                        specialist = tr.specialist = "report"
-                    else:
-                        pa = self._pa(held[0])
-                        txt = self._still_waiting(pa)
-                        self.repo.add_chat(thread_id, "munshi", txt, {"specialist": specialist, "waiting_on": pa.approval_id})
-                        tr.response_text = txt
-                        return Reply(txt, specialist, None, thread_id, waiting=pa)
-
-                bundle = self.specialists[specialist]
-                cfg = self._cfg(thread_id, role, specialist)
-                self._clear_orphaned_interrupt(bundle, cfg)
-                result = bundle.agent.invoke({"messages": [HumanMessage(text)], "role": role}, config=cfg)
-                reply = self._settle(bundle, specialist, thread_id, role, user, result, tr)
-                self.repo.add_chat(thread_id, "munshi", reply.text, {"specialist": specialist} | ({"approval_id": reply.pending.approval_id} if reply.pending else {}))
+                reply, meta, understood = self._turn(RULES, thread_id, role, text, user, tr)
+                if not understood and self.hybrid:
+                    reply, meta = self._model_turn(thread_id, role, text, user, tr, reply, meta)
+                self.repo.add_chat(thread_id, "munshi", reply.text, meta)
                 return reply
+
+    def _turn(self, engine: str, thread_id: str, role: str, text: str, user: str, tr, config: dict | None = None,
+              context: list | None = None) -> tuple[Reply, dict, bool]:
+        """One engine's go at a message: (reply, chat-log meta, understood). `understood` is False only when the
+        engine's manager routed nowhere or, in hybrid mode, the rules specialist ended on the explicit
+        NOT_UNDERSTOOD outcome."""
+        manager = self.manager if engine == RULES else self.llm_manager
+        specialist = classify(manager, text, role, config=config, context=context)
+        tr.specialist = specialist
+        if specialist is None:
+            return Reply(CLARIFY, None, None, thread_id, engine=engine), {"specialist": None}, False
+
+        # A thread can only hold one pending action per specialist per role (whichever engine raised it), and a
+        # paused graph is NEVER invoked with a new message. A plain read-only question goes to the Report munshi
+        # instead (its own thread namespace, no write tools for any role); anything else is answered with the
+        # card it is waiting behind, so it can be decided right there.
+        held = sorted((p for p in self.repo.pending_approvals(thread_id) if p["specialist"] == specialist and p["requested_by_role"] == role),
+                      key=lambda p: p["created_at"])
+        if held:
+            if self._read_only_question(text) and self._report_answers(role, thread_id):
+                specialist = tr.specialist = "report"
+            else:
+                pa = self._pa(held[0])
+                txt = self._still_waiting(pa)
+                tr.response_text = txt
+                return (Reply(txt, specialist, None, thread_id, waiting=pa, engine=engine),
+                        {"specialist": specialist, "waiting_on": pa.approval_id}, True)
+
+        bundle = self._bundle(engine, specialist)
+        cfg = self._cfg(thread_id, role, specialist, engine)
+        self._clear_orphaned_interrupt(bundle, cfg)
+        result = bundle.agent.invoke({"messages": [*(context or []), HumanMessage(text)], "role": role}, config=cfg | (config or {}))
+        if engine == RULES and self.hybrid and not result.get("__interrupt__") and not_understood(result["messages"][-1]):
+            return Reply(self._final_text(result), specialist, None, thread_id, engine=engine), {"specialist": specialist}, False
+        reply = self._settle(bundle, specialist, thread_id, role, user, result, tr, engine=engine, config=config)
+        reply.engine = engine
+        return reply, {"specialist": specialist} | ({"approval_id": reply.pending.approval_id} if reply.pending else {}), True
+
+    # ------------------------------------------------------------------ the model engine
+    _CONTEXT_LINES = 4
+
+    def _history_lines(self, thread_id: str, n: int = 12) -> list[str]:
+        """This conversation's earlier lines (oldest first), without the message being answered."""
+        return [str(r["text"]) for r in self.repo.chat_history(thread_id, n + 1)[:-1]]
+
+    def _context(self, thread_id: str, text: str) -> list:
+        """One note ahead of the message: the reply script, decided in code from the message (a system-prompt rule
+        alone was not enough: the model answered Roman Urdu in Urdu script), and the last few lines of the chat,
+        whichever engine answered them (the model engine's own memory doesn't hold the turns the rules answered)."""
+        script = ("The next message is written in Urdu script: reply in Urdu script." if is_urdu(text) else
+                  "The next message is written in Latin letters (Roman Urdu or English): reply ONLY in Latin letters, in the same "
+                  "language as the message -- Roman Urdu for Roman Urdu. Do not use Urdu script.")
+        try:
+            read = guard.hints(text, self.repo)
+        except Exception:
+            log.exception("hints failed")
+            read = ""
+        rows = self.repo.chat_history(thread_id, self._CONTEXT_LINES + 1)[:-1]
+        lines = "\n".join(f"{'munshi' if r['role'] == 'munshi' else 'user'}: {str(r['text'])[:240]}" for r in rows)
+        earlier = f"\nEarlier in this chat, for context only -- act on the next message:\n{lines}" if rows else ""
+        return [HumanMessage(f"(Note from the system, not from the user. {script}" + (f" {read}" if read else "") + f"{earlier})")]
+
+    # A model reply that says something was done (recorded, created, received...) when no write ran and no card was
+    # raised this turn. Seen on real traffic: "Green Valley ka payment record kar diya gaya" with no tool call at all.
+    _CLAIM = re.compile(r"\b(record(ed)?|darj|saved?|created|posted|added|done|kar dia|kar diya|kar di|kar diye|kr diya|ho gaya|ho gayi|ho gaye|ho gya|"
+                        r"ho chuka|ho chuki|bana diya|bana di|tayyar|tayar|jama ho|wusool ho|wasool ho|vasool ho|mil gaye|mil gaya|bhej diya|bhej di)\b"
+                        r"|کر دیا|کر دی|کردیا|ہو گیا|ہو گئی|ہو گئے|ہوگیا|تیار|درج|وصول ہو|بھیج دیا|بنا دیا", re.I)
+
+    @classmethod
+    def _claims_done(cls, text: str) -> bool:
+        """A sentence asserting completion. A question ('delivery ho gayi?') or a negation ('nothing was recorded',
+        'darj nahi hua') is not a claim."""
+        for s in re.split(r"(?<=[.!۔\n])\s+", str(text)):
+            s = s.strip()
+            if not s or s.rstrip("*_ )").endswith(("?", "؟")) or cls._NEG.search(s):
+                continue
+            if cls._CLAIM.search(s):
+                return True
+        return False
+
+    _NEG = re.compile(r"\b(not|nothing|no|never|nahi|nahin|nai|na|mat|couldn't|can't|cannot|won't|haven't|hasn't|isn't|wasn't)\b|نہیں|نہ ", re.I)
+
+    _URDU_CHARS = re.compile(r"[؀-ۿ]")
+
+    @classmethod
+    def _latin_only(cls, text: str) -> str:
+        """For a message typed in Latin letters: drop the sentences of a model reply written wholly in Urdu script
+        (typically a tacked-on 'کوئی اور مدد؟'), but only when a Latin-letter part remains -- a reply that is all Urdu
+        script is left as it is rather than emptied."""
+        parts = re.split(r"(?<=[.!?۔؟\n])\s+", str(text))
+        keep = [s for s in parts if not (cls._URDU_CHARS.search(s) and not re.search(r"[A-Za-z]{2,}", s))]
+        return " ".join(keep).strip() if keep and len(keep) < len(parts) else text
+
+    def _guard_refused(self, reply: Reply, thread_id: str, role: str) -> bool:
+        """The reply is the entity guard's own question (agents/guard.py), not model text."""
+        try:
+            msgs = self._bundle(MODEL, reply.specialist).agent.get_state(self._cfg(thread_id, role, reply.specialist, MODEL)).values.get("messages", [])
+            return bool(msgs) and guard.guard_refusal(msgs[-1]) is not None
+        except Exception:
+            return False
+
+    def _acted(self, bundle, cfg: dict) -> bool:
+        """Did this model turn run a write (OTP-gated close_stop) -- i.e. a non-read tool result after the message?"""
+        try:
+            msgs = bundle.agent.get_state(cfg).values.get("messages", [])
+        except Exception:
+            return True
+        h = max((i for i, m in enumerate(msgs) if isinstance(m, HumanMessage)), default=-1)
+        return any(isinstance(m, ToolMessage) and m.name and self._is_write(m.name) and m.status != "error" for m in msgs[h + 1:])
+
+    @staticmethod
+    def _is_write(tool: str) -> bool:
+        try:
+            return risk_of(tool) != RiskTier.READ_ONLY
+        except ValueError:
+            return True
+
+    def _model_turn(self, thread_id: str, role: str, text: str, user: str, tr, fallback: Reply, fallback_meta: dict) -> tuple[Reply, dict]:
+        """The real model's go at a message the rules didn't understand. Any failure -- timeout, rate limit,
+        provider error, a malformed reply -- gives the rules' own reply instead; never a stack trace."""
+        calls = _ModelCalls()
+        token = guard.set_history(self._history_lines(thread_id))
+        try:
+            reply, meta, _ = self._turn(MODEL, thread_id, role, text, user, tr, config={"callbacks": [calls]}, context=self._context(thread_id, text))
+            if reply.specialist is None:                   # the model routed nowhere either: the rules' answer stands
+                reply, meta = fallback, dict(fallback_meta)
+            elif (reply.pending is None and reply.waiting is None and not self._guard_refused(reply, thread_id, role) and self._claims_done(reply.text)
+                  and not self._acted(self._bundle(MODEL, reply.specialist), self._cfg(thread_id, role, reply.specialist, MODEL))):
+                # it says it did something it didn't: never let that stand -- nothing was recorded, and the rules' reply says what to send
+                log.warning("model claimed an action it didn't take on %s: %r", thread_id, reply.text[:160])
+                claim = reply.text
+                reply = Reply(f"{NOTHING_DONE_UR if is_urdu(text) else NOTHING_DONE} {fallback.text}", reply.specialist, None, thread_id, engine=MODEL)
+                meta = {"specialist": reply.specialist, "claim_blocked": claim[:200]}
+            elif reply.pending is None and not is_urdu(text):
+                trimmed = self._latin_only(reply.text)
+                if trimmed != reply.text:
+                    meta = meta | {"script_trimmed": reply.text[:200]}
+                    reply.text = trimmed
+        except Exception as e:
+            log.warning("model turn failed on %s (%s: %s); answering from the rules", thread_id, type(e).__name__, str(e)[:200])
+            self._heal_model_threads(thread_id, role)
+            reply, meta = fallback, dict(fallback_meta)
+            reply.model_error = meta["model_error"] = type(e).__name__
+        finally:
+            guard.reset_history(token)
+        reply.model_calls, reply.model_tokens = calls.n, calls.tokens
+        return reply, meta | {"engine": reply.engine, "model_calls": calls.n, "model_tokens": calls.tokens}
+
+    def _heal_model_threads(self, thread_id: str, role: str) -> None:
+        """After a failed model turn, leave no model-engine thread of this conversation holding a tool call with
+        no answer (the provider would refuse every later request on it). A call paused behind a card is untouched."""
+        for specialist, bundle in (self.llm_specialists or {}).items():
+            cfg = self._cfg(thread_id, role, specialist, MODEL)
+            try:
+                self._heal(bundle, cfg)
+            except Exception:
+                log.exception("couldn't heal %s", cfg["configurable"]["thread_id"])
+
+    @staticmethod
+    def _heal(bundle, cfg: dict) -> None:
+        state = bundle.agent.get_state(cfg)
+        if not state.values or state.interrupts:
+            return
+        msgs = state.values.get("messages", [])
+        ai_i = max((i for i, m in enumerate(msgs) if isinstance(m, AIMessage) and m.tool_calls), default=-1)
+        if ai_i < 0:
+            return
+        answered = {m.tool_call_id for m in msgs[ai_i + 1:] if isinstance(m, ToolMessage)}
+        missing = [tc for tc in msgs[ai_i].tool_calls if tc["id"] not in answered]
+        if missing:
+            bundle.agent.update_state(cfg, {"messages": [ToolMessage(content="Not run: the turn failed before this call finished.", tool_call_id=tc["id"],
+                                                                     name=tc["name"], status="error") for tc in missing]}, as_node="tools")
 
     # ------------------------------------------------------------------ pausing on a gated call
     _MAX_DECLINES = 3
 
-    def _settle(self, bundle, specialist: str, thread_id: str, role: str, user: str, result: dict, tr, lead: str = "") -> Reply:
+    def _settle(self, bundle, specialist: str, thread_id: str, role: str, user: str, result: dict, tr, lead: str = "",
+                engine: str = RULES, config: dict | None = None) -> Reply:
         """Turn a specialist run into a Reply. If the run paused on a gated call,
         persist exactly one approval card for it -- unless the call references
         something that doesn't exist (or the pause holds more than one action,
@@ -776,13 +1010,13 @@ class MunshiPlatform:
             reqs = value.get("action_requests", [])
             problem = "only one action needing approval can be asked for at a time" if len(reqs) != 1 else self._unresolvable(reqs[0]["name"], reqs[0]["args"])
             if problem is None:
-                return self._open_card(bundle, specialist, thread_id, role, user, reqs[0], value.get(DEFERRED_KEY, []), problems, tr, lead)
+                return self._open_card(bundle, specialist, thread_id, role, user, reqs[0], value.get(DEFERRED_KEY, []), problems, tr, lead, engine)
             log.warning("declined gated call on %s/%s: %s", thread_id, specialist, problem)
             problems.append(problem)
             if len(problems) > self._MAX_DECLINES:
                 break
             result = bundle.agent.invoke(Command(resume={"decisions": [{"type": "reject", "message": f"Not asked for: {problem}."}] * max(len(reqs), 1)}),
-                                         config=self._cfg(thread_id, role, specialist))
+                                         config=self._cfg(thread_id, role, specialist, engine) | (config or {}))
         if problems and lead:
             txt = f"{lead}A follow-up action couldn't be asked for — {problems[0]}. That follow-up was not done."
         elif problems:
@@ -793,9 +1027,11 @@ class MunshiPlatform:
         return Reply(txt, specialist, None, thread_id)
 
     def _open_card(self, bundle, specialist: str, thread_id: str, role: str, user: str, req: dict, deferred: list[dict], problems: list[str], tr,
-                   lead: str = "") -> Reply:
+                   lead: str = "", engine: str = RULES) -> Reply:
         tool = req["name"]
-        pa = PendingApproval(uuid.uuid4().hex[:10].upper(), thread_id, specialist, tool, req["args"],
+        # the approval id records the engine whose graph is paused on this call (see engine_of / resolve)
+        aid = (MODEL_APPROVAL_PREFIX + uuid.uuid4().hex[:9].upper()) if engine == MODEL else uuid.uuid4().hex[:10].upper()
+        pa = PendingApproval(aid, thread_id, specialist, tool, req["args"],
                              risk_of(tool).value, self._needs_role(tool, req["args"]), role, user)
         self.repo.save_approval(asdict(pa))
         later = ""
@@ -944,33 +1180,78 @@ class MunshiPlatform:
                 why = self.decision_refusal(pa, role, user)
                 if why:
                     raise PermissionError(why)
-            bundle = self.specialists[pa.specialist]
+            engine = engine_of(pa.approval_id)              # resumed by the SAME engine that paused it
+            bundle = self._bundle(engine, pa.specialist)
+            cfg = self._cfg(pa.thread_id, pa.requested_by_role, pa.specialist, engine)
+            calls = _ModelCalls()
             decision = {"type": "approve"} if approve else {"type": "reject", "message": note or f"rejected by {role}"}
-            with self._trace(f"{pa.specialist}.resume", role, f"{'approve' if approve else 'reject'} {pa.tool}") as tr:
-                tr.approval_decision = "approve" if approve else "reject"
-                # the approval is on record BEFORE the tool runs: the audit trail never shows a write ahead of its approval
-                self.repo.resolve_approval(approval_id, approve, user or role, note)
-                self.repo.audit(role, "approval_" + ("granted" if approve else "rejected"), "approval", approval_id,
-                                {"tool": pa.tool, "args": pa.args, "specialist": pa.specialist, "note": note}, approved_by=role)
-                signature = (f"{role}:{user}" if user.strip() else role) if approve else ""
-                try:
-                    with self.repo.acting_as(pa.requested_by, approved_by=signature):
-                        result = bundle.agent.invoke(Command(resume={"decisions": [decision]}), config=self._cfg(pa.thread_id, pa.requested_by_role, pa.specialist))
-                except Exception as e:      # the graph state is gone (e.g. checkpoints wiped); the approval stays resolved but unexecuted
-                    log.exception("resume failed for %s", approval_id)
-                    txt = f"Couldn't resume that action ({type(e).__name__}); please ask the munshi again."
-                    self.repo.add_chat(pa.thread_id, "munshi", txt, {"specialist": pa.specialist, "resolved": approval_id, "approved": approve, "error": True})
-                    return Reply(txt, pa.specialist, None, pa.thread_id)
-                # The resumed turn may go on to ask for another gated action ("confirm A, then B"): that gets its
-                # own card, on the requester's behalf, instead of a bare "Done." over a paused graph. Anything the
-                # agent does while settling is the requester's too, but no longer covered by this approval.
-                with self.repo.acting_as(pa.requested_by):
-                    reply = self._settle(bundle, pa.specialist, pa.thread_id, pa.requested_by_role, pa.requested_by, result, tr,
-                                         lead="Approved. " if approve else "Rejected. ")
-                meta = {"specialist": pa.specialist, "resolved": approval_id, "approved": approve}
-                self.repo.add_chat(pa.thread_id, "munshi", reply.text, meta | ({"approval_id": reply.pending.approval_id} if reply.pending else {}))
-                if approve: self.deliver_messages()
-                return reply
+            token = guard.set_history([str(r["text"]) for r in self.repo.chat_history(pa.thread_id, 12)]) if engine == MODEL else None
+            try:
+                with self._trace(f"{pa.specialist}.resume", role, f"{'approve' if approve else 'reject'} {pa.tool}") as tr:
+                    tr.approval_decision = "approve" if approve else "reject"
+                    # the approval is on record BEFORE the tool runs: the audit trail never shows a write ahead of its approval
+                    self.repo.resolve_approval(approval_id, approve, user or role, note)
+                    self.repo.audit(role, "approval_" + ("granted" if approve else "rejected"), "approval", approval_id,
+                                    {"tool": pa.tool, "args": pa.args, "specialist": pa.specialist, "note": note}, approved_by=role)
+                    signature = (f"{role}:{user}" if user.strip() else role) if approve else ""
+                    meta = {"specialist": pa.specialist, "resolved": approval_id, "approved": approve}
+                    run_cfg = cfg | ({"callbacks": [calls]} if engine == MODEL and self.hybrid else {})
+                    # The resumed turn may go on to ask for another gated action ("confirm A, then B"): that gets its
+                    # own card, on the requester's behalf, instead of a bare "Done." over a paused graph. Anything the
+                    # agent does while settling is the requester's too, but no longer covered by this approval.
+                    settle = lambda res: self._settle(bundle, pa.specialist, pa.thread_id, pa.requested_by_role, pa.requested_by, res, tr,  # noqa: E731
+                                                      lead="Approved. " if approve else "Rejected. ", engine=engine, config=run_cfg)
+                    reply = None
+                    try:
+                        with self.repo.acting_as(pa.requested_by, approved_by=signature):
+                            result = bundle.agent.invoke(Command(resume={"decisions": [decision]}), config=run_cfg)
+                        if engine == MODEL:              # a model's follow-up can fail too: covered by the same fallback
+                            with self.repo.acting_as(pa.requested_by):
+                                reply = settle(result)
+                    except Exception as e:
+                        reply = self._resume_failed(pa, approve, bundle, cfg, engine, e)
+                        if reply is None:   # the graph state is gone (e.g. checkpoints wiped); the approval stays resolved but unexecuted
+                            txt = f"Couldn't resume that action ({type(e).__name__}); please ask the munshi again."
+                            self.repo.add_chat(pa.thread_id, "munshi", txt, meta | {"error": True})
+                            return Reply(txt, pa.specialist, None, pa.thread_id, engine=engine, model_calls=calls.n)
+                    if reply is None:
+                        with self.repo.acting_as(pa.requested_by):
+                            reply = settle(result)
+                    reply.engine, reply.model_calls, reply.model_tokens = engine, calls.n, calls.tokens
+                    self.repo.add_chat(pa.thread_id, "munshi", reply.text, meta | ({"approval_id": reply.pending.approval_id} if reply.pending else {}))
+                    if approve: self.deliver_messages()
+                    return reply
+            finally:
+                if token is not None:
+                    guard.reset_history(token)
+
+    def _resume_failed(self, pa: PendingApproval, approve: bool, bundle, cfg: dict, engine: str, e: Exception) -> Reply | None:
+        """A model-engine resume that failed AFTER the decision was applied -- typically the provider timing out on
+        the follow-up message once the approved tool has already run -- must not read as "couldn't resume": say what
+        actually happened, from the graph's own record, and leave the thread healthy. None = nothing was applied."""
+        if engine != MODEL:
+            log.exception("resume failed for %s", pa.approval_id)
+            return None
+        try:
+            state = bundle.agent.get_state(cfg)
+            msgs = state.values.get("messages", []) if state.values else []
+        except Exception:
+            msgs = []
+        call = next((tc for m in reversed(msgs) if isinstance(m, AIMessage) for tc in m.tool_calls if tc["name"] == pa.tool), None)
+        out = next((m for m in msgs if isinstance(m, ToolMessage) and call and m.tool_call_id == call["id"]), None)
+        if out is None:
+            log.exception("resume failed for %s", pa.approval_id)
+            return None
+        log.warning("model follow-up failed after %s ran (%s); answering from the tool result", pa.approval_id, type(e).__name__)
+        try:
+            self._heal(bundle, cfg)
+        except Exception:
+            log.exception("couldn't heal after %s", pa.approval_id)
+        if not approve:
+            return Reply("Rejected. Nothing was done.", pa.specialist, None, pa.thread_id, model_error=type(e).__name__)
+        from munshi.llm.stub_model import StubToolCallingModel
+        summary = StubToolCallingModel._summary(str(out.content)).content      # the offline one-line summary ("Done -- ...", redacted)
+        return Reply(f"Approved. {summary}"[:600], pa.specialist, None, pa.thread_id, model_error=type(e).__name__)
 
     def pending_items(self, thread_id: str | None = None) -> list[PendingApproval]:
         """Pending approvals, oldest first."""

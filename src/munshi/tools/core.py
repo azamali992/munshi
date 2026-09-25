@@ -30,9 +30,37 @@ class MunshiTools:
         self.repo = repo
 
     # ---------- lookups ----------
+    # A lookup never picks one of several matches: 'Malik' with Malik Agro and Malik Seeds on the books comes back
+    # as ambiguous with both candidates, so the caller asks which. Resolution is llm/resolve.py's confidence rule
+    # (the same code that checks a model's arguments), then an exact ID / phone, then a name substring that fits
+    # exactly one record.
+    @staticmethod
+    def _lookup(text: str, resolution, records: list, rid, name) -> tuple[str, object | None, list]:
+        if resolution.ok:
+            return "ok", next((r for r in records if rid(r) == resolution.id), None), []
+        if resolution.status == "ambiguous":
+            return "ambiguous", None, [{"id": c.id, "name": c.name} for c in resolution.candidates]
+        t = text.lower().strip()
+        if not t:
+            return "none", None, []
+        exact = [r for r in records if t in (rid(r).lower(), str(getattr(r, "phone", "") or "").lower())]
+        if len(exact) == 1:
+            return "ok", exact[0], []
+        subs = [r for r in records if t in name(r).lower()]
+        if len(subs) == 1:
+            return "ok", subs[0], []
+        if len(subs) > 1:
+            return "ambiguous", None, [{"id": rid(r), "name": name(r)} for r in subs[:3]]
+        return "none", None, []
+
     def find_customer(self, text: str) -> dict:
-        c = self.repo.find_customer(text)
-        if not c: return {"found": False, "query": text}
+        from munshi.llm.parse import customer_resolution
+        records = self.repo.list_customers()
+        status, c, cands = self._lookup(text, customer_resolution(text, self.repo), records, lambda r: r.customer_id, lambda r: r.name)
+        if status == "ambiguous":
+            return {"found": False, "ambiguous": True, "query": text, "candidates": [{"customer_id": x["id"], "name": x["name"]} for x in cands],
+                    "note": "More than one customer matches: ask the user which one, naming these. Do not pick one."}
+        if c is None: return {"found": False, "query": text}
         return {"found": True, **asdict(c), "outstanding": self.repo.outstanding(c.customer_id)}
 
     def get_customer_khata(self, customer_id: str) -> dict:
@@ -176,8 +204,13 @@ class MunshiTools:
 
     # ---------- khareed (purchases) ----------
     def find_supplier(self, text: str) -> dict:
-        s = self.repo.find_supplier(text)
-        if not s: return {"found": False, "query": text}
+        from munshi.llm.parse import supplier_resolution
+        records = self.repo.list_suppliers()
+        status, s, cands = self._lookup(text, supplier_resolution(text, self.repo), records, lambda r: r.supplier_id, lambda r: r.name)
+        if status == "ambiguous":
+            return {"found": False, "ambiguous": True, "query": text, "candidates": [{"supplier_id": x["id"], "name": x["name"]} for x in cands],
+                    "note": "More than one supplier matches: ask the user which one, naming these. Do not pick one."}
+        if s is None: return {"found": False, "query": text}
         return {"found": True, **asdict(s), "balance": self.repo.supplier_balance(s.supplier_id)}
 
     def list_suppliers(self) -> list[dict]:
