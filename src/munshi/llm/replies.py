@@ -11,6 +11,28 @@ from __future__ import annotations
 
 from munshi.llm.resolve import Resolution
 
+
+class Ask(str):
+    """A clarifying question that asks for ONE missing piece (`slot`): customer, supplier, amount, date, items,
+    order, product, otp or stock_kind (a purchase or a correction?). `candidates` are the [{"id", "name"}] it
+    offered, best first as shown. The platform remembers an Ask as the thread's open question, so the next
+    message can simply answer it ("haji sons", "80000", "doosra"). A plain str with two attributes: anything
+    that concatenates it just gets the text."""
+
+    slot: str
+    candidates: list[dict]
+
+    def __new__(cls, text: str, slot: str, candidates: list[dict] | None = None):
+        s = super().__new__(cls, text)
+        s.slot, s.candidates = slot, list(candidates or [])
+        return s
+
+
+# the slot each question key asks for
+SLOT_OF = {"which_customer": "customer", "no_customer": "customer", "which_supplier": "supplier", "no_supplier": "supplier",
+           "how_much": "amount", "how_much_from": "amount", "which_date": "date", "by_when": "date", "no_items": "items",
+           "which_product": "product", "which_otp": "otp", "stock_kind": "stock_kind", "which_order": "order"}
+
 UR = {
     # refusals
     "refuse_delete": "میں کوئی ریکارڈ مٹا نہیں سکتا۔ منشی میں کچھ ڈیلیٹ نہیں ہوتا؛ غلط اندراج اس کی آئی ڈی سے ریورس ہوتا ہے، اور ریورس مالک منظور کرتا ہے۔",
@@ -78,6 +100,40 @@ UR |= {
     "which_godown": "کون سا گودام؟",
 }
 
+# follow-ups, whole-business answers and help (Roman Urdu in RU; Urdu script in UR)
+EN |= {
+    "how_much_from": "How much did {name} pay? Send just the amount, e.g. '50000'.",
+    "by_when": "By when will {name} pay? e.g. '25 october' or 'jumma tak'.",
+    "which_order": "No order was named, so nothing was done. Which order should I {verb}?{where}",
+    "stock_kind": ("{qty} {product} at {godown} -- did this come from a supplier (which one, and at what price?) or is it a stock correction? "
+                   "Reply e.g. 'Fauji se, {price} rate' or 'correction'."),
+    "stock_in_what": "Which product and how many came in, and at which godown? e.g. '100 urea Multan godown mein aaye'.",
+    "from_chat": "for {name} (from our conversation)",
+    "sku": ("An SKU is just the short code for a product in your catalogue (e.g. UREA-50 = Urea 50kg). You never need to type it: "
+            "write the product's name and I find it. Things you can ask: 'aaj ka stock', 'udhaar list', 'Haji Sons ka khata', "
+            "'Haji Sons ne 50000 diye', 'aaj kis kis ne payment ki', 'Chaudhry Farms ko 20 urea bhej do'."),
+    "help_more": " For example: 'aaj ka stock', 'udhaar list', 'Haji Sons ka khata', 'aaj kis kis ne payment ki'.",
+}
+RU = {
+    "how_much_from": "{name} ne kitne paise diye? Sirf raqam likhein, maslan '50000'.",
+    "by_when": "{name} kab tak dega? Maslan '25 october' ya 'jumma tak'.",
+    "stock_kind": ("{qty} {product} {godown} mein -- ye kisi supplier se aaya hai (kaun sa, kis rate par?) ya stock ki correction hai? "
+                   "Jawab dein, maslan 'Fauji se, {price} rate' ya 'correction'."),
+    "stock_in_what": "Kaun sa maal, kitna, aur kis godown mein aaya? Maslan '100 urea Multan godown mein aaye'.",
+    "sku": ("SKU sirf maal ka chhota code hai (maslan UREA-50 = Urea 50kg). Aap ko ye likhna nahi parta: maal ka naam likhein, main dhoond leta hoon. "
+            "Aap ye pooch sakte hain: 'aaj ka stock', 'udhaar list', 'Haji Sons ka khata', 'Haji Sons ne 50000 diye', 'aaj kis kis ne payment ki', "
+            "'Chaudhry Farms ko 20 urea bhej do'."),
+}
+UR |= {
+    "how_much_from": "{name} نے کتنی رقم دی؟ صرف رقم لکھیں، مثلاً «50000»۔",
+    "by_when": "{name} کب تک دے گا؟ مثلاً «25 اکتوبر» یا «جمعہ تک»۔",   # (?)
+    "stock_kind": "{qty} {product} ({godown}) — یہ کسی سپلائر سے آیا ہے (کون سا، کس ریٹ پر؟) یا اسٹاک کی درستی ہے؟ مثلاً «فوجی سے، {price} ریٹ» یا «correction»۔ (supplier / correction)",   # (?)
+    "stock_in_what": "کون سا مال، کتنا، اور کس گودام میں آیا؟",
+    "sku": ("SKU مال کا مختصر کوڈ ہے (مثلاً UREA-50 = یوریا 50 کلو)۔ آپ کو یہ لکھنے کی ضرورت نہیں: مال کا نام لکھیں۔ "
+            "آپ یہ پوچھ سکتے ہیں: «آج کا اسٹاک»، «ادھار لسٹ»، «حاجی سنز کا کھاتہ»، «آج کس کس نے ادائیگی کی»۔"),   # (?)
+    "help_more": " مثلاً: «آج کا اسٹاک»، «ادھار لسٹ»، «حاجی سنز کا کھاتہ»۔",
+}
+
 HELP_BY_ROLE = {
     "owner": "I can take orders, check stock and khata, record payments and expenses, receive purchases, pay suppliers, chase collections and give reports.",
     "clerk": "I can take orders, check stock and khata, allocate and plan dispatch, record payments and expenses, receive purchases and chase collections.",
@@ -86,30 +142,42 @@ HELP_BY_ROLE = {
 }
 
 
-def t(key: str, urdu: bool, **kw) -> str:
-    table = UR if urdu and key in UR else EN
+def t(key: str, urdu: bool, roman: bool = False, candidates: list[dict] | None = None, **kw) -> str:
+    """The reply for `key`: Urdu script for an Urdu-script message, Roman Urdu where one is written and the message
+    was Roman Urdu, else English. A question that asks for one missing piece comes back as an Ask."""
+    table = UR if urdu and key in UR else RU if roman and key in RU else EN
     if "why" in kw:                                   # end the reason with exactly one mark
         w = str(kw["why"]).rstrip(" .")
         kw["why"] = w if w.endswith("?") else w + "."
-    return table[key].format(**kw)
+    text = table[key].format(**kw)
+    return Ask(text, SLOT_OF[key], candidates) if key in SLOT_OF else text
+
+
+def _ordered(res: Resolution) -> list:
+    return sorted(res.candidates, key=lambda c: c.id)[:3]
 
 
 def options(res: Resolution, urdu: bool = False) -> str:
     """'Chaudhry Farms (C-002) or Chaudhry Traders (C-011)' -- names as stored in master data, with IDs, at most three."""
-    names = [f"{c.name} ({c.id})" for c in sorted(res.candidates, key=lambda c: c.id)[:3]]
+    names = [f"{c.name} ({c.id})" for c in _ordered(res)]
     word, comma = (" یا ", "، ") if urdu else (" or ", ", ")
     return word.join(names) if len(names) <= 2 else comma.join(names[:-1]) + word + names[-1]
 
 
+def _cands(res: Resolution) -> list[dict]:
+    """The candidates in the order the question lists them ('pehla' = the first shown)."""
+    return [{"id": c.id, "name": c.name} for c in _ordered(res)]
+
+
 def ask_customer(res: Resolution, urdu: bool = False) -> str:
     if res.status == "ambiguous":
-        return t("which_customer", urdu, options=options(res, urdu))
+        return t("which_customer", urdu, candidates=_cands(res), options=options(res, urdu))
     return t("no_customer", urdu)
 
 
 def ask_supplier(res: Resolution, urdu: bool = False) -> str:
     if res.status == "ambiguous":
-        return t("which_supplier", urdu, options=options(res, urdu))
+        return t("which_supplier", urdu, candidates=_cands(res), options=options(res, urdu))
     return t("no_supplier", urdu)
 
 

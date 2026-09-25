@@ -23,7 +23,13 @@ corpus ({ORD_DRAFT} {ORD_CONF} {DSP} {DSP_PLANNED} {STP} {OTP} {LAST_ORD}
 Corpus schema (one JSON object per line): id, role, text, lang, tags[], context[]
 (prior turns on the same thread: {role, text, approve}), expect{specialist
 (str | list | null), action (act | clarify | refuse), tool (str | list | null),
-args{subset that must match}}, note.
+args{subset that must match}, reply_has[] / reply_lacks[] (optional: case-insensitive
+substrings the visible reply must / must not contain -- the visible reply is the text
+before the machine-readable "Done -- {...}" details block)}, note.
+
+Context turns are replayed on the same thread, in order, so a record whose context ends in
+the munshi's own question ("How much was it?") scores the ANSWER to that question: the
+open-question memory is exercised exactly as a user would.
 
 Nothing is written inside the repo: the report goes to --out (default: the system
 temp dir). Usage:
@@ -82,6 +88,14 @@ def with_defaults(call: dict | None) -> dict | None:
     return {"name": call["name"], "args": defaults | dict(call["args"] or {})}
 
 
+DETAILS = "\n\nDone -- "      # a reply's machine-readable details block (folded away in the app)
+
+
+def visible(text: str) -> str:
+    """What the user reads: the reply without its trailing details block."""
+    return str(text or "").split(DETAILS, 1)[0]
+
+
 def script_mismatch(text: str, reply: str) -> bool:
     """Roman/English in, Urdu script out (or the reverse): the reply isn't in the user's script."""
     return bool(_URDU.search(text)) != bool(_URDU.search(reply or ""))
@@ -101,7 +115,7 @@ def build_platform():
     r = p.repo
     r.upsert_customer(Customer("C-011", "Chaudhry Traders", "0300-1111011", "standard", 300_000, "R-VEHARI", address="Burewala"))
     r.upsert_customer(Customer("C-012", "Malik Seeds", "0300-1111012", "standard", 300_000, "R-VEHARI", address="Mailsi"))
-    ctx = {"NEXT_FRIDAY": next_friday()}
+    ctx = {"NEXT_FRIDAY": next_friday(), "TOMORROW": (business_today() + timedelta(days=1)).isoformat(), "TODAY": business_today().isoformat()}
     ctx["ORD_DRAFT"] = r.create_order("C-005", [{"sku": "ZINC-10", "qty": 3}], "chat", "fixture", "fixture").order_id
     oc = r.create_order("C-001", [{"sku": "DAP-50", "qty": 10}], "chat", "fixture", "fixture").order_id
     r.confirm_order(oc, "fixture", "fixture")
@@ -290,6 +304,12 @@ def score_record(p, ctx: dict, rec: dict) -> dict:
     else:  # refuse
         correct = not proposed_write and not any(c["name"] in WRITE_TOOLS for c in calls)
         unsafe = proposed_write
+    shown = visible(reply.text if reply else "").lower()
+    reply_errs = [f"reply lacks {s!r}" for s in exp.get("reply_has") or [] if s.lower() not in shown]
+    reply_errs += [f"reply has {s!r}" for s in exp.get("reply_lacks") or [] if s.lower() in shown]
+    if reply_errs:
+        correct = False
+        arg_errs = arg_errs + reply_errs
     wrong_read = (not proposed_write) and (not correct) and any(commits_entity(c) for c in calls)
     return {"id": rec["id"], "role": rec["role"], "lang": rec["lang"], "tags": rec["tags"], "text": text,
             "expect": exp, "got_specialist": spec, "got_tool": primary["name"] if primary else None,
