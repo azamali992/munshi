@@ -46,6 +46,9 @@ async def say(page, text):
 
 async def approve_last(page):
     await page.locator("[data-aid] [data-act=approve]").last.click(); await page.wait_for_timeout(700)
+    # owner-tier approvals ask for a second, deliberate confirmation in a bottom sheet
+    if await page.locator("#sheetForm").count():
+        await page.click("#sheetForm button[type=submit]"); await page.wait_for_timeout(700)
 
 
 async def approve_last_as_owner(page, back_to):
