@@ -21,6 +21,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 
 from munshi.agents.factory import AgentBundle, build_specialist, is_real_model
 from munshi.domain.repository import MunshiRepository
+from munshi.llm import memory as MEM
 from munshi.llm import replies as RP
 from munshi.llm.answers import lang_of
 from munshi.llm.followup import PRONOUN
@@ -233,6 +234,27 @@ def build_order_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChat
     cancel_w = contains("cancel", "mansookh", "منسوخ")
     confirm_w = lambda t: contains("confirm", "pakka", "کنفرم", "پکا")(t) or (contains("haan", "yes", "ok")(t) and bool(ids_in(t, "ORD")))  # noqa: E731
 
+    def _repeat(t: str):
+        """The repeat plan (llm.memory.repeat_plan) for a "same order again" request naming one customer, else None."""
+        def plan():
+            op, c = _order(t, repo), _cust(t, repo)
+            if not MEM.asks_repeat(t) or op.items or op.problems or not c.ok or c.other is not None:
+                return None
+            return MEM.repeat_plan(repo, c.id or "")
+        return memo(("repeat", t), plan)
+
+    def _repeat_reply(t: str, urdu: bool) -> str:
+        c = _cust(t, repo)
+        if not c.ok or c.other is not None:
+            return RP.ask_customer(c, urdu) if c.status != "ok" else RP.t("two_customers", urdu, a=c.name, b=c.other.name)
+        p = _repeat(t)
+        if p is None or p.status == "none":
+            return f"I have no confirmed order for {c.name} to repeat yet -- tell me the items and quantities, e.g. '{c.name} ko 20 urea aur 5 dap'."
+        if p.status == "open":
+            return (f"{c.name}'s latest order {p.order_id} ({p.lines}) is still {p.order_status} -- repeating it now could double the order, "
+                    f"so I haven't made a card. If you do want the same again, send the items as a new order.")
+        return (f"{c.name}'s last order {p.order_id} had {p.problem}, which isn't sold any more -- tell me the items and quantities for this one.")
+
     def _open_orders(cid: str) -> str:
         rows = [o for o in repo.list_orders(customer_id=cid, limit=10) if o.status in ("draft", "confirmed", "allocated")][:4]
         return "; ".join(f"{o.order_id} ({o.status}, " + ", ".join(f"{i.qty} x {i.sku}" for i in o.items) + ")" for o in rows)
@@ -248,6 +270,10 @@ def build_order_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChat
              lambda t: {"sku": _sku(t, repo)}),
         Rule(lambda t: _order(t, repo).ready, "create_order",
              lambda t: {"customer_id": _order(t, repo).customer.id, "items": _order(t, repo).items, "source_text": t}),
+        # 'Haji Sons ko wahi order dobara' / 'pichla order repeat karo' (the customer from the message or the conversation):
+        # the lines of their last confirmed, delivered order, on a card -- a human still approves what is shown
+        Rule(lambda t: _repeat(t) is not None and _repeat(t).status == "ok", "create_order",
+             lambda t: {"customer_id": _cust(t, repo).id, "items": _repeat(t).items, "source_text": t}),
         # just a customer ('aur Haji Sons ka?'): their khata -- a read, and only for a confident match
         Rule(lambda t: _cust(t, repo).ok and not _order(t, repo).items and not _order(t, repo).problems and not repeat(t)
              and not cancel_w(t) and not confirm_w(t) and not order_verb(t), "get_customer_khata",
@@ -262,10 +288,12 @@ def build_order_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChat
             opts = _open_orders(op.customer.id) if op.customer.ok else ""
             where = f" {op.customer.name}'s open orders: {opts}." if opts else f" Say its ID, e.g. '{verb} ORD-...'."
             return RP.t("which_order", False, verb=verb, where=where)
+        if MEM.asks_repeat(t) and not op.items and not op.problems:
+            return _repeat_reply(t, urdu)
         if order_verb(t) and op.customer.ok and not op.items and not op.problems:
             return RP.t("no_items", urdu)
         if repeat(t) and not op.items:
-            return "I can't repeat an earlier order from chat yet -- tell me the items and quantities (the last order is in Orders)."
+            return "Tell me the items and quantities (the customer's earlier orders are in Orders)."
         if _KHATA(t) and not op.items:
             return RP.ask_customer(op.customer, urdu)
         if op.items or op.problems or op.unknown or op.dropped:

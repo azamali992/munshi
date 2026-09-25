@@ -395,7 +395,7 @@ def test_v5_migrates_a_legacy_float_file_exactly(tmp_path):
     path = str(tmp_path / "legacy.db"); _legacy_file(path)
     repo = MunshiRepository(path)
     one = lambda q, a=(): repo._one(q, a)[0]   # noqa: E731
-    assert one("SELECT MAX(version) FROM schema_version") == 5
+    assert one("SELECT MAX(version) FROM schema_version") == migrations.MIGRATIONS[-1][0]      # V5 and every later step
     amounts = {r["entry_id"]: r["amount"] for r in repo._all("SELECT entry_id, amount FROM ledger")}
     assert amounts == {"INV-A1B2C3D4": 30, "PAY-1": -10, "PAY-2": -20, "INV-OB": 6843852, "CRN-1": -556}
     assert repo.outstanding_paisa("C-1") == 30 - 10 - 20 + 6843852 - 556 and repo.get_ledger_entry("INV-A1B2C3D4").doc_no is None
@@ -427,7 +427,7 @@ def test_v5_migrates_a_legacy_float_file_exactly(tmp_path):
     assert repo._one("SELECT name FROM sqlite_master WHERE name LIKE '%__v5'") is None
     repo.close()
     again = MunshiRepository(path)                     # re-opening applies nothing and changes nothing
-    assert migrations.current_version(again._conn) == 5 and again.outstanding_paisa("C-1") == 30 - 10 - 20 + 6843852 - 556
+    assert migrations.current_version(again._conn) == migrations.MIGRATIONS[-1][0] and again.outstanding_paisa("C-1") == 30 - 10 - 20 + 6843852 - 556
 
 
 def test_v5_cannot_half_apply(tmp_path):
