@@ -306,7 +306,7 @@ class MunshiTools:
         start, end = self._range(start, end)
         names = {c.customer_id: c.name for c in self.repo.list_customers(include_inactive=True)}
         pays = [{"entry_id": e.entry_id, "customer_id": e.customer_id, "name": names.get(e.customer_id, e.customer_id), "amount": -e.amount,
-                 "method": e.method or "cash", "at": e.created_at} for e in self.repo.ledger_between(start, end, "payment")]
+                 "method": e.method or "cash", "at": e.created_at, "reversal_of": e.reversal_of} for e in self.repo.ledger_between(start, end, "payment")]
         return self.repo.collection_report(start, end) | {"payments": pays}
 
     def stock_ledger(self, sku: str, warehouse_id: str = "") -> dict:
