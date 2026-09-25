@@ -6,6 +6,7 @@ moment the app opens. `seed_new_business` is the empty starting point a
 real business gets at signup."""
 from __future__ import annotations
 
+import json
 from datetime import date, timedelta
 
 from munshi.domain.models import Customer, Product, Route, Supplier, Vehicle, Warehouse, to_paisa
@@ -77,6 +78,24 @@ HISTORY = [
     ("C-010", 39_000, 5, 39_000),
 ]
 
+# What each HISTORY invoice sold, at list price (sku, qty); each adds up to its invoice exactly. Fertilizer-heavy,
+# the way an agri distributor's book looks, so the demo's gross margin is the thin one such a business runs on
+# (about 6%: urea 6.5%, DAP 5.6%, SOP 6.8% at the seed cost prices), not the 100% an uncosted invoice shows.
+# Drip line, maize, wheat seed, zinc, NPK (outside the 41-day-old Punjab Seed Mart bill) and the pesticides sold
+# nothing in the last 30 days, so slow stock still has something true to say.
+HISTORY_LINES = [
+    [("UREA-50", 100)],                         # 385,000
+    [("UREA-50", 20), ("IMIDA-250", 20)],       # 77,000 + 19,000 = 96,000
+    [("UREA-50", 75), ("DAP-50", 53)],          # 288,750 + 331,250 = 620,000
+    [("UREA-50", 30), ("SOP-50", 5)],           # 115,500 + 29,500 = 145,000
+    [("UREA-50", 100), ("DAP-50", 4)],          # 385,000 + 25,000 = 410,000
+    [("UREA-50", 12), ("SOP-50", 2)],           # 46,200 + 11,800 = 58,000
+    [("UREA-50", 64), ("NPK-25", 16)],          # 246,400 + 65,600 = 312,000
+    [("DAP-50", 4), ("SOP-50", 10)],            # 25,000 + 59,000 = 84,000
+    [("UREA-50", 4), ("SOP-50", 4)],            # 15,400 + 23,600 = 39,000
+]
+OPENING_DAYS_AGO = 100      # the opening stock count, before the oldest HISTORY invoice
+
 DEMO_SETTINGS = {"business_name": "Sultan Traders", "city": "Multan", "phone": "061-4567890", "owner_phone": "0300-0000001",
                  "default_warehouse": "WH-MULTAN", "language": "en"}
 
@@ -89,18 +108,49 @@ def seed(repo: MunshiRepository) -> MunshiRepository:
     for s in SUPPLIERS: repo.upsert_supplier(s)
     for r in ROUTES: repo.upsert_route(r)
     for v in VEHICLES: repo.upsert_vehicle(v)
-    for wh, levels in STOCK.items():
-        for sku, qty in levels.items():
-            repo.set_stock(wh, sku, qty, 0)
-    # backdated history (pre-Munshi paper records, so no gapless numbers) so aging has teeth.
-    # Written directly because it is backdated; amounts are integer paisa like every stored amount.
+    # backdated history (pre-Munshi paper records, so no gapless numbers) so aging has teeth, margins are real and
+    # best sellers / slow stock mean something. Written directly because it is backdated (the repository stamps
+    # "now"), but by the repository's own rules: the opening count and every sale go through the stock ledger
+    # (stock_moves) and the moving-average pool (inventory_value), and each sale leaves a sale_lines cost snapshot
+    # at the average of the moment -- which is the cost price, since nothing else has moved the pool. What is left
+    # on the shelf is exactly STOCK. Amounts are integer paisa like every stored amount.
+    price = {p.sku: to_paisa(p.unit_price) for p in PRODUCTS}
+    cost = {p.sku: to_paisa(p.cost_price) for p in PRODUCTS}
+    godown = {c.customer_id: next(r.warehouse_id for r in ROUTES if r.route_id == c.route_id) for c in CUSTOMERS}
+    sold: dict[tuple[str, str], int] = {}
+    for (cust, amt, _, _), lines in zip(HISTORY, HISTORY_LINES, strict=True):
+        if sum(q * price[sku] for sku, q in lines) != to_paisa(amt): raise ValueError(f"seed lines for {cust} don't add up to {amt}")
+        for sku, q in lines: sold[(godown[cust], sku)] = sold.get((godown[cust], sku), 0) + q
+    move = ("INSERT INTO stock_moves (move_id, warehouse_id, sku, delta, kind, ref, created_at, value_paisa, order_id) VALUES (?,?,?,?,?,?,?,?,?)")
     with repo._tx() as conn:
+        opened = f"{(date.today() - timedelta(days=OPENING_DAYS_AGO)).isoformat()}T05:00:00+00:00"
+        for wh, levels in STOCK.items():
+            for sku, qty in levels.items():
+                units = qty + sold.get((wh, sku), 0)
+                conn.execute("INSERT INTO stock (warehouse_id, sku, on_hand, reserved) VALUES (?,?,?,0)", (wh, sku, units))
+                if units:
+                    conn.execute(move, (f"MOV-SEEDO-{wh[3:]}-{sku}", wh, sku, units, "opening", "opening stock count", opened, units * cost[sku], None))
+                    conn.execute("INSERT INTO inventory_value (sku, value_paisa) VALUES (?, ?) ON CONFLICT(sku) DO UPDATE SET value_paisa = value_paisa + excluded.value_paisa",
+                                 (sku, units * cost[sku]))
         for i, (cust, amt, days_ago, paid) in enumerate(HISTORY):
             inv_day = date.today() - timedelta(days=days_ago)
             created = f"{inv_day.isoformat()}T10:00:00+00:00"
             due = (inv_day + timedelta(days=30)).isoformat()
+            ref, wh = f"SEED-{i:02d}", godown[cust]
             conn.execute("INSERT INTO ledger (entry_id, customer_id, kind, amount, ref, due_date, created_at, method, received_by) VALUES (?,?,?,?,?,?,?,?,?)",
-                         (f"INV-SEED{i:02d}", cust, "invoice", to_paisa(amt), f"SEED-{i:02d}", due, created, "", ""))
+                         (f"INV-SEED{i:02d}", cust, "invoice", to_paisa(amt), ref, due, created, "", ""))
+            # the paper delivery behind the bill: a closed stop on no Munshi plan (sale_lines needs a stop to point at)
+            lines = HISTORY_LINES[i]
+            conn.execute("INSERT INTO stops (stop_id, plan_id, order_id, customer_id, sequence, status, delivered_items, returned_items, cash_collected, otp, otp_verified, closed_at, note) "
+                         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                         (f"STP-SEED{i:02d}", None, ref, cust, 1, "delivered", json.dumps([{"sku": s, "qty": q} for s, q in lines]), "[]", 0, None, 0, created,
+                          "pre-Munshi paper delivery"))
+            for sku, q in lines:
+                conn.execute(move, (f"MOV-SEED{i:02d}-{sku}", wh, sku, -q, "sale", ref, created, -q * cost[sku], ref))
+                conn.execute("UPDATE stock SET on_hand = on_hand - ? WHERE warehouse_id=? AND sku=?", (q, wh, sku))
+                conn.execute("UPDATE inventory_value SET value_paisa = value_paisa - ? WHERE sku=?", (q * cost[sku], sku))
+                conn.execute("INSERT INTO sale_lines (stop_id, order_id, customer_id, invoice_id, sku, qty, revenue_paisa, cost_paisa, cost_basis, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                             (f"STP-SEED{i:02d}", ref, cust, f"INV-SEED{i:02d}", sku, q, q * price[sku], q * cost[sku], "moving_average", created))
             if paid:
                 pay_day = inv_day + timedelta(days=min(max(days_ago - 1, 0), 15))
                 conn.execute("INSERT INTO ledger (entry_id, customer_id, kind, amount, ref, due_date, created_at, method, received_by) VALUES (?,?,?,?,?,?,?,?,?)",
