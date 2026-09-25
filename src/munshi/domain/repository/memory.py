@@ -189,6 +189,6 @@ class MemoryMixin(ApprovalsMixin):
         """How many orders this user has booked for each customer lately: ranks the options of a "which one?" question."""
         if not str(user or "").strip():
             return {}
-        rows = self._all("SELECT customer_id, COUNT(*) n FROM orders WHERE lower(created_by)=lower(?) AND created_at >= datetime('now', ?) GROUP BY customer_id",
+        rows = self._all("SELECT customer_id, COUNT(*) n FROM orders WHERE lower(created_by)=lower(?) AND datetime(created_at) >= datetime('now', ?) GROUP BY customer_id",
                          (user.strip(), f"-{int(days)} days"))
         return {r["customer_id"]: int(r["n"]) for r in rows}

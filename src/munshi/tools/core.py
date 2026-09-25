@@ -6,7 +6,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from datetime import date, timedelta
 
-from munshi.domain.models import today_iso
+from munshi.domain.models import to_business_date, today_iso
 from munshi.domain.repository import MunshiRepository, StateError
 
 REMINDER_TEMPLATES = {
@@ -91,14 +91,13 @@ class MunshiTools:
         """Recent orders, newest first; optionally only one status, one product, one customer, or the last N days
         (days=1: today). Read-only."""
         days = max(0, int(days or 0))
-        since = (date.fromisoformat(today_iso()) - timedelta(days=days - 1)).isoformat() if days else ""
-        rows = self.repo.list_orders(status or None, customer_id=customer_id or None, limit=200 if (sku or days) else 40,
-                                     day=today_iso() if days == 1 else None)
+        # "today" / "last N days" are Pakistan business days, filtered in SQL on the business date of created_at
+        # (never on the UTC date prefix, which is a day behind from 00:00 to 05:00 PKT)
+        since = (date.fromisoformat(today_iso()) - timedelta(days=days - 1)).isoformat() if days else None
+        rows = self.repo.list_orders(status or None, customer_id=customer_id or None, limit=200 if (sku or days) else 40, since=since)
         out = []
         for o in rows:
             if sku and not any(i.sku == sku for i in o.items):
-                continue
-            if since and str(o.created_at)[:10] < since:
                 continue
             out.append(self._order(o))
         return out[:40]
@@ -253,17 +252,9 @@ class MunshiTools:
 
     def reverse_ledger_entry(self, entry_id: str, reason: str, approved_by: str = "owner") -> dict:
         # a reversal changes money that already moved: HIGH_RISK, owner-approved, like credit_note
+        # the customer's correction message (if they were ever told) is queued by the repository, exactly once
         e = self.repo.reverse_ledger_entry(entry_id, reason, "hisaab_munshi", approved_by)
         c = self.repo.get_customer(e.customer_id)
-        try:
-            orig = self.repo.get_ledger_entry(entry_id)
-        except Exception:
-            orig = None
-        if orig is not None and orig.kind == "payment" and c.phone:
-            # the customer was told 'received, balance now X' when it was recorded: a templated correction follows the reversal
-            why = "cheque returned unpaid" if (orig.method or "") == "cheque" else "payment reversed"
-            self.repo.queue_message("whatsapp", c.phone, f"{self.repo.business_name}: Rs {abs(orig.amount):,.0f} (receipt {orig.entry_id}) -- {why}. "
-                                    f"Balance now Rs {self.repo.outstanding(e.customer_id):,.0f}.", e.entry_id)
         return asdict(e) | {"customer_name": c.name, "outstanding": self.repo.outstanding(e.customer_id)}
 
     def reverse_expense(self, expense_id: str, reason: str, approved_by: str = "owner") -> dict:
@@ -359,7 +350,8 @@ class MunshiTools:
         start, end = self._range(start, end)
         names = {c.customer_id: c.name for c in self.repo.list_customers(include_inactive=True)}
         pays = [{"entry_id": e.entry_id, "customer_id": e.customer_id, "name": names.get(e.customer_id, e.customer_id), "amount": -e.amount,
-                 "method": e.method or "cash", "at": e.created_at, "reversal_of": e.reversal_of} for e in self.repo.ledger_between(start, end, "payment")]
+                 "method": e.method or "cash", "at": e.created_at, "day": to_business_date(e.created_at).isoformat(),   # `at` is UTC; `day` is the business day
+                 "reversal_of": e.reversal_of} for e in self.repo.ledger_between(start, end, "payment")]
         return self.repo.collection_report(start, end) | {"payments": pays}
 
     def stock_ledger(self, sku: str, warehouse_id: str = "") -> dict:
