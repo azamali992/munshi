@@ -17,8 +17,19 @@ never raised for a call whose record reference is blank.
 card()            what the human reads before approving (CardBuilder): names,
                   lines, total, and the before/after effect, read-only.
 A message sent while a card waits never reaches the paused graph: a plain
-read-only question goes to the Report munshi; anything else gets the waiting
-card back (Reply.waiting) so it can be decided right there.
+read-only question goes to the Report munshi; anything else runs on a fresh
+graph LANE of its own ('{thread}:{role}:{specialist}:q{approval id}', recorded
+in the chat log, so resolve() resumes exactly that graph) -- an independent
+request gets its own card, a read its answer; what can't stand alone (a
+duplicate of the waiting card, a bare 'yes') gets the waiting card back
+(Reply.waiting) so it can be decided right there. A correction of the card the
+person just asked for ('galti, 40 kar do') withdraws it and raises the corrected
+one. A batch ('sab confirm kar do') is one card per record, chained: the next is
+raised when the previous one is decided (resolve(), 'Next, 2 of 6').
+
+Never a card that can't succeed: _cannot() reads the books first (a draft to
+edit, stock at the godown to reserve, a route/vehicle/godown for a plan, stock
+to load) and says why instead.
 
 Two engines, deterministic first. The RULES engine (manager + specialists on the
 offline language layer, llm/*) always runs first. With a real model configured
@@ -44,6 +55,7 @@ offline model just to finish the approved action).
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 import re
 import sqlite3
@@ -51,7 +63,7 @@ import threading
 import uuid
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -61,7 +73,7 @@ from langgraph.types import Command
 from munshi.agents import guard
 from munshi.agents.factory import is_real_model
 from munshi.agents.manager import CLARIFY, build_manager, classify
-from munshi.agents.specialists import BUILDERS
+from munshi.agents.specialists import BUILDERS, order_label, orders_of
 from munshi.channels import build_channel, deliver_outbox
 from munshi.domain.models import discounted_paisa, to_paisa, to_rupees, today_iso
 from munshi.domain.repository import MunshiRepository
@@ -70,10 +82,11 @@ from munshi.llm import answers
 from munshi.llm import followup as FU
 from munshi.llm import memory as MEM
 from munshi.llm import replies as RP
+from munshi.llm import turns as TURNS
 from munshi.llm.answers import lang_of
-from munshi.llm.parse import catalogue, customer_resolution, prepare, supplier_resolution
+from munshi.llm.parse import analyse_order, catalogue, customer_resolution, otp_in, prepare, supplier_resolution
 from munshi.llm.stub_model import ask_of, not_understood
-from munshi.llm.text import is_urdu
+from munshi.llm.text import fold, is_urdu
 from munshi.observability.tracing import TurnTrace, configure_tracking, trace_turn
 from munshi.safety.middleware import DEFERRED_KEY
 from munshi.safety.risk import RiskTier, approval_refusal, approver_for, risk_of, same_person, stricter_role
@@ -139,6 +152,9 @@ class PendingApproval:
         if t == "create_order":
             lines = ", ".join(f"{i['qty']} × {i['sku']}" for i in a.get("items", []))
             return f"Create order for {a.get('customer_id')}: {lines}"
+        if t == "update_order":
+            lines = ", ".join(f"{i.get('sku')} → {i.get('qty')}" for i in a.get("items", []) if isinstance(i, dict))
+            return f"Change draft order {a.get('order_id')}: {lines}"
         if t == "confirm_order": return f"Confirm order {a.get('order_id')}" + (" — over credit limit" if self.needs_role == "owner" else "")
         if t == "cancel_order": return f"Cancel order {a.get('order_id')} — {a.get('reason', '')[:40]}"
         if t == "allocate_order": return f"Allocate {a.get('order_id')} at {a.get('warehouse_id') or 'default godown'}"
@@ -174,6 +190,8 @@ class Reply:
     model_error: str | None = None              # the model failed and the rules' reply was used instead
     ask: dict | None = None                     # the one missing piece this reply asks for ({"slot", "candidates"}), if any
     tool: str | None = None                     # the (last) tool the specialist called this turn, if any
+    listed: list | None = None                  # the order ids a list reply showed (what 'sab confirm kar do' then means)
+    extra: dict = field(default_factory=dict)   # chat-log meta the turn adds: the graph lane of each card, a chain of cards to come
 
 
 # ====================================================================== approval cards
@@ -191,6 +209,8 @@ class Reply:
 CARD_EN = {
     # titles
     "t_create_order": "Create order for {customer}",
+    "t_update_order": "Change order for {customer}",
+    "t_update_order_id": "Change order {order}",
     "t_confirm_order": "Confirm order for {customer}",
     "t_confirm_order_id": "Confirm order {order}",
     "t_cancel_order": "Cancel order for {customer}",
@@ -227,6 +247,7 @@ CARD_EN = {
     # effects
     "order_new": "Saves a draft order of {total}; nothing is owed until it is delivered. {customer} owes {now} now, {after} once delivered.",
     "order_new_plain": "Saves a draft order of {total}; nothing is owed until it is delivered.",
+    "order_change": "{changes}. Total {before} → {after}. It stays a draft; nothing is owed until it is delivered.",
     "order_confirm": "Order {order} ({total}) goes to the godown for packing. {customer} owes {now} now, {after} once delivered.",
     "order_cancel": "Order {order} ({total}) is cancelled. Nothing is owed for it.",
     "order_cancel_release": "Order {order} ({total}) is cancelled and its reserved stock at {godown} is released.",
@@ -260,6 +281,7 @@ CARD_EN = {
     "w_short_stock": "Not enough stock: {product} needs {need}, only {available} available.",
     "w_below_zero": "Only {on_hand} {product} on hand at {godown}: stock can't go below zero, so approving will fail.",
     "w_bad_status": "{what} {id} is {status}: approving will fail.",
+    "w_empty_order": "No lines would be left: cancel the order instead. Approving will fail.",
     "w_over_capacity": "{units} units won't fit: the vehicle holds {capacity}.",
     "w_overpay": "More than is owed: the balance goes to {after}.",
     "w_cash_short": "Cash short by {gap}.",
@@ -268,6 +290,7 @@ CARD_EN = {
     "w_already_reversed": "{entry} was already reversed by {by}: approving will fail.",
     "w_bill_of_purchase": "Bill {entry} came with purchase {purchase}: reverse the purchase instead, so the goods go back too.",
     "w_already_sent": "Reminder {reminder} was already sent.",
+    "w_not_overdue": "{customer} isn't overdue yet: the message would say '0 din'. Send it only if you mean to.",
     # who approves
     "approver_owner": "The owner must approve",
     "approver_clerk": "Another clerk or the owner must approve",
@@ -456,6 +479,42 @@ class CardBuilder:
         facts = [{"key": "note", "value": "; ".join(negotiated)}] if negotiated else []
         return {"title": _t("t_create_order", customer=cname), "effect": effect, "lines": lines, "total": to_rupees(total_p), "warnings": warns,
                 "facts": facts}
+
+    def _c_update_order(self, a: dict, pa) -> dict:
+        """A change to a draft: the lines as they will be, each product's quantity before -> after, and the total before -> after
+        (priced by the repository's own rule: kept lines keep their drafted price, a new line gets the customer's price)."""
+        oid = str(a.get("order_id") or ""); o = self._order(oid)
+        if o is None:
+            return self._missing("t_update_order_id", "order", oid, order=oid)
+        cust = self._cust(o.customer_id); cname = cust.name if cust else o.customer_id
+        new = self.ops.merged_lines(o, [i for i in a.get("items") or [] if isinstance(i, dict)])
+        before_q = self._need(o.items)
+        lines, warns, total_p = [], [], 0
+        for it in new:
+            p = self._prod(it["sku"])
+            if p is None:
+                warns.append(_t("w_unknown_product", sku=it["sku"])); lines.append(self._line(it["sku"], it["qty"], None)); continue
+            price_p = to_paisa(it["unit_price"]) if it.get("unit_price") not in (None, "", 0) else discounted_paisa(to_paisa(p.unit_price), cust.discount_pct if cust else 0)
+            lines.append(self._line(it["sku"], it["qty"], price_p, qty_before=before_q.get(it["sku"], 0)))
+            total_p += int(it["qty"]) * price_p
+        after_q = {it["sku"]: int(it["qty"]) for it in new}
+        changes = [{"name": self._name(self.repo.get_product, sku), "before": before_q.get(sku, 0), "after": after_q.get(sku, 0)}
+                   for sku in dict.fromkeys([*before_q, *after_q]) if before_q.get(sku, 0) != after_q.get(sku, 0)]
+        if o.status != "draft":
+            warns.insert(0, _t("w_bad_status", what=_word("order"), id=oid, status=_word(o.status)))
+        if not new:
+            warns.insert(0, _t("w_empty_order"))
+        if cust:
+            warns += self._credit_warning(o.customer_id, cname, self._customer_balance(o.customer_id) + total_p)
+        limit = float(self.repo.setting("big_order_limit") or 0)
+        list_total = sum(int(it["qty"]) * (self._prod(it["sku"]).unit_price if self._prod(it["sku"]) else 0) for it in new)
+        if limit and list_total > limit:
+            warns.append(_t("w_big_order", limit={"rs": limit}))
+        grow = {sku: q - before_q.get(sku, 0) for sku, q in after_q.items() if q > before_q.get(sku, 0)}
+        warns += self._stock_warnings(grow)
+        return {"title": _t("t_update_order", customer=cname), "lines": lines, "total": to_rupees(total_p), "warnings": warns,
+                "effect": _t("order_change", changes=changes or [{"name": "-", "before": 0, "after": 0}], before=_rs(o.total_paisa), after=_rs(total_p)),
+                "facts": [{"key": "note", "value": f"Draft {oid}, total before {_en(_rs(o.total_paisa))}"}]}
 
     def _c_confirm_order(self, a: dict, pa) -> dict:
         oid = str(a.get("order_id") or ""); o = self._order(oid)
@@ -657,7 +716,8 @@ class CardBuilder:
         if not ag:
             return {"title": _t("t_draft_reminder", tier=_word(a.get("tier") or "auto"), customer=cust.name), "effect": _t("reminder_none", customer=cust.name)}
         tier = a.get("tier") or ("final" if ag["days_overdue"] > 60 else "firm" if ag["days_overdue"] > 30 else "gentle")    # as the tool picks it
-        return {"title": _t("t_draft_reminder", tier=_word(tier), customer=cust.name), "total": ag["balance"],
+        warns = [_t("w_not_overdue", customer=cust.name)] if int(ag["days_overdue"] or 0) <= 0 else []
+        return {"title": _t("t_draft_reminder", tier=_word(tier), customer=cust.name), "total": ag["balance"], "warnings": warns,
                 "effect": _t("reminder_draft", amount={"rs": ag["balance"]}, days=int(ag["days_overdue"]))}
 
     def _c_draft_due_reminders(self, a: dict, pa) -> dict:
@@ -767,6 +827,7 @@ class MunshiPlatform:
         self._checkpointer = checkpointer
         # the rules engine: always there, always first
         self.specialists = {name: build(self.ops, self.repo, None, checkpointer) for name, build in BUILDERS.items()}
+        self._built = dict(self.specialists)     # the offline rules' own munshis (a test may swap one for a scripted model)
         self.manager = build_manager(None, self.repo)
         # the model engine: only with a real model, only for what the rules didn't understand
         self.model = model if is_real_model(model) else None
@@ -776,6 +837,7 @@ class MunshiPlatform:
             self.llm_specialists = {name: build(self.ops, self.repo, self.model, checkpointer) for name, build in BUILDERS.items() if name != "help"}
             self.llm_manager = build_manager(self.model)
         self._resume_only: dict = {}
+        self._model_down_until: datetime | None = None     # a rate-limited provider isn't asked again until then
         self.cards = CardBuilder(self.repo, self.ops)
         self._from_chat: dict | None = None     # the remembered customer/supplier this turn's message leaned on (named on its card)
         self._topic: dict | None = None         # this turn's remembered topic (handed to the model guard)
@@ -806,10 +868,11 @@ class MunshiPlatform:
                     return "owner"
             except Exception:
                 pass
-        if tool == "create_order" and need == "clerk":
+        if tool in ("create_order", "update_order") and need == "clerk":
             try:
                 limit = float(self.repo.setting("big_order_limit") or 0)
-                total = sum(int(i["qty"]) * self.repo.get_product(i["sku"]).unit_price for i in args.get("items", []))
+                items = args.get("items", []) if tool == "create_order" else self.ops.merged_lines(self.repo.get_order(args.get("order_id", "")), args.get("items", []))
+                total = sum(int(i["qty"]) * self.repo.get_product(i["sku"]).unit_price for i in items)
                 if limit and total > limit:
                     return "owner"
             except Exception:
@@ -911,12 +974,12 @@ class MunshiPlatform:
             self._answered = ask if answered else None
             try:
                 with self._trace("manager", role, text) as tr:
-                    reply, meta, understood = self._turn(RULES, thread_id, role, run, user, tr, force=force)
+                    reply, meta, understood = self._rules_turn(thread_id, role, text, run, user, tr, force, answered)
                     if not understood and self.hybrid:
                         # the model reads the message as the user wrote it (a completed open question: the whole request),
                         # with the remembered customer in its context note; the guard accepts that customer by the same rule
                         reply, meta = self._model_turn(thread_id, role, run if answered else text, user, tr, reply, meta)
-                    meta = meta | ({"completed": run} if answered else {"read_as": run} if run != text else {})
+                    meta = meta | ({"completed": run} if answered else {"read_as": run} if run != text else {}) | (reply.extra or {})
                     try:
                         meta["memo"] = self._remember(role, text, run, reply, ask, topic, used, answered)
                     except Exception:
@@ -941,7 +1004,8 @@ class MunshiPlatform:
         at = FU.now().isoformat()
         new_ask = None
         if reply.ask and not reply.pending:
-            new_ask = dict(reply.ask) | {"text": run, "specialist": reply.specialist, "at": at, "left": FU.MAX_CHATTER, "used": used}
+            new_ask = dict(reply.ask) | {"text": reply.ask.get("text") or run, "specialist": reply.ask.get("specialist") or reply.specialist, "at": at,
+                                         "left": FU.MAX_CHATTER, "used": used}
         elif ask and not answered and not reply.pending and reply.specialist in (None, "help") and int(ask.get("left", 0)) > 0:
             new_ask = dict(ask) | {"left": int(ask.get("left", 0)) - 1}
         intent = {"get_stock": "stock", "list_orders": "orders"}.get(reply.tool or "")
@@ -949,7 +1013,10 @@ class MunshiPlatform:
             intent = None
         whole = FU.WHOLE_BUSINESS(text) and not FU.PRONOUN(text)
         new_topic = FU.next_topic(topic, run, self.repo, role, reply.pending.args if reply.pending else None, whole, intent)
-        return {"role": role, "ask": new_ask, "topic": new_topic}
+        out = {"role": role, "ask": new_ask, "topic": new_topic}
+        if reply.listed:
+            out["listed"] = {"ids": list(reply.listed)[:40], "at": at}
+        return out
 
     # ------------------------------------------------------------------ memory across conversations (llm/memory.py)
     # Learned names are taught ONLY by a human confirming who they meant: approving a card made from their wording
@@ -1096,6 +1163,336 @@ class MunshiPlatform:
                 return spec
         return None
 
+    # ------------------------------------------------------------------ the rules engine: messages about more than one request
+    def _rules_turn(self, thread_id: str, role: str, text: str, run: str, user: str, tr, force: str | None, answered: bool) -> tuple[Reply, dict, bool]:
+        """The rules engine's go at a message. Before the one-request path (_turn), in order: a question about the
+        approvals queue; a correction of the card this person just asked for; a driver's 'customer wasn't there';
+        a batch ('sab confirm kar do'); one message with orders for several customers; two questions asked at once."""
+        ans = self._answered or {}
+        if answered and ans.get("slot") == "split":
+            return self._split_cards(thread_id, role, user, [str(c["id"]) for c in ans.get("candidates") or []], tr)
+        if not answered:
+            for step in (self._pending_question, self._correct, self._driver_step, self._batch, self._split_orders, self._split_reads):
+                try:
+                    out = step(thread_id, role, text, run, user, tr)
+                except Exception:
+                    log.exception("%s failed on %r", step.__name__, text[:80])
+                    out = None
+                if out is not None:
+                    return out
+        reply, meta, ok = self._turn(RULES, thread_id, role, run, user, tr, force=force)
+        pa = reply.pending
+        # 'X ko reminder bhej do' with nothing drafted yet: the draft card now, and -- once it is approved -- the send card
+        # right after it, so sending takes no second request (two decisions still: what it says, and that it goes out)
+        if pa is not None and pa.tool == "draft_reminder" and re.search(r"\b(bhej|bhejo|bhejdo|send|bhijwa\w*)\b", fold(run)) and \
+                not re.search(r"\b(draft|bana|banao|tayyar|tayar|likh\w*)\b", fold(run)):
+            reply.extra = dict(reply.extra or {}) | {"chain": {"after": pa.approval_id, "rest": [f"send reminder {pa.args.get('customer_id')}"], "total": 0,
+                                                              "done": 0, "specialist": "wasooli", "role": role, "user": user, "on": "approve"}}
+            reply.text += " Once it is approved, the card to send it comes next."
+        return reply, meta, ok
+
+    # -- the approvals queue ('koi approval pending he?')
+    def _pending_question(self, thread_id, role, text, run, user, tr):
+        if not TURNS.asks_pending(text) or customer_resolution(text, self.repo).status != "none":
+            return None
+        items = self.pending_items()
+        mine = lambda p: bool(user.strip() and p.requested_by.strip() and same_person(user, p.requested_by)) or (not user.strip() and p.requested_by_role == role)  # noqa: E731
+        can = [p for p in items if role in ("owner", "clerk") and self.decision_refusal(p, role, user) is None]
+        own = [p for p in items if p not in can and mine(p)]
+        rows = lambda ps: " ".join(f"{k}) {self._headline(self.card(p))} -- asked by {p.requested_by or p.requested_by_role}." for k, p in enumerate(ps[:10], 1))  # noqa: E731
+        parts = []
+        if can:
+            parts.append(f"{len(can)} card(s) waiting for you to approve: {rows(can)}" + (f" ...and {len(can) - 10} more." if len(can) > 10 else "")
+                         + " Open Approvals to decide them.")
+        if own:
+            parts.append(f"Your own request(s) waiting for someone else: {rows(own)}")
+        txt = " ".join(parts) if parts else ("Nothing is waiting for your approval." if role in ("owner", "clerk") else "None of your requests is waiting for approval.")
+        tr.specialist, tr.response_text = "report", txt
+        return Reply(txt, "report", None, thread_id), {"specialist": "report", "approvals_listed": [p.approval_id for p in can + own]}, True
+
+    # -- corrections ('galti ho gayi 40 kar do', 'nahi 25', '15000 nahi 12000 the')
+    def _correct(self, thread_id, role, text, run, user, tr):
+        me = lambda p: p.requested_by_role == role and (not p.requested_by.strip() or not user.strip() or same_person(p.requested_by, user))  # noqa: E731
+        mine = [p for p in self.pending_items(thread_id) if me(p)]
+        if mine:
+            pa = mine[-1]
+            new = TURNS.correction(text, pa.tool, pa.args, self.repo)
+            if new is None:
+                return None
+            req = self._corrected_request(pa.tool, new)
+            if req is None:
+                return None
+            old = self._headline(self.card(pa))
+            # the requester withdraws their own request (never a decision on someone else's), then asks again, corrected
+            self._withdraw(pa, role, user, f"withdrawn by the requester: corrected ('{text[:60]}')")
+            reply, meta, ok = self._turn(RULES, thread_id, role, req, user, tr, force=pa.specialist)
+            now = (", ".join(f"{int(i['qty'])} {self._entity_name('product', i['sku']) or i['sku']}"
+                             + (f" at {_en({'rs': float(i['unit_cost'])})}" if i.get("unit_cost") else "") for i in new.get("items") or [])
+                   if pa.tool in TURNS.ORDER_TOOLS + ("record_purchase",) else _en({"rs": float(new.get("amount") or 0)}))
+            lead = f"Corrected to {now}: the earlier card ({old}) is withdrawn. "
+            reply.text = lead + reply.text
+            return reply, meta | {"corrects": pa.approval_id}, ok
+        last = self._last_approved(thread_id, role, user)
+        if last is None:
+            return None
+        new = TURNS.correction(text, last["tool"], last["args"], self.repo)
+        if new is None:
+            return None
+        if last["tool"] in TURNS.ORDER_TOOLS:
+            oid = last["args"].get("order_id") or self._order_made_by(last["approval_id"], thread_id)
+            try:
+                o = self.repo.get_order(oid or "")
+            except Exception:
+                return None
+            before = {i["sku"]: int(i["qty"]) for i in last["args"].get("items") or []}
+            changed = [i for i in new["items"] if before.get(i["sku"]) != int(i["qty"])]
+            if o.status != "draft":
+                txt = (f"That order ({order_label(self.repo, o)}) is already {o.status}: only a draft can be changed, so nothing was done. "
+                       "Cancel it and book the right quantity as a new order.")
+                return Reply(txt, "order", None, thread_id), {"specialist": "order"}, True
+            reply, meta, ok = self._turn(RULES, thread_id, role, TURNS.update_text(o.order_id, changed), user, tr, force="order")
+            return reply, meta | {"corrects": last["approval_id"]}, ok
+        if last["tool"] == "record_payment":
+            a = last["args"]
+            cname = self._entity_name("customer", a.get("customer_id", "")) or a.get("customer_id", "")
+            entry = next((e.entry_id for e in reversed(self.repo.ledger_for(a.get("customer_id", ""))) if e.kind == "payment" and abs(-e.amount - float(a.get("amount") or 0)) < .01), "")
+            amt = lambda v: _en({"rs": float(v)})  # noqa: E731
+            txt = (f"{amt(a.get('amount'))} from {cname} is already recorded" + (f" (receipt {entry})" if entry else "") + ". A recorded payment is never edited: "
+                   f"the owner reverses it -- '{entry or 'RCP-...'} reverse karo, galat raqam' -- and then send the right one, e.g. "
+                   f"'{cname} ne {new['amount']:,.0f} {a.get('method') or 'cash'} diye'. Nothing was changed yet.")
+            return Reply(txt, "hisaab", None, thread_id), {"specialist": "hisaab"}, True
+        return None
+
+    @staticmethod
+    def _corrected_request(tool: str, args: dict) -> str | None:
+        if tool == "create_order":
+            return TURNS.order_text(args["customer_id"], args["items"])
+        if tool == "update_order":
+            return TURNS.update_text(args["order_id"], args["items"])
+        if tool == "record_payment":
+            return TURNS.payment_text(args["customer_id"], float(args["amount"]), str(args.get("method") or "cash"))
+        if tool == "record_purchase" and len(args.get("items") or []) == 1:
+            return TURNS.purchase_text(args)
+        return None
+
+    def _withdraw(self, pa: PendingApproval, role: str, user: str, note: str) -> None:
+        """The requester takes their own request back: recorded as a rejection with the reason, and the paused graph is
+        told so (never left hanging). No decision is made on anyone else's behalf."""
+        engine = engine_of(pa.approval_id)
+        bundle, cfg = self._bundle(engine, pa.specialist), self._resume_cfg(pa, engine)
+        self.repo.resolve_approval(pa.approval_id, False, user or role, note)
+        self.repo.audit(role, "approval_rejected", "approval", pa.approval_id, {"tool": pa.tool, "args": pa.args, "specialist": pa.specialist, "note": note},
+                        approved_by=role)
+        try:
+            bundle.agent.invoke(Command(resume={"decisions": [{"type": "reject", "message": note}]}), config=cfg)
+        except Exception:
+            log.exception("couldn't release the graph of withdrawn %s", pa.approval_id)
+        self._settle_memory(pa, False, False, "withdrawn", user or role)
+
+    def _last_approved(self, thread_id: str, role: str, user: str) -> dict | None:
+        """This person's most recent approved card on this thread, if it was decided within the conversation window."""
+        for a in self.repo.approval_history(40):
+            if a["thread_id"] != thread_id or a["requested_by_role"] != role:
+                continue
+            if user.strip() and (a.get("requested_by") or "").strip() and not same_person(user, a["requested_by"]):
+                continue
+            return a if a["status"] == "approved" and FU.fresh(a.get("resolved_at")) else None
+        return None
+
+    def _order_made_by(self, approval_id: str, thread_id: str) -> str:
+        """The order an approved create_order card made (its resolve reply names it)."""
+        for r in reversed(self.repo.chat_history(thread_id, 200)):
+            if (r.get("meta") or {}).get("resolved") == approval_id:
+                m = re.search(r"ORD-[A-Z0-9]{8}", str(r.get("text") or ""))
+                return m.group(0) if m else ""
+        return ""
+
+    # -- a driver at the door: 'customer ghar pe nahi tha'
+    _NOT_THERE = re.compile(r"\b(ghar (pe|par|pr)? ?nahi|nahi (mila|mile|the|tha|thi)|dukan band|shop (was )?closed|band thi|band tha|not (at )?home|koi nahi tha|"
+                            r"mana kar (diya|dia)|lene se mana|maal nahi liya|wapis le aya|wapas le aya|refused)\b")
+
+    def _driver_step(self, thread_id, role, text, run, user, tr):
+        if role != "driver" or not self._NOT_THERE.search(fold(text)) or otp_in(text):
+            return None
+        from munshi.agents.specialists import todays_stop
+        c = customer_resolution(text, self.repo)
+        st = todays_stop(self.repo, c.id or "") if c.ok else None
+        if st is None:
+            txt = "Which customer wasn't there? Say their name, e.g. 'Chaudhry Farms ghar pe nahi the'. The stop stays open until it is delivered."
+            return Reply(txt, "delivery", None, thread_id), {"specialist": "delivery"}, True
+        self.repo.notify("clerk", "delivery_failed", f"Driver{(' ' + user) if user else ''}: {c.name} -- delivery not made ('{text[:80]}'). The stop is still open.", st.stop_id)
+        self.repo.notify("owner", "delivery_failed", f"Driver{(' ' + user) if user else ''}: {c.name} -- delivery not made ('{text[:80]}'). The stop is still open.", st.stop_id)
+        txt = (f"I've told the office that {c.name} couldn't take the delivery. The stop stays open: nothing is delivered or collected, and no code is needed. "
+               "Keep their goods on the gaari and go on to the next stop -- the office will tell you whether to try again today or bring it back.")
+        tr.specialist, tr.response_text = "delivery", txt
+        return Reply(txt, "delivery", None, thread_id), {"specialist": "delivery", "notified": st.stop_id}, True
+
+    def _driver_route(self, text: str) -> str | None:
+        """A driver's message about a customer on today's run (the amount to collect, the address, a delivery made) is the
+        Delivery munshi's, whichever words it used -- the driver has no other munshi for it."""
+        from munshi.agents.specialists import todays_stop
+        f = fold(text)
+        door = re.search(r"\b(address|pata|kahan|location|otp|code|agla|next|stop|paise lene|lene hein|lene hain|kitne lene|kitna lena|collect|raqam|bill kitna|"
+                         r"de diya|de dia|diya|utar|utara|delivered|deliver|pohncha|maal de)\b", f)
+        if not door:
+            return None
+        c = customer_resolution(text, self.repo)
+        if c.ok and c.other is None and todays_stop(self.repo, c.id or "") is not None:
+            return "delivery"
+        if re.search(r"\b(address|otp|code|agla|next|stop)\b", f):
+            return "delivery"
+        return None
+
+    # -- batches ('unko confirm kar do sab'): one card per record, chained through resolve()
+    def _listed(self, thread_id: str, role: str) -> list[str]:
+        for r in reversed(self.repo.chat_history(thread_id, self._MEMO_ROWS * 2)):
+            memo = (r.get("meta") or {}).get("memo") if r.get("role") == "munshi" else None
+            if memo and memo.get("role") == role and memo.get("listed") and FU.fresh(memo["listed"].get("at")):
+                return list(memo["listed"]["ids"])
+        return []
+
+    def _batch(self, thread_id, role, text, run, user, tr):
+        b = TURNS.batch_of(run)
+        if b is None or role not in ("owner", "clerk"):
+            return None
+        verb, spec, statuses, ids = b
+        if self.specialists.get(spec) is not self._built.get(spec):
+            return None                                   # a swapped-in munshi (a scripted model) reads the whole message itself
+        c = customer_resolution(text, self.repo)          # (as typed: a remembered customer the topic added doesn't narrow 'sab')
+        if ids:
+            cands = ids
+        elif c.ok and c.other is None:
+            cands = [o.order_id for o in orders_of(self.repo, c.id or "", statuses)]
+        else:
+            listed = self._listed(thread_id, role)
+            pool = listed or [o.order_id for o in self.repo.list_orders(limit=200)]
+            cands = []
+            for oid in pool:
+                try:
+                    if self.repo.get_order(oid).status in statuses:
+                        cands.append(oid)
+                except Exception:
+                    continue
+        cands = list(dict.fromkeys(cands))[:20]
+        if not cands:
+            txt = f"There is no {' or '.join(statuses)} order to {verb}. Nothing was done."
+            return Reply(txt, spec, None, thread_id), {"specialist": spec}, True
+        steps = [TURNS.batch_step(verb, oid, text) for oid in cands]
+        if len(steps) == 1:
+            return self._turn(RULES, thread_id, role, steps[0], user, tr, force=spec)
+        chain = {"rest": steps, "total": len(steps), "done": 0, "specialist": spec, "role": role, "user": user, "on": "any", "verb": verb}
+        reply, meta, extra, notes = self._chain_step(thread_id, chain, tr)
+        head = f"{len(steps)} orders to {verb} -- one card each, so each can be checked."
+        reply.text = head + (" " + " ".join(notes) if notes else "") + (f" {reply.text}" if reply.pending else "")
+        reply.extra = extra
+        return reply, meta, True
+
+    def _chain_step(self, thread_id: str, chain: dict, tr) -> tuple[Reply, dict, dict, list[str]]:
+        """Raise the next card of a chain: (reply, meta, chat meta for the chain, notes on steps that raised no card)."""
+        rest, k, n = list(chain["rest"]), int(chain["done"]), int(chain["total"])
+        notes: list[str] = []
+        reply, meta = Reply("", chain["specialist"], None, thread_id), {"specialist": chain["specialist"]}
+        while rest:
+            step = rest.pop(0)
+            k += 1
+            reply, meta, _ = self._turn(RULES, thread_id, chain["role"], step, chain["user"], tr, force=chain["specialist"])
+            label = f"{k} of {n}: " if n else ""
+            if reply.pending:
+                reply.text = f"{label}{visible(reply.text)}" + (" After you decide it, the next one comes." if rest else "")
+                nxt = dict(chain) | {"rest": rest, "done": k, "after": reply.pending.approval_id}
+                extra = {"chain": nxt} | ({"lane": meta["lane"]} if meta.get("lane") else {})
+                return reply, meta, extra, notes
+            notes.append(f"{label}{visible(reply.text)}")
+        reply = Reply("", chain["specialist"], None, thread_id)
+        return reply, meta, {}, notes
+
+    def _chain_of(self, approval_id: str, thread_id: str) -> dict | None:
+        for r in reversed(self.repo.chat_history(thread_id, 5000)):
+            ch = (r.get("meta") or {}).get("chain")
+            if ch and ch.get("after") == approval_id:
+                return ch
+        return None
+
+    # -- one message, several requests
+    def _split_orders(self, thread_id, role, text, run, user, tr):
+        """Orders for two or more customers in one message are never merged into one card. The munshi reads it back
+        split, one order per customer, and asks once; 'haan' raises one card per customer (_split_cards)."""
+        if role == "driver":
+            return None
+        segs = TURNS.split_customers(run, self.repo)
+        if not segs:
+            return None
+        rows = []
+        for k, seg in enumerate(segs, 1):
+            op = analyse_order(seg, self.repo)
+            items = ", ".join(f"{i['qty']} {self._entity_name('product', i['sku']) or i['sku']}" for i in op.items)
+            rows.append(f"{k}) {op.customer.name}: {items}")
+        txt = (f"That's {len(segs)} customers in one message, so I read it as {len(segs)} separate orders -- " + "; ".join(rows)
+               + ". Shall I ask for approval of each, one card per customer? Say 'haan' (or send them one at a time).")
+        reply = Reply(txt, "order", None, thread_id)
+        reply.ask = {"slot": "split", "candidates": [{"id": s, "name": r} for s, r in zip(segs, rows, strict=True)], "specialist": "order"}
+        tr.specialist, tr.response_text = "order", txt
+        return reply, {"specialist": "order"}, True
+
+    def _split_cards(self, thread_id: str, role: str, user: str, segs: list[str], tr) -> tuple[Reply, dict, bool]:
+        """'haan' to a split order: one card per customer -- the first on the order desk's thread, the rest on lanes."""
+        outs = [self._turn(RULES, thread_id, role, seg, user, tr, force="order") for seg in segs]
+        cards = [{"approval_id": r.pending.approval_id, "lane": m.get("lane")} for r, m, _ in outs if r.pending]
+        names = [(self._entity_name("customer", customer_resolution(s, self.repo).id or "")) for s in segs]
+        head = f"{len(segs)} customers in one message ({', '.join(names)}), so each gets its own card:"
+        body = " ".join(f"{k}) {visible(r.text)}" for k, (r, _, _) in enumerate(outs, 1))
+        first = next((r for r, _, _ in outs if r.pending), outs[0][0])
+        meta = next((m for r, m, _ in outs if r.pending), outs[0][1])
+        first.text = f"{head} {body}"
+        first.extra = {"cards": cards}
+        return first, meta, True
+
+    def _split_reads(self, thread_id, role, text, run, user, tr):
+        parts = TURNS.split_reads(run)
+        if not parts or not all(self._read_only_question(p) for p in parts):
+            return None
+        outs = [self._turn(RULES, thread_id, role, p, user, tr) for p in parts]
+        if any(r.pending or r.waiting or not r.tool or self._is_write(r.tool) for r, _, _ in outs):
+            return None
+        first, meta, _ = outs[0]
+        first.text = "\n".join(visible(r.text) for r, _, _ in outs)
+        return first, meta, True
+
+    # -- what a tool result means for the next message
+    def _tool_followups(self, reply: Reply, new_msgs: list, text: str) -> None:
+        """A list reply remembers what it listed; a wrong delivery code keeps the close open for the right one; a
+        dispatch suggestion can be taken with 'theek he, bana do'; a cut-short list can be shown whole with 'sab dikhao'."""
+        tms = [m for m in new_msgs if isinstance(m, ToolMessage)]
+        tm = tms[-1] if tms else None
+        if tm is None:
+            return
+        content = str(tm.content)
+        if tm.name == "list_orders":
+            reply.listed = list(dict.fromkeys(re.findall(r"ORD-[A-Z0-9]{8}", content)))
+        if tm.name == "close_stop" and "OTP does not match" in content and reply.ask is None:
+            reply.ask = {"slot": "otp", "candidates": [], "specialist": "delivery"}
+            reply.text += " Ask the customer for the code again and send just the code, e.g. 'code 1234'."
+        if tm.name == "suggest_dispatch" and reply.ask is None:
+            try:
+                rows = [r for r in json.loads(content) if isinstance(r, dict) and r.get("vehicle_id") and r.get("route_id") != "UNROUTED"]
+            except (ValueError, TypeError):
+                rows = []
+            if rows:
+                reply.ask = {"slot": "dispatch", "specialist": "godown",
+                             "candidates": [{"id": f"dispatch plan {r['route_id']} {r['vehicle_id']} " + " ".join(r.get("order_ids") or []),
+                                             "name": self._route_name(r["route_id"])} for r in rows[:5]]}
+                if len(rows) == 1:
+                    reply.text = visible(reply.text).rstrip(".") + ". Say 'theek he, bana do' and I'll ask for approval of this plan." + (
+                        DETAILS + reply.text.split(DETAILS, 1)[1] if DETAILS in reply.text else "")
+        if reply.ask is None and re.search(r"\.\.\.(and \d+ more|aur \d+ mazeed)|\.\.\.اور \d+ مزید", visible(reply.text)):
+            reply.ask = {"slot": "more", "candidates": []}
+
+    def _route_name(self, rid: str) -> str:
+        try:
+            return self.repo.get_route(rid).name
+        except Exception:
+            return rid
+
     def _turn(self, engine: str, thread_id: str, role: str, text: str, user: str, tr, config: dict | None = None,
               context: list | None = None, force: str | None = None) -> tuple[Reply, dict, bool]:
         """One engine's go at a message: (reply, chat-log meta, understood). `understood` is False only when the
@@ -1110,40 +1507,125 @@ class MunshiPlatform:
                 specialist = self._bare_entity(text)
             except Exception:
                 log.exception("bare-name routing failed on %r", text[:80])
+        if engine == RULES and role == "driver" and specialist not in ("delivery", "help"):
+            specialist = self._driver_route(text) or specialist
         tr.specialist = specialist
         if specialist is None:
             return Reply(CLARIFY, None, None, thread_id, engine=engine), {"specialist": None}, False
 
-        # A thread can only hold one pending action per specialist per role (whichever engine raised it), and a
-        # paused graph is NEVER invoked with a new message. A plain read-only question goes to the Report munshi
-        # instead (its own thread namespace, no write tools for any role); anything else is answered with the
-        # card it is waiting behind, so it can be decided right there.
+        # A paused graph is NEVER invoked with a new message. While this role has a card waiting with this specialist on
+        # this thread: a plain read-only question goes to the Report munshi (its own thread namespace, no write tools for
+        # any role); anything else runs on a fresh graph LANE of its own ('{thread}:{role}:{specialist}:q{approval id}',
+        # recorded in the chat log so resolve() resumes the right one) -- an independent request (another customer's
+        # order) gets its own card, a read gets its answer, and only what can't stand alone (a duplicate of the waiting
+        # card, 'yes', a bare verb) is answered with the card it is waiting behind, so it can be decided right there.
         held = sorted((p for p in self.repo.pending_approvals(thread_id) if p["specialist"] == specialist and p["requested_by_role"] == role),
                       key=lambda p: p["created_at"])
+        lane = None
         if held:
             if self._read_only_question(text) and self._report_answers(role, thread_id):
                 specialist = tr.specialist = "report"
+            elif engine == RULES:
+                lane = self._new_lane(thread_id, role, specialist)
             else:
                 pa = self._pa(held[0])
-                txt = self._still_waiting(pa)
+                txt = self._still_waiting(pa, role, user)
                 tr.response_text = txt
                 return (Reply(txt, specialist, None, thread_id, waiting=pa, engine=engine),
                         {"specialist": specialist, "waiting_on": pa.approval_id}, True)
 
         bundle = self._bundle(engine, specialist)
-        cfg = self._cfg(thread_id, role, specialist, engine)
+        cfg = {"configurable": {"thread_id": lane[1]}} if lane else self._cfg(thread_id, role, specialist, engine)
         self._clear_orphaned_interrupt(bundle, cfg)
         result = bundle.agent.invoke({"messages": [*(context or []), HumanMessage(text)], "role": role}, config=cfg | (config or {}))
+        if lane:
+            kept = self._lane_result(bundle, cfg, specialist, thread_id, role, user, text, result, held, tr)
+            if kept is not None:
+                return kept
         if engine == RULES and self.hybrid and not result.get("__interrupt__") and not_understood(result["messages"][-1]):
             return Reply(self._final_text(result), specialist, None, thread_id, engine=engine), {"specialist": specialist}, False
         msgs = result.get("messages") or []
         h = max((i for i, m in enumerate(msgs) if isinstance(m, HumanMessage)), default=-1)
         called = [tc["name"] for m in msgs[h + 1:] if isinstance(m, AIMessage) for tc in (m.tool_calls or [])]
         ask = ask_of(msgs[-1]) if msgs and not result.get("__interrupt__") else None
-        reply = self._settle(bundle, specialist, thread_id, role, user, result, tr, engine=engine, config=config)
+        reply = self._settle(bundle, specialist, thread_id, role, user, result, tr, engine=engine, config=config, cfg=cfg if lane else None,
+                             aid=lane[0] if lane else None)
         reply.engine, reply.tool = engine, (called[-1] if called else None)
         reply.ask = ask if reply.pending is None else None
-        return reply, {"specialist": specialist} | ({"approval_id": reply.pending.approval_id} if reply.pending else {}), True
+        if reply.pending is None:
+            self._tool_followups(reply, msgs[h + 1:], text)
+        meta = {"specialist": specialist} | ({"approval_id": reply.pending.approval_id} if reply.pending else {})
+        if lane and reply.pending:
+            meta["lane"] = lane[1]
+        return reply, meta, True
+
+    # ------------------------------------------------------------------ graph lanes: more than one card per specialist per thread
+    def _new_lane(self, thread_id: str, role: str, specialist: str) -> tuple[str, str]:
+        """(the approval id a card raised on it will get, the lane's graph thread id). Rules-engine ids are hex."""
+        aid = uuid.uuid4().hex[:10].upper()
+        return aid, f"{thread_id}:{role}:{specialist}:q{aid}"
+
+    _IGNORED_ARGS = ("source_text", "reason", "ref", "note", "channel", "approved_by")
+
+    def _same_request(self, tool: str, args: dict, held: list[dict]) -> dict | None:
+        """The waiting card this call merely repeats (same action, same record, same lines/amount), if any."""
+        key = lambda a: json.dumps({k: v for k, v in (a or {}).items() if k not in self._IGNORED_ARGS}, sort_keys=True, default=str)  # noqa: E731
+        return next((p for p in held if p["tool"] == tool and key(p["args"]) == key(args)), None)
+
+    def _lane_result(self, bundle, cfg: dict, specialist: str, thread_id: str, role: str, user: str, text: str, result: dict,
+                     held: list[dict], tr) -> tuple[Reply, dict, bool] | None:
+        """What a message run on a fresh lane (while this role's card waits) gets: its own card, or a read's answer
+        (None: the normal settle does that). Otherwise the waiting card, with the lane's question added when the message
+        named someone -- and a card that only repeats the waiting one is declined, never raised twice."""
+        interrupts = result.get("__interrupt__")
+        msgs = result.get("messages") or []
+        h = max((i for i, m in enumerate(msgs) if isinstance(m, HumanMessage)), default=-1)
+        pa = self._pa(held[0])
+        if interrupts:
+            reqs = interrupts[0].value.get("action_requests", [])
+            dup = self._same_request(reqs[0]["name"], reqs[0]["args"], held) if len(reqs) == 1 else None
+            if dup is None:
+                return None
+            pa = self._pa(dup)
+            try:
+                bundle.agent.invoke(Command(resume={"decisions": [{"type": "reject", "message": "Not asked for: the same request is already waiting."}] * len(reqs)}),
+                                    config=cfg)
+            except Exception:
+                log.exception("couldn't decline a duplicate on %s", cfg["configurable"]["thread_id"])
+            txt = self._still_waiting(pa, role, user)
+            tr.response_text = txt
+            return Reply(txt, specialist, None, thread_id, waiting=pa), {"specialist": specialist, "waiting_on": pa.approval_id}, True
+        reads = [tc["name"] for m in msgs[h + 1:] if isinstance(m, AIMessage) for tc in (m.tool_calls or []) if not self._is_write(tc["name"])]
+        if reads:
+            return None
+        txt = self._still_waiting(pa, role, user)
+        ask = ask_of(msgs[-1]) if msgs else None
+        named = customer_resolution(text, self.repo).status != "none" or supplier_resolution(text, self.repo).status != "none"
+        reply = Reply(txt, specialist, None, thread_id, waiting=pa)
+        if named and msgs and isinstance(msgs[-1], AIMessage) and not not_understood(msgs[-1]) and str(msgs[-1].content).strip():
+            reply.text = f"{txt}\n\nYour new message: {msgs[-1].content}"
+            reply.ask = ask
+        tr.response_text = reply.text
+        return reply, {"specialist": specialist, "waiting_on": pa.approval_id}, True
+
+    def _lane_of(self, approval_id: str, thread_id: str) -> str | None:
+        """The graph lane a card was raised on (None: the specialist's main thread). Read from the chat log."""
+        try:
+            rows = self.repo.chat_history(thread_id, 5000)
+        except Exception:
+            return None
+        for r in reversed(rows):
+            meta = r.get("meta") or {}
+            if meta.get("approval_id") == approval_id and meta.get("lane"):
+                return meta["lane"]
+            for c in meta.get("cards") or []:
+                if c.get("approval_id") == approval_id and c.get("lane"):
+                    return c["lane"]
+        return None
+
+    def _resume_cfg(self, pa: PendingApproval, engine: str) -> dict:
+        lane = self._lane_of(pa.approval_id, pa.thread_id) if engine == RULES else None
+        return {"configurable": {"thread_id": lane}} if lane else self._cfg(pa.thread_id, pa.requested_by_role, pa.specialist, engine)
 
     # ------------------------------------------------------------------ the model engine
     _CONTEXT_LINES = 4
@@ -1231,6 +1713,11 @@ class MunshiPlatform:
         """The real model's go at a message the rules didn't understand. Any failure -- timeout, rate limit,
         provider error, a malformed reply -- gives the rules' own reply instead; never a stack trace."""
         calls = _ModelCalls()
+        if self._model_down_until is not None and datetime.now(UTC) < self._model_down_until:
+            # the provider said "rate limited" a moment ago: answer from the rules at once instead of waiting a minute to hear it again
+            reply, meta = fallback, dict(fallback_meta)
+            reply.model_error = meta["model_error"] = "ModelUnavailable"
+            return reply, meta | {"engine": reply.engine, "model_calls": 0, "model_tokens": 0, "model_down_until": self._model_down_until.isoformat()}
         token = guard.set_history(self._history_lines(thread_id))
         ttoken = guard.set_topic(self._topic)
         try:
@@ -1260,11 +1747,27 @@ class MunshiPlatform:
             self._heal_model_threads(thread_id, role)
             reply, meta = fallback, dict(fallback_meta)
             reply.model_error = meta["model_error"] = type(e).__name__
+            wait = self.rate_limit_wait(e)
+            if wait:
+                self._model_down_until = datetime.now(UTC) + timedelta(seconds=wait)
+                log.warning("model rate-limited: answering from the rules until %s", self._model_down_until.isoformat())
         finally:
             guard.reset_history(token)
             guard.reset_topic(ttoken)
         reply.model_calls, reply.model_tokens = calls.n, calls.tokens
         return reply, meta | {"engine": reply.engine, "model_calls": calls.n, "model_tokens": calls.tokens}
+
+    @staticmethod
+    def rate_limit_wait(e: Exception) -> float:
+        """Seconds to stop asking the model after this error: 0 unless it is a rate limit. A daily token limit (Groq's
+        'tokens per day (TPD)') won't lift for hours -- asking again only adds a minute of retries to every message."""
+        msg = f"{type(e).__name__} {e}".lower()
+        if "ratelimit" not in msg.replace("_", "").replace(" ", "") and "429" not in msg:
+            return 0.0
+        m = re.search(r"try again in\s*(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:([\d.]+)s)?", msg)
+        said = (int(m.group(1) or 0) * 3600 + int(m.group(2) or 0) * 60 + float(m.group(3) or 0)) if m and any(m.groups()) else 0.0
+        daily = "per day" in msg or "tpd" in msg or "rpd" in msg
+        return max(said, 3600.0 if daily else 60.0) if not said else min(max(said, 30.0), 6 * 3600.0)
 
     @staticmethod
     def _raw(text: str) -> bool:
@@ -1311,7 +1814,7 @@ class MunshiPlatform:
     _MAX_DECLINES = 3
 
     def _settle(self, bundle, specialist: str, thread_id: str, role: str, user: str, result: dict, tr, lead: str = "",
-                engine: str = RULES, config: dict | None = None) -> Reply:
+                engine: str = RULES, config: dict | None = None, cfg: dict | None = None, aid: str | None = None) -> Reply:
         """Turn a specialist run into a Reply. If the run paused on a gated call,
         persist exactly one approval card for it -- unless the call references
         something that doesn't exist (or the pause holds more than one action,
@@ -1327,15 +1830,17 @@ class MunshiPlatform:
                 break
             value = interrupts[0].value
             reqs = value.get("action_requests", [])
-            problem = "only one action needing approval can be asked for at a time" if len(reqs) != 1 else self._unresolvable(reqs[0]["name"], reqs[0]["args"])
+            problem = "only one action needing approval can be asked for at a time" if len(reqs) != 1 else (
+                self._unresolvable(reqs[0]["name"], reqs[0]["args"]) or self._cannot(reqs[0]["name"], reqs[0]["args"]))
             if problem is None:
-                return self._open_card(bundle, specialist, thread_id, role, user, reqs[0], value.get(DEFERRED_KEY, []), problems, tr, lead, engine)
+                return self._open_card(bundle, specialist, thread_id, role, user, reqs[0], value.get(DEFERRED_KEY, []), problems, tr, lead, engine,
+                                       aid=aid)
             log.warning("declined gated call on %s/%s: %s", thread_id, specialist, problem)
             problems.append(problem)
             if len(problems) > self._MAX_DECLINES:
                 break
             result = bundle.agent.invoke(Command(resume={"decisions": [{"type": "reject", "message": f"Not asked for: {problem}."}] * max(len(reqs), 1)}),
-                                         config=self._cfg(thread_id, role, specialist, engine) | (config or {}))
+                                         config=(cfg or self._cfg(thread_id, role, specialist, engine)) | (config or {}))
         if problems and lead:
             txt = f"{lead}A follow-up action couldn't be asked for — {problems[0]}. That follow-up was not done."
         elif problems:
@@ -1346,10 +1851,10 @@ class MunshiPlatform:
         return Reply(txt, specialist, None, thread_id)
 
     def _open_card(self, bundle, specialist: str, thread_id: str, role: str, user: str, req: dict, deferred: list[dict], problems: list[str], tr,
-                   lead: str = "", engine: str = RULES) -> Reply:
+                   lead: str = "", engine: str = RULES, aid: str | None = None) -> Reply:
         tool = req["name"]
         # the approval id records the engine whose graph is paused on this call (see engine_of / resolve)
-        aid = (MODEL_APPROVAL_PREFIX + uuid.uuid4().hex[:9].upper()) if engine == MODEL else uuid.uuid4().hex[:10].upper()
+        aid = aid or ((MODEL_APPROVAL_PREFIX + uuid.uuid4().hex[:9].upper()) if engine == MODEL else uuid.uuid4().hex[:10].upper())
         pa = PendingApproval(aid, thread_id, specialist, tool, req["args"],
                              risk_of(tool).value, self._needs_role(tool, req["args"]), role, user)
         self.repo.save_approval(asdict(pa))
@@ -1378,6 +1883,11 @@ class MunshiPlatform:
             str(req["args"].get("customer_id") or ""), str(req["args"].get("supplier_id") or "")) else ""
         # ... and one whose customer / supplier / product came from a learned name names that memory
         note += "".join(f" -- {n}" for n in mem_notes)
+        # money cards say HOW the money moved, so a wrong method is caught at approval (the card's facts carry it too)
+        if tool in ("record_payment", "pay_supplier") and isinstance(req["args"], dict):
+            m = str(req["args"].get("method") or "cash")
+            ref = str(req["args"].get("ref") or "")
+            note += f" -- by {CARD_WORDS_EN.get(m, m)}" + (f" ({ref})" if re.match(r"(cheque|check|chq|chek|tid|trx|txn|ref) ", ref) else "")
         txt = f"{lead}{skipped}{bundle.title} {'next ' if lead else ''}wants to: {self._headline(card)}{note}.{effect} Needs {pa.needs_role} approval.{later}"
         return Reply(txt, specialist, pa, thread_id)
 
@@ -1424,10 +1934,20 @@ class MunshiPlatform:
             code, txt = "refused", why
         return {"can_approve": False, "blocked_reason": txt, "blocked_code": code, "is_requester": mine, "needs_role_now": need}
 
-    def _still_waiting(self, pa: PendingApproval) -> str:
+    def _still_waiting(self, pa: PendingApproval, role: str = "", user: str = "") -> str:
+        """The card a message is held behind, and what THIS person can do about it (a salesman is never told to approve)."""
         card = self.card(pa)
         who = "the owner needs to approve" if pa.needs_role == "owner" else "another clerk or the owner needs to approve"
-        return f"Still waiting for approval: {self._headline(card)} — {who}. Approve or reject it here, then ask again."
+        mine = pa.requested_by_role == role and (not pa.requested_by.strip() or not user.strip() or same_person(pa.requested_by, user))
+        if role in ("owner", "clerk") and self.decision_refusal(pa, role, user) is None:
+            then = "Approve or reject it here, then ask again."
+        elif mine and role in ("owner", "clerk"):
+            then = "You can withdraw it here, or correct it (e.g. 'galti, 40 kar do'); anything new gets its own card."
+        elif mine:
+            then = "The office decides it; send a correction if something on it is wrong (e.g. 'galti, 40 kar do')."
+        else:
+            then = "The office decides it."
+        return f"Still waiting for approval: {self._headline(card)} — {who}. {then}"
 
     # A read-only question may be answered by the Report munshi while a write waits. Deliberately
     # conservative: it needs a question cue AND no action word at all. Getting this wrong is safe in
@@ -1461,7 +1981,69 @@ class MunshiPlatform:
     # entry_id / expense_id / purchase_id: the four reversal tools (reverse_ledger_entry, reverse_supplier_entry,
     # reverse_expense, reverse_purchase) each take exactly one of these and nothing else that names a record.
     _REFS = {"order_id": "order", "customer_id": "customer", "plan_id": "dispatch plan", "supplier_id": "supplier", "reminder_id": "reminder",
-             "entry_id": "entry to reverse", "expense_id": "expense to reverse", "purchase_id": "purchase to reverse"}
+             "entry_id": "entry to reverse", "expense_id": "expense to reverse", "purchase_id": "purchase to reverse",
+             "route_id": "route", "vehicle_id": "vehicle"}
+
+    def _cannot(self, tool: str, args: dict) -> str | None:
+        """Why this call would certainly fail if approved, read from the books now (read-only), or None. A card that
+        can't succeed wastes an approver's tap and teaches them to tap without reading -- so none is raised: the
+        munshi says why instead. (Orders, allocation, dispatch and loading: where state and stock decide.)"""
+        g = lambda fn, *a: self.cards._get(fn, *a)  # noqa: E731
+        pname = lambda sku: self._entity_name("product", sku) or sku  # noqa: E731
+        wname = lambda wid: (g(self.repo.get_warehouse, wid).name if g(self.repo.get_warehouse, wid) else wid)  # noqa: E731
+        if tool == "update_order":
+            o = g(self.repo.get_order, str(args.get("order_id") or ""))
+            if o is None:
+                return f"there is no order {args.get('order_id')}"
+            if o.status != "draft":
+                return f"that order is already {o.status} -- only a draft can be changed"
+            if not self.ops.merged_lines(o, [i for i in args.get("items") or [] if isinstance(i, dict)]):
+                return "that would leave the order with no lines -- cancel it instead"
+        if tool == "allocate_order":
+            o = g(self.repo.get_order, str(args.get("order_id") or ""))
+            if o is None:
+                return f"there is no order {args.get('order_id')}"
+            if o.status != "confirmed":
+                return f"that order is {o.status} -- only a confirmed order can have stock reserved" + (" (confirm it first)" if o.status == "draft" else "")
+            wid = str(args.get("warehouse_id") or "") or (g(self.repo.default_warehouse_id) or "")
+            short = [f"{pname(sku)} {self.cards._available(sku, wid)} of {q}" for sku, q in self.cards._need(o.items).items() if self.cards._available(sku, wid) < q]
+            if short:
+                return f"{wname(wid)} doesn't have enough: " + ", ".join(short)
+        if tool == "create_dispatch_plan":
+            route, veh = g(self.repo.get_route, str(args.get("route_id") or "")), g(self.repo.get_vehicle, str(args.get("vehicle_id") or ""))
+            if route is None or veh is None:
+                return "the route or the vehicle doesn't exist"
+            units = 0
+            for oid in dict.fromkeys(str(x) for x in args.get("order_ids") or []):
+                o = g(self.repo.get_order, oid)
+                if o is None:
+                    return f"there is no order {oid}"
+                cname = self._entity_name("customer", o.customer_id) or o.customer_id
+                if o.status != "allocated":
+                    return f"{cname}'s order is {o.status} -- it must be allocated (stock reserved) before it can go on a plan"
+                if o.warehouse_id != route.warehouse_id:
+                    return f"{cname}'s order is reserved at {wname(o.warehouse_id)}, but the {route.name} gaari loads at {wname(route.warehouse_id)}"
+                if self.repo._one("SELECT 1 FROM stops WHERE order_id=? AND status='pending'", (oid,)):
+                    return f"{cname}'s order is already on a plan"
+                units += o.load_units
+            if units > veh.capacity_units:
+                return f"{units} units won't fit on {veh.plate} (holds {veh.capacity_units})"
+        if tool == "approve_dispatch_plan":
+            plan = g(self.repo.get_plan, str(args.get("plan_id") or ""))
+            if plan is None:
+                return f"there is no plan {args.get('plan_id')}"
+            if plan.status != "planned":
+                return f"that plan is already {plan.status}"
+            need: dict[str, int] = {}
+            for oid in plan.order_ids:
+                o = g(self.repo.get_order, oid)
+                for sku, q in (self.cards._need(o.items) if o else {}).items():
+                    need[sku] = need.get(sku, 0) + q
+            short = [f"{pname(sku)} {self.repo.get_stock(plan.warehouse_id, sku).on_hand} of {q}" for sku, q in need.items()
+                     if self.repo.get_stock(plan.warehouse_id, sku).on_hand < q]
+            if short:
+                return f"{wname(plan.warehouse_id)} doesn't have the stock to load: " + ", ".join(short)
+        return None
 
     def _unresolvable(self, tool: str, args: dict) -> str | None:
         """Why no card should be raised for this call, or None. A card must never
@@ -1516,7 +2098,7 @@ class MunshiPlatform:
                     raise PermissionError(why)
             engine = engine_of(pa.approval_id)              # resumed by the SAME engine that paused it
             bundle = self._bundle(engine, pa.specialist)
-            cfg = self._cfg(pa.thread_id, pa.requested_by_role, pa.specialist, engine)
+            cfg = self._resume_cfg(pa, engine)               # its own graph lane, when it was raised on one
             # memory learns only from an approved card that raised no warnings (read before the action changes the books)
             warned = False
             if approve:
@@ -1562,7 +2144,29 @@ class MunshiPlatform:
                     reply.engine, reply.model_calls, reply.model_tokens = engine, calls.n, calls.tokens
                     ran = approve and self._ran(bundle, cfg, pa.tool)
                     self._settle_memory(pa, approve, ran and not warned, "warnings" if warned else "action failed", user or role)
-                    self.repo.add_chat(pa.thread_id, "munshi", reply.text, meta | ({"approval_id": reply.pending.approval_id} if reply.pending else {}))
+                    if reply.pending:
+                        meta["approval_id"] = reply.pending.approval_id
+                        main = self._cfg(pa.thread_id, pa.requested_by_role, pa.specialist, engine)["configurable"]["thread_id"]
+                        if cfg["configurable"]["thread_id"] != main:
+                            meta["lane"] = cfg["configurable"]["thread_id"]
+                    else:
+                        # the next card of a chain this one belongs to ('sab confirm kar do': 2 of 6), on the requester's behalf
+                        try:
+                            ch = self._chain_of(approval_id, pa.thread_id)
+                            if ch and ch.get("rest") and (approve or ch.get("on") != "approve"):
+                                with self.repo.acting_as(pa.requested_by):
+                                    nxt, nmeta, extra, notes = self._chain_step(pa.thread_id, ch, tr)
+                                more = " ".join(notes)
+                                head, sep, tail = reply.text.partition(DETAILS)      # the next card is said BEFORE the folded details
+                                if nxt.pending:
+                                    reply.text = f"{head}\n\n" + (f"{more} " if more else "") + ("Next, " if ch.get("total") else "Next: ") + nxt.text + sep + tail
+                                    reply.pending = nxt.pending
+                                    meta |= {"approval_id": nxt.pending.approval_id} | extra
+                                elif more:
+                                    reply.text = f"{head}\n\n{more}{sep}{tail}"
+                        except Exception:
+                            log.exception("couldn't raise the next card of the chain after %s", approval_id)
+                    self.repo.add_chat(pa.thread_id, "munshi", reply.text, meta)
                     if approve: self.deliver_messages()
                     return reply
             finally:

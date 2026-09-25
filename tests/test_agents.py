@@ -48,10 +48,15 @@ def test_domain_error_becomes_a_reply_not_a_crash(p):
     assert "Couldn't do that" in r.text
 
 
-def test_one_pending_per_specialist_per_thread(p):
-    p.handle_message("t", "clerk", "Chaudhry Farms ko 20 urea bhej do")
+def test_a_paused_graph_holds_one_card_and_an_independent_request_gets_its_own_lane(p):
+    # (was: one pending per specialist per thread, and the second order was dropped -- the persona run's G4)
+    first = p.handle_message("t", "clerk", "Chaudhry Farms ko 20 urea bhej do")
     r = p.handle_message("t", "clerk", "Rana Brothers ko 3 zinc bhej do")
-    assert r.pending is None and "waiting for approval" in r.text
+    assert r.pending is not None and r.pending.args["customer_id"] == "C-005" and r.pending.approval_id != first.pending.approval_id
+    # what can't stand on its own ('yes', the same order again) is still held behind the waiting card
+    for text in ("yes confirm it", "Chaudhry Farms ko 20 urea bhej do"):
+        held = p.handle_message("t", "clerk", text)
+        assert held.pending is None and "waiting for approval" in held.text, text
 
 
 def test_every_approval_is_audited(p):

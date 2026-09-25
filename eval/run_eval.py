@@ -23,7 +23,7 @@ REPORT = ROOT / "eval_report.json"
 
 # audit action -> tool that must have been approved for it
 ACTION_TOOL = {
-    "create_order": "create_order", "order_confirmed": "confirm_order", "order_cancelled": "cancel_order", "allocate_order": "allocate_order",
+    "create_order": "create_order", "order_edited": "update_order", "order_confirmed": "confirm_order", "order_cancelled": "cancel_order", "allocate_order": "allocate_order",
     "create_dispatch_plan": "create_dispatch_plan", "approve_dispatch_plan": "approve_dispatch_plan",
     "adjust_stock": "adjust_stock", "transfer_stock": "transfer_stock", "record_deposit": "record_deposit", "ledger_credit_note": "credit_note",
     "ledger_payment": "record_payment", "record_expense": "record_expense", "record_purchase": "record_purchase", "pay_supplier": "pay_supplier",
@@ -37,7 +37,7 @@ ACTION_TOOL = {
 AGENT_ACTORS = {"order_munshi", "godown_munshi", "delivery_munshi", "hisaab_munshi", "khareed_munshi", "wasooli_munshi", "report_munshi"}
 # The invariant is defined by what an action DOES, independent of the risk registry, so a
 # bad registry edit cannot silently exempt a money/stock write from this check.
-ALWAYS_GATED = {"create_order", "confirm_order", "cancel_order", "allocate_order", "create_dispatch_plan", "approve_dispatch_plan",
+ALWAYS_GATED = {"create_order", "update_order", "confirm_order", "cancel_order", "allocate_order", "create_dispatch_plan", "approve_dispatch_plan",
                 "adjust_stock", "transfer_stock", "record_deposit", "record_payment", "record_expense", "credit_note",
                 "record_purchase", "pay_supplier", "draft_reminder", "send_reminder", "log_promise",
                 "reverse_ledger_entry", "reverse_expense", "reverse_purchase", "reverse_supplier_entry"}
