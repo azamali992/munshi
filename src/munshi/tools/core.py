@@ -7,7 +7,7 @@ from dataclasses import asdict
 from datetime import date, timedelta
 
 from munshi.domain.models import today_iso
-from munshi.domain.repository import MunshiRepository
+from munshi.domain.repository import MunshiRepository, StateError
 
 REMINDER_TEMPLATES = {
     "gentle": {
@@ -124,7 +124,18 @@ class MunshiTools:
         return asdict(p) | {"stops": [self._stop_view(s) for s in self.repo.list_stops(plan_id)]}
 
     def list_stops(self, plan_id: str) -> list[dict]:
-        return [self._stop_view(s) | {"customer_name": self.repo.get_customer(s.customer_id).name} for s in self.repo.list_stops(plan_id)]
+        """The stops with what a driver needs at the door: the customer's name and address, what was loaded for them and the
+        bill for it (the amount to collect, at most). Read-only; the delivery code is never included."""
+        out = []
+        for s in self.repo.list_stops(plan_id):
+            c = self.repo.get_customer(s.customer_id)
+            try:
+                o = self.repo.get_order(s.order_id)
+                extra = {"order_total": o.total, "items": [{"sku": i.sku, "qty": i.qty} for i in o.items]}
+            except Exception:
+                extra = {}
+            out.append(self._stop_view(s) | {"customer_name": c.name, "address": c.address, "phone": c.phone} | extra)
+        return out
 
     def aging_report(self, limit: int = 30) -> list[dict]:
         return self.repo.aging()[:max(1, min(int(limit or 30), 200))]
@@ -158,6 +169,38 @@ class MunshiTools:
     def create_order(self, customer_id: str, items: list[dict], source_text: str = "", channel: str = "chat") -> dict:
         o = self.repo.create_order(customer_id, items, channel, source_text, "order_munshi")
         return self._order(o)
+
+    @staticmethod
+    def merged_lines(order, changes: list[dict]) -> list[dict]:
+        """A draft's lines with `changes` applied: each {sku, qty} sets that product's quantity (a new product is added
+        at the end, qty 0 removes it); lines not mentioned stay as they are. Existing lines keep the price they were
+        drafted at; a new line takes the customer's price (the repository prices it). Pure: reads nothing."""
+        want: dict[str, int] = {}
+        for c in changes or []:
+            want[str(c["sku"]).strip().upper()] = int(c["qty"])
+        out, seen = [], set()
+        for it in order.items:
+            if it.sku in seen:
+                continue
+            seen.add(it.sku)
+            qty = want.get(it.sku, sum(i.qty for i in order.items if i.sku == it.sku))
+            if qty > 0:
+                out.append({"sku": it.sku, "qty": qty, "unit_price": it.unit_price})
+        for sku, qty in want.items():
+            if sku not in seen and qty > 0:
+                out.append({"sku": sku, "qty": qty})
+        return out
+
+    def update_order(self, order_id: str, items: list[dict], approved_by: str = "clerk") -> dict:
+        """Edit a DRAFT order: `items` are only the lines that change (see merged_lines). Anything past draft is
+        refused by the repository ("only drafts can be edited") -- that is a cancel and a new order."""
+        o = self.repo.get_order(order_id)
+        if o.status != "draft":
+            raise StateError(f"order {order_id} is {o.status}; only drafts can be edited -- cancel it and book a new order instead")
+        lines = self.merged_lines(o, items)
+        if not lines:
+            raise ValueError("that would leave the order with no lines -- cancel it instead")
+        return self._order(self.repo.update_order(order_id, lines, None, "order_munshi", approved_by))
 
     def confirm_order(self, order_id: str, approved_by: str = "clerk") -> dict:
         # the platform escalates an over-limit confirmation to the owner before this runs, so an approved call may override
@@ -211,7 +254,17 @@ class MunshiTools:
     def reverse_ledger_entry(self, entry_id: str, reason: str, approved_by: str = "owner") -> dict:
         # a reversal changes money that already moved: HIGH_RISK, owner-approved, like credit_note
         e = self.repo.reverse_ledger_entry(entry_id, reason, "hisaab_munshi", approved_by)
-        return asdict(e) | {"customer_name": self.repo.get_customer(e.customer_id).name, "outstanding": self.repo.outstanding(e.customer_id)}
+        c = self.repo.get_customer(e.customer_id)
+        try:
+            orig = self.repo.get_ledger_entry(entry_id)
+        except Exception:
+            orig = None
+        if orig is not None and orig.kind == "payment" and c.phone:
+            # the customer was told 'received, balance now X' when it was recorded: a templated correction follows the reversal
+            why = "cheque returned unpaid" if (orig.method or "") == "cheque" else "payment reversed"
+            self.repo.queue_message("whatsapp", c.phone, f"{self.repo.business_name}: Rs {abs(orig.amount):,.0f} (receipt {orig.entry_id}) -- {why}. "
+                                    f"Balance now Rs {self.repo.outstanding(e.customer_id):,.0f}.", e.entry_id)
+        return asdict(e) | {"customer_name": c.name, "outstanding": self.repo.outstanding(e.customer_id)}
 
     def reverse_expense(self, expense_id: str, reason: str, approved_by: str = "owner") -> dict:
         return asdict(self.repo.reverse_expense(expense_id, reason, "hisaab_munshi", approved_by))

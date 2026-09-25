@@ -265,6 +265,19 @@ def _check_amount(key: str, v: Any, ctx: _Ctx) -> str | None:
     return None
 
 
+def _only_open_order(order_id: str, ctx: _Ctx) -> bool:
+    """The message names one customer confidently, and this order is that customer's ONLY open order -- the same
+    single-candidate rule the offline rules use ('Rana Brothers ka order confirm karo'), so a model may name it too."""
+    res = ctx.customer()
+    if not res.ok or res.other is not None:
+        return False
+    try:
+        open_ = [o.order_id for o in ctx.repo.list_orders(customer_id=res.id, limit=50) if o.status in ("draft", "confirmed", "allocated")]
+    except Exception:
+        return False
+    return open_ == [order_id.strip().upper()]
+
+
 def _check_refs(args: dict, ctx: _Ctx) -> str | None:
     texts = [ctx.text] + ctx.earlier
     for key, (what, example) in _REF_KEYS.items():
@@ -272,6 +285,8 @@ def _check_refs(args: dict, ctx: _Ctx) -> str | None:
             continue
         v = str(args.get(key) or "").strip()
         if key in ("route_id", "vehicle_id") and not v:
+            continue
+        if key == "order_id" and v and not _in(v, texts) and _only_open_order(v, ctx):
             continue
         if not v or not _in(v, texts):
             return RP.t("which_ref", ctx.urdu, what=what, example=example)
@@ -337,7 +352,7 @@ def check_call(name: str, args: dict, text: str, repo, prior: list[BaseMessage] 
                 return q
     if not write:
         return None
-    if name in ("create_order", "record_purchase"):
+    if name in ("create_order", "record_purchase", "update_order"):
         q = _check_items(name, args, ctx)
         if q:
             return q
