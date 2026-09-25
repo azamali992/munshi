@@ -41,7 +41,8 @@ _n = iter(range(10_000))
 def ask(p, spec, tool, args, role="owner", user="Sultan Ahmed", thread=None):
     """Send one chat message that the scripted specialist answers with exactly this gated call."""
     text = f"{WORD[spec]} #{next(_n)}"
-    p.specialists[spec] = BUILD[spec](p.ops, p.repo, ScriptedModel(plan={text: [[(tool, args)]]}, calls_seen=[]))
+    # guarded=False: the card pipeline under test sits behind the real model's entity guard (test_hybrid.py)
+    p.specialists[spec] = BUILD[spec](p.ops, p.repo, ScriptedModel(plan={text: [[(tool, args)]]}, calls_seen=[]), guarded=False)
     return p.handle_message(thread or f"t-{tool}", role, text, user=user)
 
 
