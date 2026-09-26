@@ -83,6 +83,11 @@ def _month_end(period: str) -> str:
     return (nxt - timedelta(days=1)).isoformat()
 
 
+def _add_months(period: str, n: int) -> str:
+    k = int(period[:4]) * 12 + int(period[5:7]) - 1 + n
+    return f"{k // 12:04d}-{k % 12 + 1:02d}"
+
+
 def _months(first: str, last: str) -> list[str]:
     out, y, m = [], int(first[:4]), int(first[5:7])
     while f"{y:04d}-{m:02d}" <= last:
@@ -935,7 +940,7 @@ class FinanceMixin(FinanceReportsMixin):
         return self.journal_entry(je) | {"assets": made_assets, "loans": made_loans}
 
     # ================================================================== periods
-    def period_status(self) -> dict:
+    def period_status(self, redact_payroll: bool = True) -> dict:
         lock = self._books_lock()
         closes = [dict(r) for r in self._all("SELECT close_id, through_date, closed_by, closed_at, note, reopened_by, reopened_at, reopen_reason FROM period_closes ORDER BY close_id DESC")]
         rows = [{"close_id": str(x["close_id"]), "through_date": x["through_date"], "closed_by": x["closed_by"], "status": "reopened" if x["reopened_at"] else "closed",
@@ -943,7 +948,53 @@ class FinanceMixin(FinanceReportsMixin):
         t = table("Closed periods", [col("close_id", "Close"), col("through_date", "Closed through", "date"), col("closed_by", "By"), col("status", "Status", badge=True),
                                      col("note", "Note")], rows,
                   lead=f"Books are closed through {lock}." if lock else "No period is closed yet.")
-        return {"locked_through": lock, "closes": closes, "table": t}
+        prev = _add_months(today_iso()[:7], -1)
+        suggested = _month_end(prev) if not lock or _month_end(prev) > lock else None
+        return {"locked_through": lock, "closes": closes, "table": t, "suggested_through": suggested,
+                "checklist": self.close_checklist(suggested, redact_payroll) if suggested else []}
+
+    def close_checklist(self, through_date: str, redact_payroll: bool = True) -> list[dict]:
+        """What should be true before the books are closed through a date: the books check is clean, payroll is approved
+        for every month with staff, depreciation is posted, every bank and wallet is reconciled to the date, and the
+        cash was counted in the last month. Advice for the owner -- close_period() itself refuses only on alarms."""
+        through = _date(through_date, "through_date")
+        lock = self._books_lock()
+        first = _add_months(lock[:7], 1) if lock else through[:7]
+        months = _months(max(first, _add_months(through[:7], -11)), through[:7])     # at most a year of months back
+        out = []
+        alarms = self.verify_books(through)["alarms"]
+        if redact_payroll:                                                   # salary totals are the owner's alone
+            alarms = [a | {"message": "payroll rows differ from the payroll postings (owner only)"} if a["code"] == "payroll_expense" else a for a in alarms]
+        out.append({"key": "books", "ok": not alarms, "label": "Books check is clean",
+                    "detail": "; ".join(a["message"] for a in alarms)[:400] if alarms else "Trial balance, clearing accounts and khatas agree."})
+        if self.payroll_ready():
+            missing = []
+            for p in months:
+                start, end = p + "-01", _month_end(p)
+                staff = self._one("SELECT COUNT(*) n FROM employees WHERE joined_on <= ? AND (left_on IS NULL OR left_on >= ?)", (end, start))["n"]
+                if staff and not self._pr_standing_run(p): missing.append(p)
+            out.append({"key": "payroll", "ok": not missing, "label": "Payroll approved for each month",
+                        "detail": ("Not approved: " + ", ".join(missing)) if missing else "Every month with staff has an approved payroll."})
+        due = []
+        for a in [dict(r) for r in self._all("SELECT * FROM fixed_assets")]:
+            if self._disposal(a["asset_id"]) or self._asset_code_net(a["asset_id"], A.FIXED_ASSETS_COST) <= 0: continue
+            done = self._depreciated_periods(a["asset_id"])
+            if any(p <= through[:7] and p not in done for p in self._asset_schedule(a)): due.append(a["name"])
+        if self._one("SELECT 1 FROM fixed_assets LIMIT 1"):
+            out.append({"key": "depreciation", "ok": not due, "label": "Depreciation posted",
+                        "detail": ("Not yet posted for: " + ", ".join(due))[:400] if due else "Every asset is depreciated through the month."})
+        stale = []
+        for aid, a in self._account_names().items():
+            if a["kind"] == "cash" or not a["active"]: continue
+            last = self._one("SELECT MAX(statement_date) d FROM reconciliations WHERE account_id=?", (aid,))["d"]
+            if not last or last < through: stale.append(a["name"])
+        if any(a["kind"] != "cash" and a["active"] for a in self._account_names().values()):
+            out.append({"key": "reconciled", "ok": not stale, "label": "Banks and wallets reconciled",
+                        "detail": ("Not reconciled to " + through + ": " + ", ".join(stale))[:400] if stale else "Every bank and wallet matches its statement."})
+        counted = self._one("SELECT MAX(counted_on) d FROM cash_counts WHERE counted_on BETWEEN ? AND ?", (through[:7] + "-01", through))["d"]
+        out.append({"key": "cash_count", "ok": bool(counted), "label": "Cash counted",
+                    "detail": f"Last count {counted}." if counted else f"No cash count in {through[:7]}: count the galla before closing."})
+        return out
 
     def _tb_snapshot(self, through: str) -> dict:
         bal = self._balances(through)
@@ -975,7 +1026,7 @@ class FinanceMixin(FinanceReportsMixin):
             close_id = c.lastrowid
             self.audit(actor, A.AUDIT_ACTION["close_period"], "period_close", str(close_id),
                        {"through": through, "sha256": snap["sha256"], "forced_alarms": [a["code"] for a in check["alarms"]] if force else []}, approved_by)
-        return self.period_status() | {"close_id": close_id, "sha256": snap["sha256"]}
+        return self.period_status(redact_payroll=False) | {"close_id": close_id, "sha256": snap["sha256"]}
 
     def reopen_period(self, close_id: int, reason: str, actor: str, approved_by: str | None) -> dict:
         reason, approved_by = _reason(reason), _approver(approved_by, "reopening the books")
@@ -986,4 +1037,4 @@ class FinanceMixin(FinanceReportsMixin):
             c.execute("UPDATE period_closes SET reopened_by=?, reopened_at=?, reopen_reason=? WHERE close_id=?",
                       (actor or self._current_user() or "owner", now_iso(), reason, int(close_id)))
             self.audit(actor, A.AUDIT_ACTION["reopen_period"], "period_close", str(close_id), {"through": r["through_date"], "reason": reason}, approved_by)
-        return self.period_status()
+        return self.period_status(redact_payroll=False)
