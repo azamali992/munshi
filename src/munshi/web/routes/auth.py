@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ipaddress
+import logging
 import os
 from functools import lru_cache
 
@@ -14,6 +15,7 @@ from munshi.tenancy.hub import DEMO_BUSINESS_ID, DEMO_USERS
 from munshi.web.deps import Ctx, context, current, hub_of, require, token_of
 
 router = APIRouter(prefix="/api", tags=["auth"])
+log = logging.getLogger("munshi.web.auth")
 
 
 class SignupIn(BaseModel):
@@ -103,6 +105,7 @@ def _me(request: Request, p: Principal) -> dict:
     setup = {"godowns": len(repo.list_warehouses()), "products": len(repo.list_products()), "customers": len(repo.list_customers()),
              "vehicles": len(repo.list_vehicles()), "routes": len(repo.list_routes()), "staff": len(hub.registry.list_users(p.business_id, include_inactive=False))}
     return {"user_id": p.user_id, "name": p.name, "phone": p.phone, "role": p.role, "role_title": ROLE_TITLES[p.role],
+            "must_change_pin": p.must_change_pin,
             "business": {"id": biz["business_id"], "name": s["business_name"], "city": s["city"], "plan": biz["plan"], "demo": biz["business_id"] == DEMO_BUSINESS_ID},
             "permissions": sorted(k for k, roles in PERMISSIONS.items() if p.role in roles),
             "llm": os.environ.get("LLM_PROVIDER", "stub"), "voice": bool(os.environ.get("GROQ_API_KEY")),
@@ -181,8 +184,10 @@ def change_pin(body: PinChangeIn, request: Request, p: Principal = Depends(curre
         raise HTTPException(423, str(e))
     if not ok:
         raise HTTPException(401, "current PIN is wrong")
+    if body.new_pin.strip() == body.old_pin.strip():
+        raise HTTPException(400, "choose a PIN different from the one you were given")
     try:
-        reg.set_pin(p.user_id, body.new_pin)        # revokes every session, including this one
+        reg.set_pin(p.user_id, body.new_pin, must_change=False)   # revokes every session, including this one; clears must_change_pin
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"ok": True, "signed_out": True}
@@ -194,6 +199,21 @@ def my_sessions(request: Request, p: Principal = Depends(current)):
 
 
 # ---------------------------------------------------------------- staff (owner)
+# The legacy /api/staff routes keep working unchanged for the phone app, as thin wrappers over the one employee master
+# (plan §4.3): when payroll is enabled on the business, a new login also gets an employee row, and deactivation / role
+# changes / PIN resets are written to that employee's life history. Best effort: the registry write is the action;
+# a failure to mirror it never undoes it (the Employees screen re-syncs on open).
+_ROLE_HINT = {"owner": "other", "clerk": "clerk", "salesman": "salesman", "driver": "driver"}
+
+
+def _mirror(c: Ctx, what: str, fn) -> None:
+    try:
+        if c.repo.payroll_ready():
+            fn()
+    except Exception:       # noqa: BLE001 -- see above; logged without any request body (a PIN may be in it)
+        log.warning("staff route: could not mirror %s onto the employee master", what)
+
+
 @router.get("/staff")
 def staff(request: Request, p: Principal = Depends(require("staff:manage"))):
     return [u | {"role_title": ROLE_TITLES[u["role"]]} for u in hub_of(request).registry.list_users(p.business_id)]
@@ -206,6 +226,12 @@ def add_staff(body: StaffIn, request: Request, c: Ctx = Depends(context("staff:m
     except ValueError as e:
         raise HTTPException(400, str(e))
     c.repo.audit(c.role, "staff_added", "user", u["user_id"], {"name": u["name"], "role": u["role"]}, approved_by=c.signature)
+
+    def employee():
+        e = c.repo.add_employee({"name": u["name"], "phone": u["phone"], "role_hint": _ROLE_HINT[u["role"]], "designation": ROLE_TITLES[u["role"]]},
+                                c.role, c.signature)
+        c.repo.link_login(e["employee_id"], u["user_id"], u["role"], c.role, generated=False)
+    _mirror(c, "a new login", employee)
     return u
 
 
@@ -225,6 +251,10 @@ def edit_staff(user_id: str, body: StaffPatch, request: Request, c: Ctx = Depend
     except ValueError as e:
         raise HTTPException(400, str(e))
     c.repo.audit(c.role, "staff_updated", "user", user_id, body.model_dump(exclude_none=True), approved_by=c.signature)
+    if body.role:
+        _mirror(c, "a role change", lambda: c.repo.login_event(user_id, "role_changed", c.role, {"role": body.role}))
+    if body.active is not None:
+        _mirror(c, "a login switch", lambda: c.repo.login_event(user_id, "login_enabled" if body.active else "login_disabled", c.role, {}))
     return u
 
 
@@ -238,6 +268,7 @@ def reset_staff_pin(user_id: str, body: StaffPin, request: Request, c: Ctx = Dep
     except ValueError as e:
         raise HTTPException(400, str(e))
     c.repo.audit(c.role, "staff_pin_reset", "user", user_id, {}, approved_by=c.signature)
+    _mirror(c, "a PIN reset", lambda: c.repo.login_event(user_id, "pin_reset", c.role, {"generated": False}))
     return {"ok": True}
 
 
