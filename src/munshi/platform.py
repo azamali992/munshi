@@ -43,6 +43,16 @@ model is called. If the model call fails (timeout, rate limit, provider error) t
 rules engine's own reply is used. With no real model, only the rules engine exists
 and nothing here changes.
 
+The model is GROUNDED (llm/grounding.py, _ground): it chooses what to do -- which read, which gated action with which
+arguments (checked by the guard) -- but it is never the source of a fact or of a claim about an action. A model turn that
+ran tools is answered with code's rendering of the results (llm/answers.py); a card it raised is shown by its own code-built
+text; after approval, what the card did is said from the tool's result (_approved_text); with no tool call only a clean
+clarifying question (no digits, no claims, no ID request) is shown, else the rules' "didn't understand". The model's own
+words are kept in the chat meta ("model_text"), never shown otherwise.
+
+A request the asker's role can't make (a clerk's write-off, a salesman's payment) is passed to the role that can
+(_handoff: a notification with the request's words) and the asker is told so -- tiers and four-eyes are unchanged.
+
 The engines never share a paused graph. Model-engine checkpoints live under
 "{thread}:{role}:{specialist}:llm" (rules: "{thread}:{role}:{specialist}"; a rules key
 always ends in a specialist name, so the two can't collide), and a card raised by the
@@ -80,12 +90,13 @@ from munshi.domain.repository import MunshiRepository
 from munshi.domain.seed import seeded_repository
 from munshi.llm import answers
 from munshi.llm import followup as FU
+from munshi.llm import grounding as GR
 from munshi.llm import memory as MEM
 from munshi.llm import replies as RP
 from munshi.llm import turns as TURNS
 from munshi.llm.answers import lang_of
 from munshi.llm.parse import analyse_order, catalogue, customer_resolution, otp_in, prepare, supplier_resolution
-from munshi.llm.stub_model import ask_of, not_understood
+from munshi.llm.stub_model import ask_of, not_understood, unbound_of
 from munshi.llm.text import fold, is_urdu
 from munshi.observability.tracing import TurnTrace, configure_tracking, trace_turn
 from munshi.safety.middleware import DEFERRED_KEY
@@ -127,7 +138,12 @@ class _ModelCalls(BaseCallbackHandler):
     def on_llm_end(self, response, **kwargs) -> None:
         try:
             usage = (response.llm_output or {}).get("token_usage") or {}
-            self.tokens += int(usage.get("total_tokens") or 0)
+            n = int(usage.get("total_tokens") or 0)
+            if not n:       # Gemini (langchain-google-genai) reports usage on the message, not in llm_output
+                for gens in response.generations or []:
+                    for g in gens:
+                        n += int((getattr(getattr(g, "message", None), "usage_metadata", None) or {}).get("total_tokens") or 0)
+            self.tokens += n
         except Exception:
             pass
 
@@ -190,6 +206,7 @@ class Reply:
     model_error: str | None = None              # the model failed and the rules' reply was used instead
     ask: dict | None = None                     # the one missing piece this reply asks for ({"slot", "candidates"}), if any
     tool: str | None = None                     # the (last) tool the specialist called this turn, if any
+    call: dict | None = None                    # that call ({"name", "args"}) -- also when it ran on a graph lane
     listed: list | None = None                  # the order ids a list reply showed (what 'sab confirm kar do' then means)
     extra: dict = field(default_factory=dict)   # chat-log meta the turn adds: the graph lane of each card, a chain of cards to come
 
@@ -1172,8 +1189,11 @@ class MunshiPlatform:
         ans = self._answered or {}
         if answered and ans.get("slot") == "split":
             return self._split_cards(thread_id, role, user, [str(c["id"]) for c in ans.get("candidates") or []], tr)
+        if answered and ans.get("slot") == "intents":
+            return self._intent_cards(thread_id, role, user, [(str(c["name"]), str(c["id"])) for c in ans.get("candidates") or []], tr, [])
         if not answered:
-            for step in (self._pending_question, self._correct, self._driver_step, self._batch, self._split_orders, self._split_reads):
+            for step in (self._withdraw_request, self._pending_question, self._correct, self._driver_step, self._batch, self._split_orders,
+                         self._split_intents, self._split_reads):
                 try:
                     out = step(thread_id, role, text, run, user, tr)
                 except Exception:
@@ -1190,7 +1210,47 @@ class MunshiPlatform:
             reply.extra = dict(reply.extra or {}) | {"chain": {"after": pa.approval_id, "rest": [f"send reminder {pa.args.get('customer_id')}"], "total": 0,
                                                               "done": 0, "specialist": "wasooli", "role": role, "user": user, "on": "approve"}}
             reply.text += " Once it is approved, the card to send it comes next."
+        if pa is not None and pa.tool == "reverse_ledger_entry":
+            self._chain_right_amount(reply, run, role, user)
+        if pa is not None and pa.tool == "draft_reminder":
+            self._chain_other_customers(reply, run, role, user)
         return reply, meta, ok
+
+    def _chain_other_customers(self, reply: Reply, run: str, role: str, user: str) -> None:
+        """'haji sons aur bhatti dono ko reminder bhej de': Haji Sons' card now; Bhatti's (draft, and send when asked) chained after
+        it -- one card per customer, the second never dropped silently."""
+        pa = reply.pending
+        ids = [c for c in TURNS.split_customers_named(run, self.repo) if c != str(pa.args.get("customer_id") or "")]
+        if not ids or len(TURNS.split_customers_named(run, self.repo)) < 2:
+            return
+        send = bool(re.search(r"\b(bhej|bhejo|bhejdo|send|bhijwa\w*)\b", fold(run))) and not re.search(r"\b(draft|bana|banao|tayyar|tayar|likh\w*)\b", fold(run))
+        ch = dict((reply.extra or {}).get("chain") or {})
+        rest = list(ch.get("rest") or [])
+        for cid in ids[:3]:
+            rest += [f"{cid} ko reminder"] + ([f"send reminder {cid}"] if send else [])
+        # (with a 'send' step in it the chain goes on only after approvals: a send after a rejected draft would find nothing to send)
+        reply.extra = dict(reply.extra or {}) | {"chain": {"after": pa.approval_id, "rest": rest, "total": 0, "done": 0, "specialist": "wasooli",
+                                                            "role": role, "user": user, "on": "approve" if send else "any"}}
+        names = ", ".join(self._entity_name("customer", c) or c for c in ids[:3])
+        reply.text += f" {names}'s reminder card comes after this one, one card per customer."
+
+    def _chain_right_amount(self, reply: Reply, run: str, role: str, user: str) -> None:
+        """'20000 wali galat thi, asal mei 12000 thi': the wrong receipt is reversed on this card, and -- once that is approved --
+        the card to record the right amount comes next (two decisions, one request). Only when the message says both."""
+        _, right = TURNS.wrong_right(run)
+        pa = reply.pending
+        if not right or pa is None:
+            return
+        try:
+            e = self.repo.get_ledger_entry(str(pa.args.get("entry_id") or ""))
+        except Exception:
+            return
+        if e.kind != "payment" or abs(-e.amount - right) < 0.01:
+            return
+        step = TURNS.payment_text(e.customer_id, right, e.method or "cash")
+        reply.extra = dict(reply.extra or {}) | {"chain": {"after": pa.approval_id, "rest": [step], "total": 0, "done": 0, "specialist": "hisaab",
+                                                            "role": role, "user": user, "on": "approve"}}
+        reply.text += f" Once it is approved, the card to record the right amount ({_en({'rs': right})}) comes next."
 
     # -- the approvals queue ('koi approval pending he?')
     def _pending_question(self, thread_id, role, text, run, user, tr):
@@ -1211,13 +1271,56 @@ class MunshiPlatform:
         tr.specialist, tr.response_text = "report", txt
         return Reply(txt, "report", None, thread_id), {"specialist": "report", "approvals_listed": [p.approval_id for p in can + own]}, True
 
+    # -- which of this person's waiting cards a message is about ('malik agro wale card pe galti', 'malik wala card wapis le lo')
+    def _my_cards(self, thread_id: str, role: str, user: str) -> list[PendingApproval]:
+        me = lambda p: p.requested_by_role == role and (not p.requested_by.strip() or not user.strip() or same_person(p.requested_by, user))  # noqa: E731
+        return [p for p in self.pending_items(thread_id) if me(p)]
+
+    def _card_party(self, pa: PendingApproval) -> str:
+        """The customer / supplier a card is for (read from its arguments, or its order's customer)."""
+        a = pa.args or {}
+        if a.get("customer_id") or a.get("supplier_id"):
+            return str(a.get("customer_id") or a.get("supplier_id"))
+        try:
+            return self.repo.get_order(str(a.get("order_id") or "")).customer_id
+        except Exception:
+            return ""
+
+    def _cards_meant(self, cards: list[PendingApproval], text: str) -> list[PendingApproval]:
+        """The cards a message points at, latest first: the ones for the customer / supplier it names; with nobody named,
+        all of them (the caller tries the latest first)."""
+        cands = list(reversed(cards))
+        who = [r.id for r in (customer_resolution(text, self.repo), supplier_resolution(text, self.repo)) if r.ok and r.other is None]
+        if who:
+            return [p for p in cands if self._card_party(p) in who]
+        return cands
+
+    _WITHDRAW = re.compile(r"\b(wapis|wapas)\s+(le lo|lo|le lein|le len|kar lo|karo|kar do|lelo)\b|\bwithdraw\w*\b|\b(card|request|darkhwast)\b.{0,25}"
+                           r"\b(hata|hatao|hata do|wapis|wapas|cancel|radd|khatam)\b|\bapprove (na|mat) (karna|karo|karein|kar)\b|\brehne do\b")
+
+    def _withdraw_request(self, thread_id, role, text, run, user, tr):
+        """'malik agro wala card wapis le lo' / 'wapis lo ye, abhi approve na karna': the requester takes their own waiting card
+        back (recorded as withdrawn -- never a decision on anyone else's). The card the message names, else the latest."""
+        f = fold(text)
+        if not self._WITHDRAW.search(f) or TURNS.rev_intent(text):
+            return None
+        cards = self._cards_meant(self._my_cards(thread_id, role, user), text)
+        if not cards:
+            return None
+        pa = cards[0]
+        head = self._headline(self.card(pa))
+        self._withdraw(pa, role, user, f"withdrawn by the requester ('{text[:60]}')")
+        txt = f"Withdrawn: {head}. Nothing was done, and nobody needs to approve it now -- send it again when it's right."
+        tr.specialist, tr.response_text = pa.specialist, txt
+        return Reply(txt, pa.specialist, None, thread_id), {"specialist": pa.specialist, "withdrew": pa.approval_id}, True
+
     # -- corrections ('galti ho gayi 40 kar do', 'nahi 25', '15000 nahi 12000 the')
     def _correct(self, thread_id, role, text, run, user, tr):
-        me = lambda p: p.requested_by_role == role and (not p.requested_by.strip() or not user.strip() or same_person(p.requested_by, user))  # noqa: E731
-        mine = [p for p in self.pending_items(thread_id) if me(p)]
+        mine = self._my_cards(thread_id, role, user)
         if mine:
-            pa = mine[-1]
-            new = TURNS.correction(text, pa.tool, pa.args, self.repo)
+            # the card the message is about: the one for the customer it names, else the latest one it fits
+            pa, new = next(((p, n) for p in self._cards_meant(mine, text) if (n := TURNS.correction(text, p.tool, p.args, self.repo)) is not None),
+                           (None, None))
             if new is None:
                 return None
             req = self._corrected_request(pa.tool, new)
@@ -1254,14 +1357,24 @@ class MunshiPlatform:
             reply, meta, ok = self._turn(RULES, thread_id, role, TURNS.update_text(o.order_id, changed), user, tr, force="order")
             return reply, meta | {"corrects": last["approval_id"]}, ok
         if last["tool"] == "record_payment":
+            # a recorded payment is never edited: its receipt is reversed (the owner's card -- a clerk's request is passed on)
+            # and the right amount recorded after it (chained onto the reversal once that is approved)
             a = last["args"]
             cname = self._entity_name("customer", a.get("customer_id", "")) or a.get("customer_id", "")
-            entry = next((e.entry_id for e in reversed(self.repo.ledger_for(a.get("customer_id", ""))) if e.kind == "payment" and abs(-e.amount - float(a.get("amount") or 0)) < .01), "")
+            entry = next((e.entry_id for e in reversed(self.repo.ledger_for(a.get("customer_id", ""))) if e.kind == "payment" and not e.reversal_of
+                          and not self.repo.reversal_of_ledger(e.entry_id) and abs(-e.amount - float(a.get("amount") or 0)) < .01), "")
             amt = lambda v: _en({"rs": float(v)})  # noqa: E731
-            txt = (f"{amt(a.get('amount'))} from {cname} is already recorded" + (f" (receipt {entry})" if entry else "") + ". A recorded payment is never edited: "
-                   f"the owner reverses it -- '{entry or 'RCP-...'} reverse karo, galat raqam' -- and then send the right one, e.g. "
-                   f"'{cname} ne {new['amount']:,.0f} {a.get('method') or 'cash'} diye'. Nothing was changed yet.")
-            return Reply(txt, "hisaab", None, thread_id), {"specialist": "hisaab"}, True
+            if not entry:
+                return None
+            req = f"{entry} reverse karo -- galat raqam {float(a.get('amount') or 0):g}, sahi {float(new['amount']):g} thi"
+            reply, meta, ok = self._turn(RULES, thread_id, role, req, user, tr, force="hisaab")
+            lead = f"{amt(a.get('amount'))} from {cname} is already recorded, and a recorded payment is never edited: its receipt is reversed instead. "
+            if reply.pending:
+                self._chain_right_amount(reply, req, role, user)
+            else:
+                reply.text += f" Once the owner has reversed it, send the right amount, e.g. '{cname} ne {new['amount']:,.0f} {a.get('method') or 'cash'} diye'."
+            reply.text = lead + reply.text
+            return reply, meta | {"corrects": last["approval_id"]}, ok
         return None
 
     @staticmethod
@@ -1333,14 +1446,15 @@ class MunshiPlatform:
         Delivery munshi's, whichever words it used -- the driver has no other munshi for it."""
         from munshi.agents.specialists import todays_stop
         f = fold(text)
-        door = re.search(r"\b(address|pata|kahan|location|otp|code|agla|next|stop|paise lene|lene hein|lene hain|kitne lene|kitna lena|collect|raqam|bill kitna|"
-                         r"de diya|de dia|diya|utar|utara|delivered|deliver|pohncha|maal de)\b", f)
+        door = re.search(r"\b(address|pata|kahan|kidhar|location|otp|code|agla|next|stop|paise lene|lene hein|lene hain|kitne lene|kitna lena|collect|raqam|"
+                         r"bill kitna|de diya|de dia|diya|de di|utar|utara|utaar|delivered|deliver|pohncha|maal de|number|phone|contact|li|liya|cash|jana)\b", f)
         if not door:
             return None
         c = customer_resolution(text, self.repo)
         if c.ok and c.other is None and todays_stop(self.repo, c.id or "") is not None:
             return "delivery"
-        if re.search(r"\b(address|otp|code|agla|next|stop)\b", f):
+        if re.search(r"\b(address|otp|code|agla|next|stop|kidhar|kahan jana|jana h[ae]i?n?)\b", f) or (
+                re.search(r"\b(cash|paise|raqam)\b", f) and re.search(r"\b(total|kul|mere paas|mere pas|jama)\b", f)):
             return "delivery"
         return None
 
@@ -1448,7 +1562,84 @@ class MunshiPlatform:
         first.extra = {"cards": cards}
         return first, meta, True
 
+    _SPEC_OF = {"payment": "hisaab", "order": "order", "khata": "order"}
+
+    def _split_intents(self, thread_id, role, text, run, user, tr):
+        """Two different requests for one customer in one message ('chaudhry farms ne 20000 diye aur 10 urea bhi chahiye unko'):
+        a question in it is answered now, the first write gets its card now, and the next write's card is chained -- raised
+        once the first is decided. Nothing in the message is dropped silently."""
+        if role == "driver":
+            return None
+        parts = TURNS.split_intents(run, self.repo)
+        if not parts:
+            return None
+        reads = [(k, p) for k, p in parts if k == "khata"]
+        writes = [(k, p) for k, p in parts if k != "khata"]
+        if not writes:
+            return None
+        if len(writes) > 1:
+            # two things that change the books in one message: read back, asked once ('haan' -> one card each, chained)
+            name = self._entity_name("customer", customer_resolution(writes[0][1], self.repo).id or "")
+            what = "; ".join(f"{k}) {self._write_label(kind, p)}" for k, (kind, p) in enumerate(writes, 1))
+            txt = (f"That's {len(writes)} things for {name} in one message -- {what}. Shall I ask for approval of each, one card at a time? "
+                   "Say 'haan' (or send them one by one).")
+            reply = Reply(txt, self._SPEC_OF[writes[0][0]], None, thread_id)
+            reply.ask = {"slot": "intents", "candidates": [{"id": p, "name": k} for k, p in writes], "specialist": self._SPEC_OF[writes[0][0]]}
+            tr.specialist, tr.response_text = reply.specialist, txt
+            return reply, {"specialist": reply.specialist}, True
+        return self._intent_cards(thread_id, role, user, writes, tr, [visible(self._turn(RULES, thread_id, role, p, user, tr, force=self._SPEC_OF[k])[0].text)
+                                                                       for k, p in reads], parts)
+
+    def _intent_cards(self, thread_id: str, role: str, user: str, writes: list, tr, answers_: list[str], parts: list | None = None):
+        """The first write's card now; the others chained after it (raised once it is decided); any read answered first."""
+        k0, p0 = writes[0]
+        reply, meta, ok = self._turn(RULES, thread_id, role, p0, user, tr, force=self._SPEC_OF[k0])
+        rest = writes[1:]
+        if reply.pending and rest:
+            steps = [self._write_step(k, p) for k, p in rest]
+            reply.extra = dict(reply.extra or {}) | {"chain": {"after": reply.pending.approval_id, "rest": steps, "total": 0, "done": 0,
+                                                                "specialist": self._SPEC_OF[rest[0][0]], "role": role, "user": user, "on": "any"}}
+            what = "; ".join(self._write_label(k, p) for k, p in rest)
+            reply.text += f" Your message also asked for {what}: its card comes next, once this one is decided."
+        elif rest:
+            reply.text += " (The rest of your message -- " + "; ".join(self._write_label(k, p) for k, p in rest) + " -- send again once this is sorted.)"
+        if answers_:
+            reply.text = "\n".join(answers_) + "\n\n" + reply.text
+        return reply, meta | {"split_intents": [k for k, _ in (parts or writes)]}, ok
+
+    def _write_step(self, kind: str, part: str) -> str:
+        if kind == "order":
+            op = analyse_order(part, self.repo)
+            return TURNS.order_text(op.customer.id or "", op.items)
+        return part
+
+    def _write_label(self, kind: str, part: str) -> str:
+        if kind == "order":
+            op = analyse_order(part, self.repo)
+            return "the order (" + ", ".join(f"{i['qty']} {self._entity_name('product', i['sku']) or i['sku']}" for i in op.items) + ")"
+        from munshi.llm.parse import amount_in
+        a = amount_in(part).amount
+        return f"the payment ({_en({'rs': a})})" if a else "the payment"
+
+    def _two_customer_reads(self, thread_id, role, text, run, user, tr):
+        """'malik agro aur green valley dono ka khata batao' / 'outstanding for Rana and Punjab Seed side by side': each customer's
+        khata, one after the other -- never the order-split refusal, never one of them dropped."""
+        if role == "driver" or not TURNS._KHATA_Q(text) or self._WRITE_CUE.search(text) or re.search(r"\d", text):
+            return None
+        ids = TURNS.split_customers_named(text, self.repo)
+        if len(ids) < 2:
+            return None
+        outs = [self._turn(RULES, thread_id, role, f"{cid} ka khata", user, tr, force="order") for cid in ids[:4]]
+        if any(r.pending or r.tool != "get_customer_khata" for r, _, _ in outs):
+            return None
+        first, meta, _ = outs[0]
+        first.text = "\n".join(visible(r.text) for r, _, _ in outs)
+        return first, meta, True
+
     def _split_reads(self, thread_id, role, text, run, user, tr):
+        both = self._two_customer_reads(thread_id, role, text, run, user, tr)
+        if both is not None:
+            return both
         parts = TURNS.split_reads(run)
         if not parts or not all(self._read_only_question(p) for p in parts):
             return None
@@ -1539,6 +1730,11 @@ class MunshiPlatform:
         cfg = {"configurable": {"thread_id": lane[1]}} if lane else self._cfg(thread_id, role, specialist, engine)
         self._clear_orphaned_interrupt(bundle, cfg)
         result = bundle.agent.invoke({"messages": [*(context or []), HumanMessage(text)], "role": role}, config=cfg | (config or {}))
+        ub = unbound_of((result.get("messages") or [None])[-1]) if engine == RULES and not result.get("__interrupt__") else None
+        if ub and ub.get("tool") and role in ("clerk", "salesman") and self._is_write(ub["tool"]):
+            txt = self._handoff(role, user, text, ub["tool"], ub.get("extra") or "")
+            tr.response_text = txt
+            return Reply(txt, specialist, None, thread_id, engine=engine), {"specialist": specialist, "handoff": ub["tool"]}, True
         if lane:
             kept = self._lane_result(bundle, cfg, specialist, thread_id, role, user, text, result, held, tr)
             if kept is not None:
@@ -1547,11 +1743,11 @@ class MunshiPlatform:
             return Reply(self._final_text(result), specialist, None, thread_id, engine=engine), {"specialist": specialist}, False
         msgs = result.get("messages") or []
         h = max((i for i, m in enumerate(msgs) if isinstance(m, HumanMessage)), default=-1)
-        called = [tc["name"] for m in msgs[h + 1:] if isinstance(m, AIMessage) for tc in (m.tool_calls or [])]
+        calls = [{"name": tc["name"], "args": tc.get("args") or {}} for m in msgs[h + 1:] if isinstance(m, AIMessage) for tc in (m.tool_calls or [])]
         ask = ask_of(msgs[-1]) if msgs and not result.get("__interrupt__") else None
         reply = self._settle(bundle, specialist, thread_id, role, user, result, tr, engine=engine, config=config, cfg=cfg if lane else None,
                              aid=lane[0] if lane else None)
-        reply.engine, reply.tool = engine, (called[-1] if called else None)
+        reply.engine, reply.tool, reply.call = engine, (calls[-1]["name"] if calls else None), (calls[-1] if calls else None)
         reply.ask = ask if reply.pending is None else None
         if reply.pending is None:
             self._tool_followups(reply, msgs[h + 1:], text)
@@ -1559,6 +1755,35 @@ class MunshiPlatform:
         if lane and reply.pending:
             meta["lane"] = lane[1]
         return reply, meta, True
+
+    # ------------------------------------------------------------------ a request this role can't make: passed on, never a dead end
+    _WHAT = {"credit_note": "issue a credit note", "reverse_ledger_entry": "reverse a khata entry (a payment, a bounced cheque)",
+             "reverse_expense": "reverse an expense", "reverse_purchase": "undo a purchase", "reverse_supplier_entry": "reverse a supplier entry",
+             "adjust_stock": "adjust or write off stock", "pay_supplier": "pay a supplier", "confirm_order": "confirm an order",
+             "cancel_order": "cancel an order", "record_payment": "record a payment", "record_expense": "record an expense",
+             "record_deposit": "record a driver's cash hand-in", "allocate_order": "reserve stock for an order", "draft_reminder": "draft a payment reminder",
+             "send_reminder": "send a payment reminder", "record_purchase": "receive stock from a supplier", "transfer_stock": "move stock between godowns"}
+
+    def _handoff(self, role: str, user: str, text: str, tool: str, extra: str = "") -> str:
+        """A clerk asks for a write-off, a salesman for a payment: the tool is another role's (tiers are unchanged -- this
+        role still can't raise or approve it), so the request goes to that role as a notification, with the words it was
+        asked in, and the requester is told plainly who does it and that nothing is recorded yet."""
+        who = approver_for(tool)
+        what = self._WHAT.get(tool, tool.replace("_", " "))
+        quote = GR.strip_ids(text, self.repo)[:140]
+        office = "the owner" if who == "owner" else "the office (a clerk or the owner)"
+        try:
+            self.repo.notify(who if who in ("owner", "clerk") else "owner", "request",
+                             f"{user or role.capitalize()} ({role}) asks: \"{quote}\" -- only {office} can {what}. Raise it in chat to make the card.")
+        except Exception:
+            log.exception("couldn't pass on a %s request", tool)
+        if lang_of(text) == "ru" and who == "owner":
+            txt = (f"Ye kaam sirf owner kar sakta hai ({what}), is liye aap ki taraf se card nahi bana. Aap ki baat owner ko bhej di hai: \"{quote}\". "
+                   "Jab tak owner khud card bana kar approve na kare, kuch darj nahi hoga.")
+        else:
+            txt = (f"Only {office} can {what}, so no card was raised for you. I've passed your request to {'the owner' if who == 'owner' else 'the office'}: "
+                   f"\"{quote}\". Nothing is recorded until {'the owner' if who == 'owner' else 'they'} raise{'s' if who == 'owner' else ''} it and approve{'s' if who == 'owner' else ''} it.")
+        return txt + (f" {extra}" if extra else "")
 
     # ------------------------------------------------------------------ graph lanes: more than one card per specialist per thread
     def _new_lane(self, thread_id: str, role: str, specialist: str) -> tuple[str, str]:
@@ -1581,7 +1806,9 @@ class MunshiPlatform:
         interrupts = result.get("__interrupt__")
         msgs = result.get("messages") or []
         h = max((i for i, m in enumerate(msgs) if isinstance(m, HumanMessage)), default=-1)
-        pa = self._pa(held[0])
+        # the waiting card the message is about (the one for the customer it names), not always the oldest
+        named_now = customer_resolution(text, self.repo).ok or supplier_resolution(text, self.repo).ok
+        pa = (next(iter(self._cards_meant([self._pa(x) for x in held], text)), None) if named_now else None) or self._pa(held[0])
         if interrupts:
             reqs = interrupts[0].value.get("action_requests", [])
             dup = self._same_request(reqs[0]["name"], reqs[0]["args"], held) if len(reqs) == 1 else None
@@ -1694,15 +1921,6 @@ class MunshiPlatform:
         except Exception:
             return False
 
-    def _acted(self, bundle, cfg: dict) -> bool:
-        """Did this model turn run a write (OTP-gated close_stop) -- i.e. a non-read tool result after the message?"""
-        try:
-            msgs = bundle.agent.get_state(cfg).values.get("messages", [])
-        except Exception:
-            return True
-        h = max((i for i, m in enumerate(msgs) if isinstance(m, HumanMessage)), default=-1)
-        return any(isinstance(m, ToolMessage) and m.name and self._is_write(m.name) and m.status != "error" for m in msgs[h + 1:])
-
     @staticmethod
     def _is_write(tool: str) -> bool:
         try:
@@ -1725,24 +1943,8 @@ class MunshiPlatform:
             reply, meta, _ = self._turn(MODEL, thread_id, role, text, user, tr, config={"callbacks": [calls]}, context=self._context(thread_id, text))
             if reply.specialist is None:                   # the model routed nowhere either: the rules' answer stands
                 reply, meta = fallback, dict(fallback_meta)
-            elif (reply.pending is None and reply.waiting is None and not self._guard_refused(reply, thread_id, role) and self._claims_done(reply.text)
-                  and not self._acted(self._bundle(MODEL, reply.specialist), self._cfg(thread_id, role, reply.specialist, MODEL))):
-                # it says it did something it didn't: never let that stand -- nothing was recorded, and the rules' reply says what to send
-                log.warning("model claimed an action it didn't take on %s: %r", thread_id, reply.text[:160])
-                claim = reply.text
-                reply = Reply(f"{NOTHING_DONE_UR if is_urdu(text) else NOTHING_DONE} {fallback.text}", reply.specialist, None, thread_id, engine=MODEL)
-                meta = {"specialist": reply.specialist, "claim_blocked": claim[:200]}
-            elif reply.pending is None and reply.waiting is None and self._raw(reply.text):
-                # the model returned nothing, or the tool's raw data: say it in a sentence instead
-                nice = self._last_tool_sentence(self._bundle(MODEL, reply.specialist), self._cfg(thread_id, role, reply.specialist, MODEL))
-                if nice:
-                    meta = meta | {"model_text_replaced": reply.text[:200]}
-                    reply.text = nice
-            elif reply.pending is None and not is_urdu(text):
-                trimmed = self._latin_only(reply.text)
-                if trimmed != reply.text:
-                    meta = meta | {"script_trimmed": reply.text[:200]}
-                    reply.text = trimmed
+            elif reply.pending is None and reply.waiting is None and not self._guard_refused(reply, thread_id, role):
+                reply, meta = self._ground(reply, meta, thread_id, role, text, fallback)
         except Exception as e:
             log.warning("model turn failed on %s (%s: %s); answering from the rules", thread_id, type(e).__name__, str(e)[:200])
             self._heal_model_threads(thread_id, role)
@@ -1758,6 +1960,64 @@ class MunshiPlatform:
         reply.model_calls, reply.model_tokens = calls.n, calls.tokens
         return reply, meta | {"engine": reply.engine, "model_calls": calls.n, "model_tokens": calls.tokens}
 
+    def _ground(self, reply: Reply, meta: dict, thread_id: str, role: str, text: str, fallback: Reply) -> tuple[Reply, dict]:
+        """A model turn that raised no card (llm/grounding.py): the reply is what CODE says about the tools it ran; with
+        no tool, only a clean clarifying question survives; anything else becomes the rules' "didn't understand".
+        The model's own words go to the chat meta ("model_text"), never to the user. The claim check and the script
+        trim stay as backstops on the one kind of model text still shown (a question)."""
+        model_text = str(reply.text or "")
+        meta = dict(meta) | {"model_text": model_text[:400]}
+        try:
+            msgs = self._bundle(MODEL, reply.specialist).agent.get_state(self._cfg(thread_id, role, reply.specialist, MODEL)).values.get("messages", [])
+        except Exception:
+            msgs = []
+        h = GR.human_index(msgs)
+        results = GR.turn_results(msgs, h) if h >= 0 else []
+        said, raw = GR.render_results(results, self.repo, text, self._is_write)
+        if said:
+            q = GR.last_question(model_text)
+            body = "\n".join(said) + (f"\n{GR.strip_ids(q, self.repo)}" if q and not self._claims_done(model_text) else "")
+            if reply.ask and reply.ask.get("slot") == "dispatch" and len(reply.ask.get("candidates") or []) == 1:
+                body = body.rstrip(".") + ". Say 'theek he, bana do' and I'll ask for approval of this plan."
+            reply.text = body + (DETAILS + raw if raw.lstrip()[:1] in ("{", "[") else "")
+            if results:
+                reply.tool, reply.call = results[-1][0], {"name": results[-1][0], "args": results[-1][1]}
+            return reply, meta | {"grounded": [t for t, _, _ in results][-6:]}
+        if GR.ok_question(model_text) and not self._claims_done(model_text):
+            q = GR.strip_ids(model_text, self.repo)
+            if not is_urdu(text):
+                q = self._latin_only(q)
+            reply.text = q
+            return reply, meta | {"grounded": "question"}
+        log.info("model text not shown on %s (not a clean question, no tool result): %r", thread_id, model_text[:160])
+        specs = [reply.specialist] + ([fallback.specialist] if fallback.specialist else [])
+        claimed = self._claims_done(model_text)
+        lead = (NOTHING_DONE_UR if is_urdu(text) else NOTHING_DONE) + " " if claimed else ""
+        reply.text = lead + RP.didnt(specs, is_urdu(text), lang_of(text) == "ru")
+        return reply, meta | {"model_text_replaced": model_text[:200]} | ({"claim_blocked": model_text[:200]} if claimed else {})
+
+    def _approved_text(self, bundle, cfg: dict, pa: PendingApproval, approve: bool, note: str) -> str | None:
+        """What an approved (or rejected) model-engine card did, said by CODE from the tool's own result -- never the
+        model's follow-up prose (seen: "... Needs clerk approval" after the reversal had run). None if not found."""
+        if not approve:
+            return "Rejected. Nothing was done." + (f" ({note[:80]})" if note else "")
+        try:
+            msgs = bundle.agent.get_state(cfg).values.get("messages", [])
+        except Exception:
+            return None
+        call = next((tc for m in reversed(msgs) if isinstance(m, AIMessage) for tc in (m.tool_calls or []) if tc["name"] == pa.tool), None)
+        i = next((k for k, m in enumerate(msgs) if isinstance(m, ToolMessage) and call and m.tool_call_id == call["id"]), -1)
+        if i < 0:
+            return None
+        content = str(msgs[i].content)
+        err = GR._error_of(content)
+        if err:
+            return f"Approved, but it couldn't be done: {err.rstrip('.')}. Nothing changed."
+        nice = self._readable(msgs, i)
+        if not nice:
+            return None
+        return f"Approved. {nice}" + (DETAILS + content if content.lstrip()[:1] in ("{", "[") else "")
+
     @staticmethod
     def rate_limit_wait(e: Exception) -> float:
         """Seconds to stop asking the model after this error: 0 unless it is a rate limit. A daily token limit (Groq's
@@ -1769,22 +2029,6 @@ class MunshiPlatform:
         said = (int(m.group(1) or 0) * 3600 + int(m.group(2) or 0) * 60 + float(m.group(3) or 0)) if m and any(m.groups()) else 0.0
         daily = "per day" in msg or "tpd" in msg or "rpd" in msg
         return max(said, 3600.0 if daily else 60.0) if not said else min(max(said, 30.0), 6 * 3600.0)
-
-    @staticmethod
-    def _raw(text: str) -> bool:
-        """A reply that is empty, a bare 'Done.', or raw data rather than prose."""
-        t = str(text or "").strip()
-        return not t or t in ("Done.", "Done") or t[:1] in ("{", "[") or t.startswith("Done -- ")
-
-    def _last_tool_sentence(self, bundle, cfg: dict) -> str | None:
-        """The readable sentence for the last tool result of this turn on a model-engine thread, if any."""
-        try:
-            msgs = bundle.agent.get_state(cfg).values.get("messages", [])
-        except Exception:
-            return None
-        h = max((i for i, m in enumerate(msgs) if isinstance(m, HumanMessage)), default=-1)
-        i = max((i for i, m in enumerate(msgs) if i > h and isinstance(m, ToolMessage) and m.status != "error"), default=-1)
-        return self._readable(msgs, i) if i >= 0 else None
 
     def _heal_model_threads(self, thread_id: str, role: str) -> None:
         """After a failed model turn, leave no model-engine thread of this conversation holding a tool call with
@@ -2142,6 +2386,14 @@ class MunshiPlatform:
                     if reply is None:
                         with self.repo.acting_as(pa.requested_by):
                             reply = settle(result)
+                    if engine == MODEL and reply.model_error is None:
+                        # what the approved card did is said by code from the tool's result, never by the model's follow-up
+                        done = self._approved_text(bundle, cfg, pa, approve, note)
+                        if done:
+                            meta["model_text"] = visible(reply.text)[:400]
+                            lead = "Approved. " if approve else "Rejected. "
+                            reply.text = done + (("\n\n" + reply.text[len(lead):] if reply.text.startswith(lead) else "\n\n" + reply.text)
+                                                 if reply.pending else "")
                     reply.engine, reply.model_calls, reply.model_tokens = engine, calls.n, calls.tokens
                     ran = approve and self._ran(bundle, cfg, pa.tool)
                     self._settle_memory(pa, approve, ran and not warned, "warnings" if warned else "action failed", user or role)

@@ -52,6 +52,47 @@ class NotUnderstood(str):
     Return one from a `fallback_fn` and the stub marks its message with the NOT_UNDERSTOOD outcome."""
 
 
+# The request was understood, but the tool it needs isn't this role's (a clerk asking for a write-off, a salesman for a
+# payment): the reply is marked response_metadata[UNBOUND_KEY] = {"tool", "extra"} so the platform can pass the request
+# to the role that may do it (platform._handoff) instead of ending on "ask the owner".
+UNBOUND_KEY = "munshi_unbound"
+
+
+class NeedsRole(str):
+    """A fallback reply for a request this role can't make itself: `tool` is what it needs, `extra` a sentence on what to
+    do next (e.g. 'then send the right amount'). The stub marks it with UNBOUND_KEY."""
+
+    tool: str
+    extra: str
+
+    def __new__(cls, text: str, tool: str, extra: str = ""):
+        s = super().__new__(cls, text)
+        s.tool, s.extra = tool, extra
+        return s
+
+
+def unbound_of(msg: Any) -> dict | None:
+    """{"tool", "extra"} when `msg` is the stub's reply to a request the role has no tool for; else None."""
+    return (getattr(msg, "response_metadata", None) or {}).get(UNBOUND_KEY) if isinstance(msg, AIMessage) else None
+
+
+# A QUESTION never raises a write card unless it also carries an explicit instruction for it ('pakka? balance kitna reh
+# jayega' is a balance question, not 'confirm the order'; 'scene kya he wasooli ka' is not 'draft every reminder').
+_QUESTION = re.compile(r"[?؟]|\b(kya|kia|kiya hua|koi|kitna|kitni|kitne|kaun|kon|kaunsa|konsa|kaise|kaisa|kab|kahan|kidhar|kyun|kyon|scene|haal|halat|"
+                       r"status|how much|how many|what|which|who|when|why|whether|is it|are they|has it|did)\b|کتنا|کتنی|کتنے|کون|کب|کہاں|کیوں")
+_IMPERATIVE = re.compile(r"\b(kar do|kardo|kr do|karo|krdo|kar dein|kar den|kar dijiye|karwa do|karwao|bana do|banao|bana dein|bhej\w*|"
+                         r"bhijwa\w*|de do|dedo|de dein|de den|de sakte|likh do|likho|daal do|dalo|nikal do|nikalo|chahiye|chahiyen|chaiye|please|plz|pls|"
+                         r"record|recorded|received|confirm|cancel|approve|allocate|reverse|dispatch|send|book|pay|paid|transfer|draft|remind|"
+                         r"diye|diya|di|dia|jama|aaye|aaya|aayi|aya|ayi|aye|mile|mila|liye|liya|li|wapis|utar\w*)\b"
+                         r"|کر دو|کرو|بھیج|دے دو|دیے|دیا|چاہیے", re.I)
+
+
+def question_only(text: str) -> bool:
+    """A message shaped as a question, with no explicit instruction or report of money / goods moving in it."""
+    f = fold(text)
+    return bool(_QUESTION.search(f)) and not _IMPERATIVE.search(f)
+
+
 def not_understood(msg: Any) -> bool:
     """True if `msg` is a stub reply carrying the explicit didn't-understand outcome."""
     return isinstance(msg, AIMessage) and (getattr(msg, "response_metadata", None) or {}).get(OUTCOME_KEY) == NOT_UNDERSTOOD
@@ -194,34 +235,55 @@ class StubToolCallingModel(BaseChatModel):
             _HISTORY.reset(h_tok)
             _TURN.reset(t_tok)
 
+    @staticmethod
+    def _writes(tool: str) -> bool:
+        from munshi.safety.risk import RiskTier, risk_of
+        try:
+            return risk_of(tool) != RiskTier.READ_ONLY
+        except ValueError:
+            return False            # not a business tool (the manager's route_to_* tools): routing is never suppressed
+
     def _decide(self, messages: list[BaseMessage]) -> AIMessage:
         text = self._latest_human_text(messages)
-        intent_unbound = False
+        intent_unbound = None
+        asking = question_only(text)
         for rule in self.rules:
             try:
                 if not rule.match(text):
                     continue
+                if asking and self._writes(rule.tool_name):
+                    continue                        # a question never raises a write card (see question_only)
                 if rule.tool_name in self._bound_tool_names:
                     tool_call = {"name": rule.tool_name, "args": rule.args(text), "id": f"call_{rule.tool_name}"}
                     return AIMessage(content="", tool_calls=[tool_call])
             except Exception:                       # a parsing bug must never become a crash or a guess
                 log.exception("stub rule %s failed on %r", rule.tool_name, text[:80])
                 continue
-            intent_unbound = True
+            intent_unbound = rule.tool_name
             break   # the intent is clear but this role has no such tool: answer from the role's prompt, like a real model would
 
         system_text = "\n".join(str(m.content) for m in messages if isinstance(m, SystemMessage))
+        early = None
+        if intent_unbound and self.fallback_fn is not None:
+            try:
+                early = self.fallback_fn(text, system_text)       # it may say more about who can do it (NeedsRole)
+            except Exception:
+                log.exception("stub fallback failed on %r", text[:80])
+            if isinstance(early, NeedsRole):
+                return AIMessage(content=str(early), response_metadata={UNBOUND_KEY: {"tool": early.tool, "extra": early.extra}})
         if intent_unbound or not self._bound_tool_names:
             for predicate, reply in self.prompt_fallbacks:
                 if predicate(system_text):
-                    return AIMessage(content=reply)
+                    return AIMessage(content=reply, response_metadata={UNBOUND_KEY: {"tool": intent_unbound, "extra": ""}} if intent_unbound else {})
         if self.fallback_fn is not None:
             try:
-                reply = self.fallback_fn(text, system_text)
+                reply = early if early is not None else self.fallback_fn(text, system_text)
             except Exception:
                 log.exception("stub fallback failed on %r", text[:80])
                 reply = None
             if reply:
+                if isinstance(reply, NeedsRole):
+                    return AIMessage(content=str(reply), response_metadata={UNBOUND_KEY: {"tool": reply.tool, "extra": reply.extra}})
                 if isinstance(reply, NotUnderstood):
                     return _didnt(reply)
                 am = ask_meta(reply)

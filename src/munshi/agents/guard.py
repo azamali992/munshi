@@ -55,7 +55,7 @@ from munshi.llm.parse import (
     warehouses_in,
 )
 from munshi.llm.resolve import Candidate, Resolution
-from munshi.llm.stub_model import ASK_KEY, ask_meta
+from munshi.llm.stub_model import ASK_KEY, ask_meta, contains
 from munshi.llm.text import is_urdu
 from munshi.safety.risk import RiskTier, risk_of
 
@@ -90,9 +90,11 @@ def reset_topic(token) -> None:
 
 CUSTOMER_TOOLS = {"create_order", "record_payment", "credit_note", "draft_reminder", "log_promise", "get_customer_khata"}
 SUPPLIER_TOOLS = {"record_purchase", "pay_supplier", "supplier_khata"}
-_REF_KEYS = {"order_id": ("order", "ORD-..."), "plan_id": ("dispatch plan", "DSP-..."), "stop_id": ("stop", "STP-..."),
-             "reminder_id": ("reminder", "REM-..."), "entry_id": ("entry", "RCP-... or SPY-..."), "expense_id": ("expense", "EXP-..."),
-             "purchase_id": ("purchase", "PUR-..."), "route_id": ("route", "R-MULTAN-N"), "vehicle_id": ("vehicle", "V-01")}
+# (what, how a person names one) -- the question never asks for a record code
+_REF_KEYS = {"order_id": ("order", "'Rana Brothers ka order'"), "plan_id": ("dispatch plan", "'Vehari wali gaari'"), "stop_id": ("stop", "the customer's name"),
+             "reminder_id": ("reminder", "'Haji Sons ka reminder'"), "entry_id": ("entry", "'Chaudhry Farms ki 20000 wali payment'"),
+             "expense_id": ("expense", "'kal ka 5000 diesel wala kharcha'"), "purchase_id": ("purchase", "'Fauji ka kal wala truck'"),
+             "route_id": ("route", "'Multan North'"), "vehicle_id": ("vehicle", "its number plate")}
 _NUM_KEYS = ("qty", "delta", "unit_cost", "unit_price", "paid_amount", "cash_collected", "min_days_overdue")
 _AMOUNT_KEYS = ("amount", "amount_counted")
 _METHOD_TOOLS = {"record_payment", "record_expense", "pay_supplier"}
@@ -278,6 +280,17 @@ def _only_open_order(order_id: str, ctx: _Ctx) -> bool:
     return open_ == [order_id.strip().upper()]
 
 
+def _only_open_stop(stop_id: str, ctx: _Ctx) -> bool:
+    """The message names one customer confidently and this is their ONE open stop on today's loaded runs -- the rule the
+    offline delivery munshi closes a stop by name with ('chaudhry farms pe sab de diya ...')."""
+    res = ctx.customer()
+    if not res.ok or res.other is not None:
+        return False
+    from munshi.agents.specialists import todays_stop
+    st = todays_stop(ctx.repo, res.id or "")
+    return st is not None and st.stop_id == stop_id.strip().upper()
+
+
 def _check_refs(args: dict, ctx: _Ctx) -> str | None:
     texts = [ctx.text] + ctx.earlier
     for key, (what, example) in _REF_KEYS.items():
@@ -288,11 +301,70 @@ def _check_refs(args: dict, ctx: _Ctx) -> str | None:
             continue
         if key == "order_id" and v and not _in(v, texts) and _only_open_order(v, ctx):
             continue
+        if key == "stop_id" and v and not _in(v, texts) and _only_open_stop(v, ctx):
+            continue
         if not v or not _in(v, texts):
             return RP.t("which_ref", ctx.urdu, what=what, example=example)
     for oid in args.get("order_ids") or []:
         if not _in(str(oid), texts):
             return RP.t("which_ref", ctx.urdu, what="order", example="ORD-...")
+    return None
+
+
+def plan_orders(route_id: str, repo, customer_ids: set[str] | None = None) -> list[str]:
+    """Every order reserved (allocated) for this route -- at the route's godown, its customer on the route, on no plan yet --
+    in the route's stop order; only those customers' when the message names some. What a plan for the route must carry."""
+    try:
+        route = repo.get_route(route_id)
+    except Exception:
+        return []
+    on_plan = {s["order_id"] for s in repo._all("SELECT order_id FROM stops WHERE status='pending'")}
+    seq = {cid: k for k, cid in enumerate(route.stop_customer_ids)}
+    out = []
+    for o in repo.list_orders("allocated", limit=200):
+        try:
+            on_route = repo.get_customer(o.customer_id).route_id == route.route_id
+        except Exception:
+            on_route = False
+        if o.order_id in on_plan or o.warehouse_id != route.warehouse_id or not on_route:
+            continue
+        if customer_ids and o.customer_id not in customer_ids:
+            continue
+        out.append(o)
+    return [o.order_id for o in sorted(out, key=lambda o: (seq.get(o.customer_id, 99), o.created_at))]
+
+
+def _check_plan(args: dict, ctx: _Ctx) -> str | None:
+    """A dispatch plan's orders come from the books, not from the model's list: every order reserved for the route (or, when
+    the message names customers, exactly theirs). A plan that leaves one out is asked about, naming what it left out."""
+    rid = str(args.get("route_id") or "").strip().upper()
+    got = [str(x).strip().upper() for x in args.get("order_ids") or []]
+    named: set[str] = set()
+    from munshi.llm.turns import split_customers_named
+    for cid in split_customers_named(ctx.text, ctx.repo):
+        named.add(cid)
+    want = plan_orders(rid, ctx.repo, named or None)
+    said = [o for o in re.findall(r"ORD-[A-Z0-9]{8}", ctx.text.upper()) if o in plan_orders(rid, ctx.repo)]
+    if said:                                          # the message names the orders themselves: exactly those
+        want = said
+    if not want:
+        return RP.t("which_ref", ctx.urdu, what="route", example="'Multan North'")
+    if set(got) != set(want):
+        def who(oid):
+            try:
+                o = ctx.repo.get_order(oid)
+                return ctx.repo.get_customer(o.customer_id).name
+            except Exception:
+                return "?"
+        left = [who(o) for o in want if o not in got]
+        extra = [who(o) for o in got if o not in want]
+        why = (f"it leaves out {', '.join(left)}" if left else "") + ("; " if left and extra else "") + (f"it adds {', '.join(extra)}" if extra else "")
+        return (f"That plan doesn't match the reserved orders for this route ({why}), so nothing was done. Every reserved order for it: "
+                f"{', '.join(who(o) for o in want)}. Say 'plan bana do' for all of them, or name the customers to send.")
+    try:
+        ctx.repo.get_vehicle(str(args.get("vehicle_id") or ""))
+    except Exception:
+        return RP.t("which_ref", ctx.urdu, what="vehicle", example="its number plate")
     return None
 
 
@@ -332,6 +404,44 @@ def _check_numbers(args: dict, ctx: _Ctx) -> str | None:
     return None
 
 
+# WHAT: a write the message never asked for is not the user's. The model picks the action, but an action that changes or
+# undoes something needs a word for it in the message (or, for a bare 'haan', in the question it answers). Seen on Gemini:
+# a cancel_order card for 'haan kal wale plan mei daal do', a reminder card for 'Chaudhry Farms ke hawale se koi pending kaam'.
+_VERB_CUES = {
+    "cancel_order": contains("cancel", "mansookh", "radd", "nahi chahiye", "nahi lena", "mana", "band karo", "خارج", "منسوخ"),
+    "confirm_order": contains("confirm", "pakka", "haan", "han", "ji", "yes", "ok", "okay", "theek", "کنفرم", "پکا"),
+    "allocate_order": contains("allocate", "allocation", "reserve", "nikal", "nikalo", "godown se", "ریزرو"),
+    "create_dispatch_plan": contains("plan", "dispatch", "gaari", "gari", "gaadi", "truck", "bana", "banao", "bhejo", "load"),
+    "approve_dispatch_plan": contains("approve", "load", "loading", "manzoor", "chala do", "nikal", "روانہ"),
+    "adjust_stock": contains("adjust", "damage", "damaged", "kharab", "phat", "phati", "toot", "chori", "write off", "correction", "kam", "barha", "brha",
+                             "badha", "add", "increase", "nikal", "restock", "count", "ginti", "خراب"),
+    "credit_note": contains("credit", "chhoot", "chhot", "choot", "maaf", "riayat", "discount", "refund", "waive", "رعایت", "چھوٹ"),
+    "draft_reminder": contains("remind", "reminder", "yaad", "yaad dehani", "message", "bhej", "bhejo", "send", "tagaza", "یاد"),
+    "draft_due_reminders": contains("remind", "reminder", "reminders", "yaad", "yaad dehani", "sab", "everyone", "all"),
+    "send_reminder": contains("send", "bhej", "bhejo", "bhej do", "reminder", "yaad"),
+    "log_promise": contains("promise", "wada", "waada", "dega", "denge", "degi", "de dega", "tak", "وعدہ"),
+    "reverse_ledger_entry": contains("reverse", "reversal", "undo", "galat", "ghalat", "galti", "bounce", "bounced", "cancel", "wapis", "wapas", "واپس", "غلط"),
+    "reverse_expense": contains("reverse", "reversal", "undo", "galat", "ghalat", "galti", "cancel", "wapis", "غلط"),
+    "reverse_purchase": contains("reverse", "reversal", "undo", "galat", "ghalat", "galti", "cancel", "wapis", "غلط"),
+    "reverse_supplier_entry": contains("reverse", "reversal", "undo", "galat", "ghalat", "galti", "bounce", "cancel", "wapis", "غلط"),
+}
+_TIERS = ("", "gentle", "firm", "final")
+
+
+def _check_verb(name: str, args: dict, ctx: _Ctx) -> str | None:
+    from munshi.llm.followup import is_yes
+    from munshi.llm.stub_model import question_only
+    yes = is_yes(ctx.text)
+    cue = _VERB_CUES.get(name)
+    if cue is not None and not cue(ctx.text) and not (yes and ctx.history and cue(ctx.history[-1])):
+        return RP.t("not_backed", ctx.urdu, why=f"your message doesn't ask for this: {name.replace('_', ' ')}")
+    if question_only(ctx.text) and not yes:
+        return RP.t("not_backed", ctx.urdu, why="it reads as a question, and a question never raises a card")
+    if name == "draft_reminder" and str(args.get("tier") or "").lower() not in _TIERS:
+        return RP.t("not_backed", ctx.urdu, why=f"there is no '{args.get('tier')}' reminder -- only gentle, firm or final")
+    return None
+
+
 def check_call(name: str, args: dict, text: str, repo, prior: list[BaseMessage] | None = None, history: list[str] | None = None) -> str | None:
     """None if the message backs this call; otherwise the ONE question to ask instead of acting."""
     ctx = _Ctx(text, repo, prior or [], history if history is not None else (_HISTORY.get() or []))
@@ -352,6 +462,9 @@ def check_call(name: str, args: dict, text: str, repo, prior: list[BaseMessage] 
                 return q
     if not write:
         return None
+    q = _check_verb(name, args, ctx)
+    if q:
+        return q
     if name in ("create_order", "record_purchase", "update_order"):
         q = _check_items(name, args, ctx)
         if q:
@@ -377,6 +490,21 @@ def check_call(name: str, args: dict, text: str, repo, prior: list[BaseMessage] 
         otp = otp_in(text)
         if not otp or str(args.get("otp") or "").strip() != otp:
             return RP.t("which_otp", ctx.urdu)
+    if name == "reverse_ledger_entry" and not _in(str(args.get("entry_id") or ""), [text]):
+        # the receipt a reversal means is read in code, the rules' way (customer + amount + method + 'aaj'): the model's pick
+        # must be that ONE receipt -- seen on Gemini: '...50000 wali payment reverse karo' carded the Rs 20,000 receipt, and
+        # '...payment reverse karo' with two receipts carded one without asking
+        res = ctx.customer()
+        if res.ok and res.other is None:
+            from munshi.agents.specialists import receipts_meant
+            pays = receipts_meant(text, res.id or "", repo)[0]
+            if [e.entry_id for e in pays] != [str(args.get("entry_id") or "").strip().upper()]:
+                return RP.t("which_ref", ctx.urdu, what="payment", example="'Chaudhry Farms ki 20000 wali cash payment'")
+            return None                               # the one receipt the message means, read in code
+    if name == "create_dispatch_plan":
+        # the orders, the route and the vehicle are checked against the BOOKS (plan_orders); the vehicle is the model's pick,
+        # shown by plate on the card for the approver
+        return _check_plan(args, ctx) or _check_numbers(args, ctx)
     q = _check_refs(args, ctx)
     if q:
         return q

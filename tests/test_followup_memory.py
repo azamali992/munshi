@@ -145,9 +145,12 @@ def test_a_model_card_for_a_remembered_customer_passes_the_guard_and_says_so(rep
 
 # ------------------------------------------------------------------ readable replies
 def test_lists_are_short_with_a_count_of_the_rest(repo):
-    rows = [{"customer_id": f"C-{i:03d}", "name": f"Customer {i}", "balance": 1000 * i, "days_overdue": i} for i in range(1, 13)]
+    rows = [{"customer_id": f"C-{i:03d}", "name": f"Customer {i}", "balance": 1000 * i, "days_overdue": i} for i in range(1, 21)]
     txt = answers.render("aging_report", rows, repo, "who owes us")
-    assert txt.startswith("12 customers owe Rs 78,000") and "...and 4 more." in txt and "{" not in txt and "customer_id" not in txt
+    assert txt.startswith("20 customers owe Rs 210,000") and "...and 12 more." in txt and "{" not in txt and "customer_id" not in txt
+    # a list of up to 15 is shown whole (persona round 2: '10 products' cut to 8 made people ask again)
+    whole = answers.render("aging_report", rows[:12], repo, "who owes us")
+    assert "more" not in whole and "Customer 12" in whole
 
 
 def test_roman_urdu_and_urdu_script_replies(repo):
