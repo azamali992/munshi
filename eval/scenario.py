@@ -42,7 +42,9 @@ STEPS: list[Step] = [
          expect_contains=["delivered", "108250"]),
     Step("clerk_records_deposit", "clerk", "{did} driver handed 45000", "hisaab", True, approve=True,
          expect_contains=["-5000", "C-002"]),
-    Step("clerk_cannot_credit_note", "clerk", "credit note Rana Brothers 5000 damaged", "hisaab", False,
+    # owner decision 4 (2026-09-26): a clerk's request for an owner-tier action is the OWNER's approval card (was: no card, a
+    # notification). The clerk still can't clear it; here the owner rejects it, so the khata is unchanged.
+    Step("clerk_cannot_credit_note", "clerk", "credit note Rana Brothers 5000 damaged", "hisaab", True, approve=False, approve_as="owner",
          expect_contains=["owner"], check_unchanged="outstanding:C-005"),
     Step("owner_credit_note", "owner", "credit note Rana Brothers 5000 damaged bags", "hisaab", True, approve=True,
          expect_contains=["credit_note", "-5000"]),
@@ -58,7 +60,8 @@ STEPS: list[Step] = [
     # ---- v1.0: purchases, office money, reports, salesman, transfers, cancellations
     Step("clerk_receives_stock", "clerk", "received 100 urea from Fauji at 3600 bill FF-2291", "khareed", True, approve=True,
          expect_contains=["PUR-", "900000"]),
-    Step("clerk_cannot_pay_supplier", "clerk", "pay Fauji 100000 by bank", "khareed", False, expect_contains=["owner"]),
+    # owner decision 4: the clerk's supplier payment is the owner's card (was: no card); the owner rejects this one
+    Step("clerk_cannot_pay_supplier", "clerk", "pay Fauji 100000 by bank", "khareed", True, approve=False, approve_as="owner", expect_contains=["owner"]),
     Step("owner_pays_supplier", "owner", "pay Fauji 100000 by bank", "khareed", True, approve=True, expect_contains=["SPY-", "800000"]),
     Step("payables", "clerk", "what do we owe suppliers", "khareed", False, expect_contains=["Fauji"]),
     Step("office_payment", "clerk", "Chaudhry Farms paid 20000 jazzcash", "hisaab", True, approve=True, expect_contains=["RCP-", "jazzcash"]),

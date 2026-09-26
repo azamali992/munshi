@@ -31,7 +31,7 @@ from munshi.llm.stub_model import Rule, StubToolCallingModel, contains
 from munshi.llm.text import fold
 from munshi.safety.auth import MunshiState
 
-Specialist = Literal["order", "godown", "delivery", "hisaab", "khareed", "wasooli", "report", "help"]
+Specialist = Literal["order", "godown", "delivery", "hisaab", "khareed", "wasooli", "report", "tankhwa", "accounts", "help"]
 
 
 @tool
@@ -70,13 +70,25 @@ def route_to_report() -> str:
     return "ROUTE:report"
 
 @tool
+def route_to_tankhwa() -> str:
+    """Route to the Tankhwa Munshi: staff, attendance (hazri, chutti), staff advances, payroll, payslips, salary payments, EOBI and salary tax."""
+    return "ROUTE:tankhwa"
+
+@tool
+def route_to_accounts() -> str:
+    """Route to the Accounts Munshi: money accounts (bank, galla, wallets) and their balances, moving money between them, cash counts,
+    capital, drawings, loans, fixed assets, depreciation, P&L, balance sheet, cash flow, KPIs and closing a month."""
+    return "ROUTE:accounts"
+
+@tool
 def route_to_help() -> str:
     """Route to the help desk: greetings, thanks, questions about what Munshi can do, and requests no munshi may carry out
     (deleting records, revealing a PIN or delivery code, approving without a human)."""
     return "ROUTE:help"
 
 
-_ROUTES = [route_to_order, route_to_godown, route_to_delivery, route_to_hisaab, route_to_khareed, route_to_wasooli, route_to_report]
+_ROUTES = [route_to_order, route_to_godown, route_to_delivery, route_to_hisaab, route_to_khareed, route_to_wasooli, route_to_report,
+           route_to_tankhwa, route_to_accounts]
 _STUB_ROUTES = _ROUTES + [route_to_help]
 
 CLARIFY = "Is this about an order, the godown, a delivery, cash/khata, a supplier, collections, or a report?"
@@ -128,6 +140,29 @@ _STOCK_WORD = _rx(r"\b(stock|stocks|inventory|godown)\b|اسٹاک|سٹاک|گو
 _OFFTOPIC = _rx(r"\b(mausam|weather|cricket|news|khabar|joke|lateefa|gana|song|movie|film)\b")
 _PERSONAL = _rx(r"\b(mera|meri|my)\b.{0,12}\b(tankha|tankhwah|salary|pay)\b")
 _URDU_SCRIPT = _rx(r"[؀-ۿ]")
+# ---- payroll (Tankhwa munshi) and company finance (Accounts munshi): agents/specialists_money.py
+_PAYROLL = _rx(r"\b(tankhwa\w*|tankha|tankhah|tanakhwa\w*|payroll|pay ?slips?|payslips?|salary ?slips?|hazri|haazri|haziri|attendance|chutti|chuttiyan|"
+               r"chhutti\w*|chuttian|mulazim\w*|mulazmeen|employees?|staff|eobi|peshgi|pesgi|kaam (chor|chhor|chod) (diya|di|de)|"
+               r"naukri (chor|chhor|chod))\b|تنخواہ|سیلری|سیلیری|ایڈوانس|حاضری|ملازم|چھٹی|سلپ")
+_SALARY = _rx(r"\bsalar(y|ies)\b")
+_EXPENSE_WORD = _rx(r"\b(kharcha|kharch|kharche|expense|expenses)\b|خرچہ")
+_ADVANCE_WORD = _rx(r"\b(advance|advances)\b")
+_PAY_TAX = _rx(r"\btax\b.{0,20}\b(kata|kati|kate|kaata|kaati|kat|withheld|deduct\w*)\b|\b(salary|tankhwa\w*)\b.{0,15}\btax\b|ٹیکس")
+_STAFF_ACTION = _rx(r"\b(kaat lo|kaat do|kaato|kat lo|jurmana|fine|bonus|inaam|eidi|commission|din|days|chuttiyan|chutti|leave|absent|ghair hazir)\b|بونس|جرمانہ|کمیشن")
+_BOOKS = _rx(r"\bbalance ?sheet\b|بیلنس شیٹ|\bprofit (and |& ?|n )?loss\b|\bp ?& ?l\b|\bpnl\b|\bincome statement\b|\b(munafa|nafa) (nuqsan|nuksan)\b|منافع نقصان|"
+             r"\bcash ?flow\b|\b(paisa|paise|paisay) kahan (gaya|gaye|gya)\b|\btrial balance\b|\b(dso|dpo|kpi|kpis|stock days)\b|\bdepreciation\b|"
+             r"\b(qarz|qarza|karz|loan)\b.{0,20}\b(liya|liye|li|mila|mile|aaya|aya)\b|\b(ghar ke liye|apne liye|khud ke liye|drawings?)\b|"
+             r"\b(capital|sarmaya)\b|\b(mahina|month|period) (close|band)\b|\b(route|routes)\b.{0,30}\b(munafa|margin|profit)\b")
+_MONTH_CLOSE = _rx(r"\b(jan|january|feb|february|march|april|may|june|july|august|sept?|september|oct|october|nov|november|dec|december)\b.{0,15}\b(band|close)\b"
+                   r"|(جنوری|فروری|مارچ|اپریل|مئی|جون|جولائی|اگست|ستمبر|اکتوبر|نومبر|دسمبر).{0,15}بند")
+_ACCOUNT_Q = _rx(r"\b(bank|galla|galle|gala|jazz ?cash|easy ?paisa|accounts?|hbl|ubl|mcb|meezan|abl|nbp|alfalah)\b|بینک|گلہ")
+_BALANCE_Q = _rx(r"\b(kitna|kitne|kitni|balance|how much)\b|کتنا|کتنے")
+_CAME_IN = _rx(r"\b(aya|aaya|aaye|aye|aayi|ayi|mila|mile|received|collect\w*|wasool|wusool)\b|آیا|آئے")
+_BOOK_Q = _rx(r"\b(hbl|ubl|mcb|meezan|abl|nbp|alfalah|jazz ?cash|easy ?paisa|galla|galle|bank)\b.{0,15}\b(hisaab|hisab|statement|book|ledger|kitab|entries)\b")
+_BANK_MOVE = _rx(r"\b(bank|jazz ?cash|easy ?paisa|hbl|meezan|ubl|mcb)\b.{0,20}\b(jama|dale|daale|dala|deposit\w*|nikale|nikala|nikali|nikalwaye|withdraw\w*)\b|"
+                 r"\b(nikale|nikala)\b.{0,20}\b(bank|hbl)\b")
+_CASH_COUNT = _rx(r"\b(gin|gina|ginti|count|counted)\b.{0,25}\d|\d.{0,25}\b(gin liya|gin liye|ginti)\b")
+_ASSET_BUY = _rx(r"\b(naya|nayi|naye|new|khareed\w*|kharid\w*)\b.{0,20}\b(shehzore|shahzore|shehzor|truck|mazda|suzuki|bike|motorcycle|rickshaw|loader|generator|forklift|gaari|gari|gaadi)\b.{0,30}\b(lakh|lac|hazar|crore|\d{5,})")
 
 
 def _stub(repo=None) -> StubToolCallingModel:
@@ -180,11 +215,31 @@ def _stub(repo=None) -> StubToolCallingModel:
             return len(warehouses_in(t, repo)) == n
         return pred
 
+    def _employee(t: str) -> bool:
+        """The message names one of the staff (agents/specialists_money.employee_res: the customers' confidence rule)."""
+        if repo is None:
+            return False
+        from munshi.agents.specialists_money import employee_res
+        return employee_res(t, repo).status != "none"
+
     return StubToolCallingModel(rules=[
-        # 1. never business: refused by the help desk
-        R(_DESTROY, "route_to_help"), R(_SECRET, "route_to_help"), R(_EDIT, "route_to_help"), R(_PERSONAL, "route_to_help"),
+        # 1. never business: refused by the help desk (a PIN -- anyone's -- is never shown in chat)
+        R(_DESTROY, "route_to_help"), R(_SECRET, "route_to_help"), R(_EDIT, "route_to_help"),
         # deciding cards from chat ('malik wala reject kar do, baqi sab approve kar do'): decisions are taken on the cards
         R(_all(_BYPASS, _rx(r"\b(approve|reject|manzoor|radd)\w*\b")), "route_to_help"),
+        # payroll: the staff, their attendance, advances and pay ('meri salary slip' too -- the Tankhwa munshi shows a person their OWN)
+        R(_all(_PAYROLL, _none(_EXPENSE_WORD), lambda t: _employee(t) or _nobody(t)), "route_to_tankhwa"),
+        R(_all(_ADVANCE_WORD, lambda t: _employee(t) or _nobody(t), _none(_rx(r"\bne\b"))), "route_to_tankhwa"),
+        R(_all(_SALARY, _none(_EXPENSE_WORD)), "route_to_tankhwa"),
+        R(_PAY_TAX, "route_to_tankhwa"),
+        R(_all(_employee, _STAFF_ACTION), "route_to_tankhwa"),
+        # company finance: statements, capital / drawings / loans / assets, closing a month, the money accounts and moves between them
+        R(_BOOKS, "route_to_accounts"), R(_MONTH_CLOSE, "route_to_accounts"),
+        R(_all(_ACCOUNT_Q, _BALANCE_Q, _none(_CAME_IN), _nobody, _none(_rx(r"\d"))), "route_to_accounts"),
+        R(_all(_BOOK_Q, _nobody), "route_to_accounts"),
+        R(_all(_BANK_MOVE, _rx(r"\d"), _nobody, _none(_rx(r"\bne\b"))), "route_to_accounts"),
+        R(_all(_CASH_COUNT, _rx(r"\b(cash|galla|galle|gala)\b")), "route_to_accounts"),
+        R(_all(_ASSET_BUY, _nobody), "route_to_accounts"),
         # reversals and credit notes (kept first: 'damaged' / 'transfer' must not pull them elsewhere) -- 'chhoot' is a discount given
         R(contains("credit note", "refund", "waive", "maaf", "chhoot", "chhot", "riayat", "riyayat", "رعایت", "چھوٹ"), "route_to_hisaab"),
         # undoing a customer's payment ('X ki 20000 wali entry galat thi, cancel kar do'): hisaab, never the order desk's 'cancel'
@@ -309,7 +364,10 @@ _MODEL_MANAGER_PROMPT = ("You are the Manager at a distribution business in Paki
                          "balance, or money a customer paid us, is hisaab (or order for an order); an order for goods is order; what we owe or pay a "
                          "supplier, or goods a supplier delivered, is khareed; reminders, overdue lists and promises to pay are wasooli; totals, sales, "
                          "profit and rankings over a period are report. Money RECEIVED from a customer ('wusool hui', 'wasool ho gaye', 'raqam mil gayi', "
-                         "'de gaya') is hisaab -- wasooli is only reminders, overdue lists and promises, never recording a payment.")
+                         "'de gaya') is hisaab -- wasooli is only reminders, overdue lists and promises, never recording a payment. "
+                         "Staff, attendance, salaries, payslips, staff advances, EOBI and salary tax are tankhwa. The business's own money "
+                         "accounts (bank, galla, wallets) and their balances, moving money between them, cash counts, capital, drawings, loans, "
+                         "fixed assets, P&L, balance sheet, cash flow and closing a month are accounts.")
 
 
 class _ModelRouter:

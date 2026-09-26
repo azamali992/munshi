@@ -346,7 +346,7 @@
       const said = status || (m.meta?.resolved ? (m.meta.approved ? t('approved') : t('reject')) : '');
       return `<div class="msg bot${tables.length ? ' has-table' : ''}"><span class="who">${esc(who)}${said ? ' · ' + esc(said) : ''}</span>${tables.length ? withTables(text, tables) : esc(text)}${extra}</div>`;
     }
-    return `<div class="msg me">${esc(m.text)}${m.meta?.user && m.meta.user !== state.me?.name ? `<span class="who">${esc(m.meta.user)}</span>` : ''}</div>`;
+    return `<div class="msg me">${esc(m.text)}${sentProofs(m.meta?.attachments)}${m.meta?.user && m.meta.user !== state.me?.name ? `<span class="who">${esc(m.meta.user)}</span>` : ''}</div>`;
   }
   function summarize(o) {
     if (o && o.error) return '⚠ ' + o.error;
@@ -424,6 +424,38 @@
       <tbody>${ls.map(l => `<tr><td><bdi class="ltr" dir="ltr">${esc(l.name)}</bdi></td><td class="n">${ltr(num(l.qty))}${unit(l.unit)}</td>${rate ? `<td class="n">${l.unit_price === null ? '—' : money(l.unit_price)}</td>` : ''}${amt ? `<td class="n">${l.line_total === null ? '—' : money(l.line_total)}</td>` : ''}</tr>`).join('')}</tbody>
       ${c.total !== null && c.total !== undefined && amt ? `<tfoot><tr><th scope="row" colspan="${1 + (rate ? 2 : 1)}">${esc(t('total'))}</th><td class="n">${money(c.total)}</td></tr></tfoot>` : ''}</table>`;
   }
+  // payment proofs on a card (Stream D): the file route needs the session header, so a thumbnail is fetched as a blob --
+  // never a bare <img src> -- and a tap opens it. A proof the viewer may not see (404) just drops out.
+  async function proofBlob(url) {
+    const r = await fetch(url, { headers: { 'X-Session': state.token || '' } });
+    if (!r.ok) throw new Error(String(r.status));
+    return r.blob();
+  }
+  const proofURL = async url => URL.createObjectURL(await proofBlob(url));        // a tap: the file in a new tab
+  const proofData = async url => {                                                 // a thumbnail: a data: URL (the CSP allows img data:, not blob:)
+    const b = await proofBlob(url);
+    return new Promise((ok, no) => { const fr = new FileReader(); fr.onload = () => ok(fr.result); fr.onerror = no; fr.readAsDataURL(b); });
+  };
+  function loadProofs() {
+    document.querySelectorAll('img[data-proof-src]:not([src])').forEach(img => {
+      img.setAttribute('src', 'data:,');
+      proofData(img.dataset.proofSrc).then(u => { img.src = u; }).catch(() => img.closest('.ap-proof')?.remove());
+    });
+  }
+  const watchProofs = () => new MutationObserver(loadProofs).observe(document.body, { childList: true, subtree: true });
+  if (document.body) watchProofs(); else document.addEventListener('DOMContentLoaded', watchProofs);
+  document.addEventListener('click', e => {
+    const a = e.target.closest && e.target.closest('[data-proof]'); if (!a) return;
+    e.preventDefault(); proofURL(a.dataset.proof).then(u => window.open(u, '_blank', 'noopener')).catch(() => {});
+  });
+  const proofLink = pr => pr.kind === 'image'
+    ? `<a class="ap-proof" href="#" data-proof="${esc(pr.file)}"><img alt="${esc(pr.filename || 'proof')}" data-proof-src="${esc(pr.thumb || pr.file)}" style="max-height:72px;max-width:96px;border-radius:6px"></a>`
+    : `<a class="ap-proof pdf" href="#" data-proof="${esc(pr.file)}">📄 <bdi>${esc(pr.filename || 'PDF')}</bdi></a>`;
+  const proofsHTML = c => (c.proofs || []).length ? `<div class="ap-proofs">${c.proofs.map(proofLink).join(' ')}</div>` : '';
+  // a sent message's proofs in chat history (the ids the chat POST carried; each fetch is checked by the server's read rule,
+  // and a proof this viewer may not see simply drops out)
+  const sentProofs = ids => (ids || []).length ? `<span class="ap-proofs">${ids.map(id => proofLink({ kind: 'image', file: '/api/attachments/' + encodeURIComponent(id) + '/file',
+    thumb: '/api/attachments/' + encodeURIComponent(id) + '/thumb', filename: 'proof' })).join(' ')}</span>` : '';
   function renderApproval(p) {
     APPROVALS.set(p.approval_id, p);
     const c = p.card || { title: p.summary, lines: [], warnings: [], facts: [] };
@@ -444,6 +476,7 @@
       ${c.effect ? `<p class="ap-effect">${cardText(c.effect_key, c.effect_vars, c.effect)}</p>` : ''}
       ${(c.warnings || []).map(w => `<p class="ap-warn"><span aria-hidden="true">⚠</span><span>${cardText(w.key, w.vars, w.text)}</span></p>`).join('')}
       ${facts ? `<div class="kv ap-facts">${facts}</div>` : ''}
+      ${proofsHTML(c)}
       ${c.quote ? `<div class="quote"><bdi>${esc(c.quote)}</bdi></div>` : ''}
       <p class="ap-meta">${asked}${c.approver ? ` · ${cardText(c.approver.key, c.approver.vars, c.approver.text)}` : ''}</p>
       ${blocked}

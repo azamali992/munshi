@@ -251,4 +251,5 @@ def test_stock_that_arrived_from_a_supplier_becomes_a_purchase(p):
 
 def test_a_clerk_adding_stock_is_never_shown_a_stock_read(p):
     r = p.handle_message("t", "clerk", "increase the stock count of drip line in multan by 1000")
-    assert r.pending is None and "available" not in shown(r)
+    # owner decision 4 (2026-09-26): the clerk's stock adjustment is the OWNER's card (was: no card) -- still never a stock read
+    assert r.pending is not None and r.pending.tool == "adjust_stock" and r.pending.needs_role == "owner" and "available" not in shown(r)

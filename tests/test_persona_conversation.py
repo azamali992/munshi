@@ -241,7 +241,10 @@ def test_a_post_approval_payment_correction_explains_the_reversal_and_changes_no
     p.resolve(r.pending.approval_id, True, "clerk", user=OTHER)
     n = len(p.repo.ledger_for("C-002"))
     r = p.handle_message("t", "clerk", "galti ho gayi 15000 nahi 12000 the", user=CLERK)
-    assert r.pending is None and "reverse" in r.text and "order" not in r.text.lower()
+    # owner decision 4 (2026-09-26): the clerk's correction raises the OWNER's reversal card (was: explained, no card); nothing
+    # changes until the owner decides it
+    assert r.pending is not None and r.pending.tool == "reverse_ledger_entry" and r.pending.needs_role == "owner"
+    assert "reverse" in r.text and "order" not in r.text.lower()
     assert len(p.repo.ledger_for("C-002")) == n
 
 

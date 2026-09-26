@@ -25,6 +25,9 @@ class _Guarded:
                 return fn(*a, **kw)
             except _DOMAIN_ERRORS as e:
                 return {"error": str(e).strip("'"), "kind": type(e).__name__}
+            except NotImplementedError:
+                # a part of the books not switched on in this build yet (payroll / finance / proofs landing in stages)
+                return {"error": "that part of Munshi isn't available yet", "kind": "NotAvailable"}
         return guarded
 
 
@@ -294,7 +297,322 @@ def build_tools(ops: MunshiTools) -> dict[str, BaseTool]:
         """Record a customer's promise to pay an amount by a date."""
         return ops.log_promise(customer_id, amount, promised_date)
 
-    all_tools = [find_customer, get_customer_khata, search_products, get_stock, list_orders, get_order,
+    # ------------------------------------------------------------------ tankhwa (payroll)
+    @tool
+    def list_employees(status: str = "active") -> dict:
+        """The staff list: name, employee number, designation, status (pay figures only for the owner)."""
+        return ops.list_employees(status)
+
+    @tool
+    def find_employee(text: str) -> dict:
+        """Look up an employee by the name as the user wrote it; returns the match or the candidates to ask about."""
+        return ops.find_employee(text)
+
+    @tool
+    def payroll_preview(period: str = "", employee_ids: list[str] | None = None) -> dict:
+        """The month's payroll worked out but not booked: each employee's gross, deductions, commission and net pay.
+        period 'YYYY-MM' (default this month); employee_ids to see only some."""
+        return ops.payroll_preview(period, employee_ids)
+
+    @tool
+    def payroll_register(period: str = "", run_id: str = "") -> dict:
+        """The approved payroll register (the salary sheet) of a month, default the latest."""
+        return ops.payroll_register(period, run_id)
+
+    @tool
+    def payslip(employee_id: str, period: str = "") -> dict:
+        """One employee's payslip for a month (default the latest)."""
+        return ops.payslip(employee_id, period)
+
+    @tool
+    def my_payslips() -> dict:
+        """The signed-in person's OWN payslips. Takes no name: whose slips is decided by who is signed in."""
+        return ops.my_payslips()
+
+    @tool
+    def staff_advances_report(employee_id: str = "", status: str = "open") -> dict:
+        """Staff advances and loans: given, recovered, outstanding -- for one employee or everyone."""
+        return ops.staff_advances_report(employee_id, status)
+
+    @tool
+    def statutory_summary(kind: str = "eobi", period: str = "") -> dict:
+        """What is due for a month by kind: eobi, ss (social security) or income_tax (salary tax withheld)."""
+        return ops.statutory_summary(kind, period)
+
+    @tool
+    def record_attendance(period: str, rows: list[dict]) -> dict:
+        """Record attendance for a month: rows [{"employee_id", "days_worked"?, "casual_leave"?, "annual_leave"?, "sick_leave"?, "unpaid_absent"?, "ot_minutes"?}].
+        Days and minutes only -- never a rupee figure."""
+        return ops.record_attendance(period, rows)
+
+    @tool
+    def add_employee(name: str, designation: str = "", phone: str = "", basic: float = 0.0, pay_basis: str = "monthly") -> dict:
+        """Add an employee with their monthly basic pay (the amount the user wrote)."""
+        return ops.add_employee(name, designation, phone, basic, pay_basis)
+
+    @tool
+    def update_employee(employee_id: str, changes: dict) -> dict:
+        """Change an employee's details (name, phone, designation...)."""
+        return ops.update_employee(employee_id, changes)
+
+    @tool
+    def rehire_employee(employee_id: str, rejoined_on: str = "") -> dict:
+        """Take back an employee who had left."""
+        return ops.rehire_employee(employee_id, rejoined_on)
+
+    @tool
+    def set_pay_structure(employee_id: str, pay_basis: str = "monthly", basic: float = 0.0, daily_rate: float = 0.0, effective_from: str = "") -> dict:
+        """Set an employee's pay: monthly basic, or a daily rate."""
+        return ops.set_pay_structure(employee_id, pay_basis, basic, daily_rate, effective_from)
+
+    @tool
+    def set_commission_rule(employee_id: str, basis: str, rate_pct: float = 0.0, per_unit: float = 0.0, sku: str = "", effective_from: str = "") -> dict:
+        """Set a salesman's commission: a percent of sales or collections, or an amount per unit."""
+        return ops.set_commission_rule(employee_id, basis, rate_pct, per_unit, sku, effective_from)
+
+    @tool
+    def end_employment(employee_id: str, reason: str = "", left_on: str = "") -> dict:
+        """An employee has left: end their employment (their app login is switched off)."""
+        return ops.end_employment(employee_id, reason, left_on)
+
+    @tool
+    def add_payroll_adjustment(employee_id: str, code: str, amount: float, note: str = "", period: str = "", ref: str = "") -> dict:
+        """Add to or take from this month's pay: code bonus, fine, loss_recovery, other_earning or other_deduction; amount as the user
+        wrote it. A loss_recovery names the cash-shortage entry it recovers (ref, EXP-...)."""
+        return ops.add_payroll_adjustment(employee_id, code, amount, note, period, ref)
+
+    @tool
+    def void_payroll_adjustment(adj_id: str) -> dict:
+        """Cancel a payroll adjustment (ADJ-...) before the month is approved."""
+        return ops.void_payroll_adjustment(adj_id)
+
+    @tool
+    def approve_payroll_run(period: str, fingerprint: str) -> dict:
+        """Approve (book) a month's payroll exactly as previewed: fingerprint comes from payroll_preview."""
+        return ops.approve_payroll_run(period, fingerprint)
+
+    @tool
+    def reverse_payroll_run(run_id: str, reason: str) -> dict:
+        """Reverse an approved payroll run (PAY-...) with a reason."""
+        return ops.reverse_payroll_run(run_id, reason)
+
+    @tool
+    def pay_salaries(run_id: str, payments: list[dict]) -> dict:
+        """Pay salaries of an approved run: payments [{"employee_id", "method", "amount"?}] (bank, jazzcash, easypaisa, cheque)."""
+        return ops.pay_salaries(run_id, payments)
+
+    @tool
+    def reverse_salary_payment(payment_id: str, reason: str) -> dict:
+        """Reverse a salary payment (SPM-...) with a reason."""
+        return ops.reverse_salary_payment(payment_id, reason)
+
+    @tool
+    def give_staff_advance(employee_id: str, amount: float, method: str, installment: float = 0.0, note: str = "") -> dict:
+        """Give an employee an advance: the amount and the method the user said (bank, jazzcash, easypaisa, cheque)."""
+        return ops.give_staff_advance(employee_id, amount, method, installment, note)
+
+    @tool
+    def repay_staff_advance(employee_id: str, amount: float, method: str) -> dict:
+        """An employee paid back part of an advance directly."""
+        return ops.repay_staff_advance(employee_id, amount, method)
+
+    @tool
+    def reverse_staff_advance(advance_id: str, reason: str) -> dict:
+        """Reverse a staff advance (ADV-...) with a reason."""
+        return ops.reverse_staff_advance(advance_id, reason)
+
+    @tool
+    def record_statutory_payment(kind: str, period: str, amount: float, method: str, challan_ref: str, paid_on: str = "") -> dict:
+        """Record a challan paid: EOBI, social security or salary tax, for a month."""
+        return ops.record_statutory_payment(kind, period, amount, method, challan_ref, paid_on)
+
+    @tool
+    def add_statutory_rate(key: str, value: str, effective_from: str, source: str, verified_on: str, source_url: str = "", grade: str = "C", note: str = "") -> dict:
+        """Add a statutory rate override (minimum wage, EOBI rate...) with its source and the date it was checked."""
+        return ops.add_statutory_rate(key, value, effective_from, source, verified_on, source_url, grade, note)
+
+    @tool
+    def set_payroll_settings(changes: dict) -> dict:
+        """Change payroll settings (profile plc_2026 / legacy_1969, province, registrations, pay day)."""
+        return ops.set_payroll_settings(changes)
+
+    # ------------------------------------------------------------------ accounts (company finance)
+    @tool
+    def money_accounts() -> dict:
+        """Every money account (cash in hand, banks, wallets) with its balance now."""
+        return ops.money_accounts()
+
+    @tool
+    def account_book(account_id: str, start: str = "", end: str = "") -> dict:
+        """One money account's book: money in and out with the running balance (default the last 30 days)."""
+        return ops.account_book(account_id, start, end)
+
+    @tool
+    def reconciliation_status(account_id: str, statement_date: str = "") -> dict:
+        """A bank account's reconciliation with its statement."""
+        return ops.reconciliation_status(account_id, statement_date)
+
+    @tool
+    def trial_balance(as_of: str = "") -> dict:
+        """The trial balance (owner)."""
+        return ops.trial_balance(as_of)
+
+    @tool
+    def income_statement(start: str = "", end: str = "") -> dict:
+        """Profit and loss for a period (default this month to date)."""
+        return ops.income_statement(start, end)
+
+    @tool
+    def balance_sheet(as_of: str = "") -> dict:
+        """The company's balance sheet (default today)."""
+        return ops.balance_sheet(as_of)
+
+    @tool
+    def cash_flow(start: str = "", end: str = "") -> dict:
+        """Where the money came from and went (default this month to date)."""
+        return ops.cash_flow(start, end)
+
+    @tool
+    def owner_kpis(as_of: str = "") -> dict:
+        """The owner's key numbers: margin, DSO, DPO, stock days, payroll share, collection rate."""
+        return ops.owner_kpis(as_of)
+
+    @tool
+    def margins_report(by: str = "product", start: str = "", end: str = "") -> dict:
+        """Margin by product, customer or route over a period."""
+        return ops.margins_report(by, start, end)
+
+    @tool
+    def fixed_assets_register(as_of: str = "") -> dict:
+        """Fixed assets with cost, depreciation and book value."""
+        return ops.fixed_assets_register(as_of)
+
+    @tool
+    def loans_report(as_of: str = "") -> dict:
+        """Loans taken: received, repaid, outstanding."""
+        return ops.loans_report(as_of)
+
+    @tool
+    def period_status() -> dict:
+        """Which months are closed."""
+        return ops.period_status()
+
+    @tool
+    def list_attachments(entity: str, entity_id: str) -> list:
+        """The payment proofs linked to an entry."""
+        return ops.list_attachments(entity, entity_id)
+
+    @tool
+    def transfer_between_accounts(from_account: str, to_account: str, amount: float, ref: str = "", note: str = "") -> dict:
+        """Move money between the business's own accounts (cash to bank, bank to cash, bank to wallet)."""
+        return ops.transfer_between_accounts(from_account, to_account, amount, ref, note)
+
+    @tool
+    def count_cash(account_id: str, counted: float, note: str = "") -> dict:
+        """Record a cash count of the galla (the amount the user counted)."""
+        return ops.count_cash(account_id, counted, note)
+
+    @tool
+    def mark_cleared(account_id: str, items: list[dict], cleared_on: str = "", cleared: bool = True) -> dict:
+        """Tick bank entries as cleared against the statement."""
+        return ops.mark_cleared(account_id, items, cleared_on, cleared)
+
+    @tool
+    def save_reconciliation(account_id: str, statement_date: str, statement_balance: float) -> dict:
+        """Save a bank reconciliation with the statement balance."""
+        return ops.save_reconciliation(account_id, statement_date, statement_balance)
+
+    @tool
+    def add_money_account(kind: str, name: str, provider: str = "", number_last4: str = "", opening_balance: float = 0.0) -> dict:
+        """Add a money account (cash, bank or wallet)."""
+        return ops.add_money_account(kind, name, provider, number_last4, opening_balance)
+
+    @tool
+    def set_method_route(method: str, account_id: str, effective_from: str = "") -> dict:
+        """Which account 'bank' / 'jazzcash' / ... money lands in."""
+        return ops.set_method_route(method, account_id, effective_from)
+
+    @tool
+    def record_capital(amount: float, method: str = "cash", note: str = "") -> dict:
+        """The owner put money into the business."""
+        return ops.record_capital(amount, method, "", note)
+
+    @tool
+    def record_drawing(amount: float, method: str = "cash", note: str = "") -> dict:
+        """The owner took money out of the business for himself (drawings)."""
+        return ops.record_drawing(amount, method, "", note)
+
+    @tool
+    def record_loan(lender: str, amount: float, method: str = "bank", kind: str = "informal", terms: str = "") -> dict:
+        """A loan received: the lender as the user named them, the amount, and how it came in."""
+        return ops.record_loan(lender, amount, method, kind, "", terms)
+
+    @tool
+    def repay_loan(loan_id: str, principal: float, interest: float = 0.0, method: str = "bank") -> dict:
+        """Repay part of a loan (LN-...)."""
+        return ops.repay_loan(loan_id, principal, interest, method)
+
+    @tool
+    def add_fixed_asset(name: str, cost: float, category: str = "vehicle", life_months: int = 60, funded_by: str = "paid", method: str = "") -> dict:
+        """A fixed asset bought (a vehicle, a generator...): name and cost as the user wrote them."""
+        return ops.add_fixed_asset(name, cost, category, life_months, "", funded_by, method)
+
+    @tool
+    def dispose_fixed_asset(asset_id: str, proceeds: float, method: str = "cash") -> dict:
+        """A fixed asset sold or scrapped."""
+        return ops.dispose_fixed_asset(asset_id, proceeds, method)
+
+    @tool
+    def run_depreciation(through_period: str) -> dict:
+        """Book depreciation up to a month ('YYYY-MM')."""
+        return ops.run_depreciation(through_period)
+
+    @tool
+    def post_journal_entry(entry_date: str, memo: str, lines: list[dict], kind: str = "general") -> dict:
+        """A manual journal entry (owner): lines [{"code", "debit"|"credit"}] that balance."""
+        return ops.post_journal_entry(entry_date, memo, lines, kind)
+
+    @tool
+    def reverse_journal_entry(je_id: str, reason: str) -> dict:
+        """Reverse a journal entry (JV-...)."""
+        return ops.reverse_journal_entry(je_id, reason)
+
+    @tool
+    def reverse_account_transfer(transfer_id: str, reason: str) -> dict:
+        """Reverse a transfer between own accounts (XFR-...)."""
+        return ops.reverse_account_transfer(transfer_id, reason)
+
+    @tool
+    def post_cash_difference(count_id: str) -> dict:
+        """Book the difference a cash count found (CC-...)."""
+        return ops.post_cash_difference(count_id)
+
+    @tool
+    def record_opening_balances(as_of: str, money: list[dict], assets: list[dict] | None = None, loans: list[dict] | None = None) -> dict:
+        """The books' opening balances: money accounts, assets and loans on a date."""
+        return ops.record_opening_balances(as_of, money, assets, loans)
+
+    @tool
+    def close_period(through_date: str, note: str = "") -> dict:
+        """Close the books through a date (a month end): nothing earlier can change after."""
+        return ops.close_period(through_date, note)
+
+    @tool
+    def reopen_period(close_id: int, reason: str) -> dict:
+        """Reopen a closed period, with a reason."""
+        return ops.reopen_period(close_id, reason)
+
+    money_tools = [list_employees, find_employee, payroll_preview, payroll_register, payslip, my_payslips, staff_advances_report, statutory_summary,
+                   record_attendance, add_employee, update_employee, rehire_employee, set_pay_structure, set_commission_rule, end_employment,
+                   add_payroll_adjustment, void_payroll_adjustment, approve_payroll_run, reverse_payroll_run, pay_salaries, reverse_salary_payment,
+                   give_staff_advance, repay_staff_advance, reverse_staff_advance, record_statutory_payment, add_statutory_rate, set_payroll_settings,
+                   money_accounts, account_book, reconciliation_status, trial_balance, income_statement, balance_sheet, cash_flow, owner_kpis,
+                   margins_report, fixed_assets_register, loans_report, period_status, list_attachments, transfer_between_accounts, count_cash,
+                   mark_cleared, save_reconciliation, add_money_account, set_method_route, record_capital, record_drawing, record_loan, repay_loan,
+                   add_fixed_asset, dispose_fixed_asset, run_depreciation, post_journal_entry, reverse_journal_entry, reverse_account_transfer,
+                   post_cash_difference, record_opening_balances, close_period, reopen_period]
+
+    all_tools = money_tools + [find_customer, get_customer_khata, search_products, get_stock, list_orders, get_order,
                  list_routes, list_vehicles, get_plan, list_stops, aging_report, get_digest, suggest_dispatch,
                  create_order, update_order, confirm_order, cancel_order, allocate_order, create_dispatch_plan, approve_dispatch_plan,
                  adjust_stock, transfer_stock, close_stop, record_deposit, credit_note, record_payment, record_expense, cashbook,
