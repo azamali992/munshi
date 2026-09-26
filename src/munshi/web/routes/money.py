@@ -1,5 +1,9 @@
 """Money: khata, payments received, credit notes, purchases and payables,
-expenses, reminders and promises, and the outbox of messages to customers."""
+expenses, reminders and promises, and the outbox of messages to customers.
+
+Payments, expenses, purchases and supplier payments take an optional `account_id` (the money account the money
+landed in or left -- Stream B); purchases also take the `method` of what was paid there and then. Leaving them out
+changes nothing: the method's route on the day decides (cash -> the drawer), exactly as before V8."""
 from __future__ import annotations
 
 from dataclasses import asdict
@@ -18,6 +22,7 @@ class PaymentIn(BaseModel):
     amount: float = Field(gt=0)
     method: str = Field(default="cash", pattern="^(cash|bank|jazzcash|easypaisa|cheque)$")
     ref: str = Field(default="", max_length=80)
+    account_id: str | None = Field(default=None, min_length=2, max_length=40)
 
 
 class CreditNoteIn(BaseModel):
@@ -43,12 +48,15 @@ class PurchaseIn(BaseModel):
     items: list[PurchaseLine] = Field(min_length=1)
     invoice_ref: str = Field(default="", max_length=40)
     paid_amount: float = Field(default=0, ge=0)
+    method: str = Field(default="cash", pattern="^(cash|bank|jazzcash|easypaisa|cheque)$")
+    account_id: str | None = Field(default=None, min_length=2, max_length=40)
 
 
 class SupplierPayIn(BaseModel):
     amount: float = Field(gt=0)
     method: str = Field(default="cash", pattern="^(cash|bank|jazzcash|easypaisa|cheque)$")
     ref: str = Field(default="", max_length=80)
+    account_id: str | None = Field(default=None, min_length=2, max_length=40)
 
 
 class ExpenseIn(BaseModel):
@@ -56,6 +64,7 @@ class ExpenseIn(BaseModel):
     amount: float = Field(gt=0)
     note: str = Field(default="", max_length=120)
     method: str = Field(default="cash", pattern="^(cash|bank|jazzcash|easypaisa|cheque)$")
+    account_id: str | None = Field(default=None, min_length=2, max_length=40)
     expense_date: str | None = Field(default=None, pattern="^\\d{4}-\\d{2}-\\d{2}$")
 
 
@@ -101,6 +110,14 @@ def khata_one(customer_id: str, c: Ctx = Depends(context("khata:read"))):
 
 @router.post("/payments", status_code=201)
 def payment(body: PaymentIn, c: Ctx = Depends(context("payments:write"))):
+    if body.account_id:     # the tools layer (Stream D) takes no account yet: the same write and receipt as ops.record_payment, with the account
+        e = c.repo.record_payment(body.customer_id, body.amount, body.method, body.ref, "hisaab_munshi", c.signature, account_id=body.account_id)
+        cust = c.repo.get_customer(body.customer_id)
+        c.repo.queue_message("whatsapp", cust.phone, f"{c.repo.business_name}: Rs {abs(e.amount):,.0f} received ({e.method}). Receipt {e.entry_id}. "
+                             f"Balance now Rs {c.repo.outstanding(body.customer_id):,.0f}. Shukriya.", e.entry_id)
+        r = asdict(e) | {"customer_name": cust.name, "outstanding": c.repo.outstanding(body.customer_id), "account_id": body.account_id}
+        c.platform.deliver_messages()
+        return r
     r = c.platform.ops.record_payment(body.customer_id, body.amount, body.method, body.ref, approved_by=c.signature)
     c.platform.deliver_messages()
     return r
@@ -128,6 +145,10 @@ def purchases(supplier_id: str = "", c: Ctx = Depends(context("purchases:read"))
 
 @router.post("/purchases", status_code=201)
 def purchase(body: PurchaseIn, c: Ctx = Depends(context("purchases:write"))):
+    if body.account_id or body.method != "cash":      # same write as ops.record_purchase, paid by another method / from an account
+        p = c.repo.record_purchase(body.supplier_id, body.warehouse_id or c.repo.default_warehouse_id(), [l.model_dump() for l in body.items], body.invoice_ref,
+                                   body.paid_amount, "khareed_munshi", c.signature, method=body.method, account_id=body.account_id)
+        return asdict(p) | {"supplier_name": c.repo.get_supplier(body.supplier_id).name, "balance": c.repo.supplier_balance(body.supplier_id)}
     return c.platform.ops.record_purchase(body.supplier_id, [l.model_dump() for l in body.items], body.warehouse_id, body.invoice_ref, body.paid_amount, approved_by=c.signature)
 
 
@@ -148,6 +169,9 @@ def supplier_khata(supplier_id: str, c: Ctx = Depends(context("purchases:read"))
 
 @router.post("/suppliers/{supplier_id}/pay", status_code=201)
 def pay_supplier(supplier_id: str, body: SupplierPayIn, c: Ctx = Depends(context("settings:write"))):   # owner only
+    if body.account_id:
+        e = c.repo.pay_supplier(supplier_id, body.amount, body.method, body.ref, "khareed_munshi", c.signature, account_id=body.account_id)
+        return asdict(e) | {"supplier_name": c.repo.get_supplier(supplier_id).name, "balance": c.repo.supplier_balance(supplier_id), "account_id": body.account_id}
     return c.platform.ops.pay_supplier(supplier_id, body.amount, body.method, body.ref, approved_by=c.signature)
 
 
@@ -190,7 +214,7 @@ def expenses(start: str = "", end: str = "", c: Ctx = Depends(context("reports:r
 
 @router.post("/expenses", status_code=201)
 def add_expense(body: ExpenseIn, c: Ctx = Depends(context("expenses:write"))):
-    return asdict(c.repo.record_expense(body.category, body.amount, body.note, body.method, c.who, c.role, c.signature, body.expense_date))
+    return asdict(c.repo.record_expense(body.category, body.amount, body.note, body.method, c.who, c.role, c.signature, body.expense_date, account_id=body.account_id))
 
 
 @router.post("/expenses/{expense_id}/reverse", status_code=201)

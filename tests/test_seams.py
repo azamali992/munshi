@@ -266,11 +266,13 @@ def test_repository_skeletons_compose_without_shadowing_and_default_safely():
         assert not own & old, f"{mixin.__name__} would shadow {own & old}"
     r = MunshiRepository(":memory:")
     assert r.assert_period_open("2026-09-26") is None
-    assert (r.resolve_account("cash"), r.resolve_account("bank"), r.resolve_account("bank", "ACC-HBL")) == ("CASH", None, "ACC-HBL")
+    # Stream B landed: an unrouted method resolves to the virtual UNASSIGNED account, never None (SEAMS §7)
+    assert (r.resolve_account("cash"), r.resolve_account("bank"), r.resolve_account("bank", "ACC-HBL")) == ("CASH", accounts.UNASSIGNED_ACCOUNT_ID, "ACC-HBL")
     assert r.payroll_profile() == accounts.PROFILE_PLC_2026 == accounts.DEFAULT_PAYROLL_PROFILE      # owner decision 1
     r.set_setting("payroll_profile", "legacy_1969"); assert r.payroll_profile() == "legacy_1969"
     assert r._payroll_postings("2026-09-01", "2026-09-30") == [] and set(r.payroll_liabilities_paisa().values()) == {0}
-    for call in (lambda: r.payroll_register(period="2026-09"), lambda: r.balance_sheet(), lambda: r.store_attachment(b"x", "a.jpg", "image/jpeg", "u", "a")):
+    assert r.balance_sheet()["balanced"]                                  # Stream B landed
+    for call in (lambda: r.payroll_register(period="2026-09"), lambda: r.store_attachment(b"x", "a.jpg", "image/jpeg", "u", "a")):
         with pytest.raises(NotImplementedError):
             call()
 

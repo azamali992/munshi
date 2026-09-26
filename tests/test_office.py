@@ -225,7 +225,7 @@ def test_v7_applies_to_a_v6_file_and_captures_changes_from_then_on(tmp_path, mon
     conn.execute("INSERT INTO products (sku, name, unit_price, aliases, units_per_load, cost_price) VALUES ('X-1','X',10000,'[]',1,9000)")
     conn.close(); monkeypatch.undo()
     r = MunshiRepository(path)
-    assert migrations.current_version(r._conn) == 7 and r._one("SELECT COUNT(*) n FROM price_history")["n"] == 0   # nothing invented for the past
+    assert migrations.current_version(r._conn) == migrations.MIGRATIONS[-1][0] and r._one("SELECT COUNT(*) n FROM price_history")["n"] == 0   # nothing invented for the past
     p = r.get_product("X-1"); p.unit_price = 120; r.upsert_product(p)
     assert [(x["old"], x["new"]) for x in r.price_history("X-1", include_cost=True)] == [(100.0, 120.0)]
     r.close()
