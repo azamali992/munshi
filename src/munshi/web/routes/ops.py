@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import os
 from dataclasses import asdict
+from types import SimpleNamespace
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, ConfigDict, Field
 
 from munshi.domain.models import Order, today_iso
+from munshi.platform import PAY_PRIVATE, audit_args
 from munshi.safety.risk import approval_refusal, approver_for, role_may_approve, stricter_role
 from munshi.web.deps import Ctx, context
 
@@ -151,9 +153,16 @@ def _confirm_needs(c: Ctx, o: Order) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------- chat + approvals
+def _thread(c: Ctx, thread_id: str) -> str:
+    """Each person's own conversation: the client names a thread ("main"), the server scopes it to the signed-in
+    user. One shared thread let a clerk read the owner's typed salary messages and share the owner's topic memory
+    ("uska balance" about the owner's customer)."""
+    return f"{c.principal.user_id}.{thread_id}"
+
+
 @router.post("/chat")
 def chat(body: ChatIn, c: Ctx = Depends(context("chat"))):
-    r = c.platform.handle_message(body.thread_id, c.role, body.text.strip(), user=c.who, user_id=c.principal.user_id,
+    r = c.platform.handle_message(_thread(c, body.thread_id), c.role, body.text.strip(), user=c.who, user_id=c.principal.user_id,
                                   attachment_ids=[a.strip()[:40] for a in body.attachment_ids if a.strip()])
     return {"text": r.text, "specialist": r.specialist, "pending": _reply_card(c, r)} | _tables(r)
 
@@ -177,7 +186,7 @@ def _reply_card(c: Ctx, r) -> dict | None:
 
 @router.get("/chat/{thread_id}")
 def history(thread_id: str, c: Ctx = Depends(context("chat"))):
-    return c.repo.chat_history(thread_id)
+    return c.repo.chat_history(_thread(c, thread_id))
 
 
 @router.get("/approvals")
@@ -187,7 +196,12 @@ def approvals(c: Ctx = Depends(context("approvals:read"))):
 
 @router.get("/approvals/history")
 def approvals_history(c: Ctx = Depends(context("approvals:read"))):
-    return c.repo.approval_history(100)
+    rows = c.repo.approval_history(100)
+    if c.principal.can("payroll:read"):
+        return rows
+    # salaries are the owner's alone (owner decision 2): a payroll card's figures and note never reach a clerk
+    return [r | {"args": audit_args(SimpleNamespace(tool=r["tool"], args=r["args"])), "note": ""} if r["tool"] in PAY_PRIVATE else r
+            for r in rows]
 
 
 @router.post("/approvals/{approval_id}")
@@ -374,5 +388,5 @@ async def voice(thread_id: str = "main", audio: UploadFile = File(...), c: Ctx =
     tr = Groq(api_key=key).audio.transcriptions.create(file=(audio.filename or "note.webm", data), model="whisper-large-v3",
                                                         language="ur" if os.environ.get("VOICE_LANG", "auto") == "ur" else None)
     text = tr.text.strip()
-    r = c.platform.handle_message(thread_id, c.role, text, user=c.who)
+    r = c.platform.handle_message(_thread(c, thread_id), c.role, text, user=c.who, user_id=c.principal.user_id)
     return {"transcript": text, "text": r.text, "specialist": r.specialist, "pending": _reply_card(c, r)} | _tables(r)

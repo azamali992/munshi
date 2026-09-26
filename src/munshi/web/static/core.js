@@ -75,7 +75,7 @@ window.M = (() => {
     if (res.status === 503 && body && body.detail === 'offline') { state.online = false; paintOnline(); throw new ApiError(t('offline'), 0); }   // the service worker's offline reply
     if (!res.ok) throw new ApiError(typeof body === 'object' && body.detail ? (typeof body.detail === 'string' ? body.detail
       : Array.isArray(body.detail) ? body.detail.map(d => d && d.msg ? `${(d.loc || []).slice(1).join(' ')}${d.loc && d.loc.length > 1 ? ': ' : ''}${d.msg}` : JSON.stringify(d)).join('; ')   // FastAPI 422: readable, not raw JSON
-      : JSON.stringify(body.detail)) : String(body).slice(0, 200), res.status);
+      : body.detail.message || body.detail.detail || JSON.stringify(body.detail)) : String(body).slice(0, 200), res.status);   // {error, message}: the words, not the JSON
     return body;
   }
   const post = (p, b) => api(p, { method: 'POST', body: JSON.stringify(b ?? {}) });
