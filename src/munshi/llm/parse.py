@@ -50,7 +50,7 @@ _NEGATION = {fold(w) for w in "nahi nahin nai na mat not no without bina baghair
 _CAP = [fold(p) for p in ("se zyada", "se ziada", "se zaida", "se kam", "zyada se zyada", "kam se kam", "at most", "at least", "maximum",
                           "max", "upto", "up to", "سے زیادہ", "سے کم")]
 _RETURN = {fold(w) for w in "wapis wapas wapsi returned return returns واپس".split()}
-_DELIVER = {fold(w) for w in "delivered deliver diya de utara utar diye دیا ڈیلیور".split()}
+_DELIVER = {fold(w) for w in "delivered deliver diya de utara utar utaar utari diye li liye liya دیا ڈیلیور".split()}
 _ALL = {fold(w) for w in "all sab saara sara poora pura complete full سب سارا پورا".split()}
 _CASH = {fold(w) for w in "cash nakad naqd naqad paise paisay raqam rs rupay rupees نقد پیسے رقم روپے".split()}
 _BOUNCE = re.compile(r"\b(bounce|bounced|bouncing|dishono(u)?r(ed)?)\b|باونس|چیک واپس|(cheque|check|chq) (wapi?s|wapas|return)")
@@ -474,6 +474,19 @@ def analyse_close(text: str, repo: MunshiRepository) -> CloseParse:
     ends = {ln_.hi: ln_ for ln_ in ln.lines}
     own: dict[int, str] = {}
     marks = sorted((i, "ret" if t in _RETURN else "del") for i, t in enumerate(toks) if t in _RETURN or t in _DELIVER)
+    # Word order: 'delivered 8 npk, returned 2 npk' puts the word BEFORE its line; Urdu '15 urea li, 5 urea wapis' puts it
+    # AFTER. A mark touching only the line before it votes 'after'; one touching only the line after it votes 'before'; a
+    # mark touching both (or neither) follows the message's vote (ties: before, as it always was).
+    def _prev_end(i: int) -> int:
+        k = i - 1
+        while k >= 0 and toks[k] in N.UNIT_WORDS:
+            k -= 1
+        return k
+    votes = 0
+    for i, _ in marks:
+        before, after = _prev_end(i) in ends, (i + 1) in starts
+        votes += 1 if before and not after else -1 if after and not before else 0
+    post = votes > 0
     for i, kind in marks:
         j = i + 1
         while j < len(toks) and toks[j] in _CONJ:
@@ -481,7 +494,9 @@ def analyse_close(text: str, repo: MunshiRepository) -> CloseParse:
         k = i - 1
         while k >= 0 and toks[k] in N.UNIT_WORDS:
             k -= 1
-        if j in starts:
+        if post and k in ends:
+            own.setdefault(id(ends[k]), kind)
+        elif j in starts:
             own.setdefault(id(starts[j]), kind)
         elif k in ends:
             own.setdefault(id(ends[k]), kind)
@@ -574,7 +589,7 @@ def method_in(text: str) -> str:
 
 # ------------------------------------------------------------------ dates
 _WEEKDAYS = {0: "monday somwar peer pir", 1: "tuesday mangal", 2: "wednesday budh", 3: "thursday jumerat jumeraat",
-             4: "friday jumma juma jummah jumah جمعہ", 5: "saturday", 6: "sunday itwar itwaar اتوار"}
+             4: "friday jumma juma jummah jumah jumme jumay jume جمعہ جمعے", 5: "saturday", 6: "sunday itwar itwaar اتوار"}
 _MONTHS = {m: i for i, ms in enumerate(["jan january", "feb february", "mar march", "apr april", "may", "jun june", "jul july",
                                         "aug august", "sep sept september", "oct october", "nov november", "dec december"], 1) for m in ms.split()}
 

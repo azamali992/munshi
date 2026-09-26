@@ -91,6 +91,13 @@ bana banao kar karo kardo chalo go ہاں جی ٹھیک بالکل وہی""".spl
 _YES_FILL = frozenset(fold(w) for w in """he hai hy do dein den dijiye de diya lo please plz pls wala wali wale ye yeh wo woh isi usi ko bhai sahab
 is it that one this the kar karo same ہے دو دیں""".split())
 _POINT = frozenset(fold(w) for w in "ye yeh wo woh wala wali wale isi usi yahi yehi wahi wohi this that یہ وہ".split())
+_DATE_WORDS = frozenset(fold(w) for w in """agle agla agli next tak jumme jumma juma jummah hafte hafta mahine mahina kal parson tareekh tarikh din
+din mein somwar mangal budh jumerat itwar week month tomorrow تک جمعہ ہفتے""".split())
+_FROM_THIS = re.compile(r"\b(is|us|in|un)\s*(mei|me|mein|main|mai|may)\s*(se|say|sy)?\b|\bisme\b|\binme\b|\bof (these|those|them)\b|اس میں|ان میں")
+_DAMAGE = contains("damage", "damaged", "phat", "phati", "phata", "phati hui", "kharab", "toot", "tooti", "tuti", "nikal do", "write off", "خراب")
+# an explicit 'make the order' ('chalo pehle order bana do 20 urea ka') -- a bare '20 urea bhej do' still asks which customer
+_ORDER_VERB = contains("order bana do", "order banao", "order bana dein", "order bana den", "order likho", "order likh do", "order kar do", "order laga do",
+                       "order book karo", "order book kar do")
 _CORRECTION = contains("correction", "correct", "adjust", "adjustment", "galti", "ghalti", "sahi karo", "sahi kar do", "theek karo", "theek kar do",
                        "count", "ginti", "درستی", "غلطی")
 
@@ -173,6 +180,8 @@ def answer(ask: dict, text: str, repo) -> tuple[str, str | None] | None:
     if slot == "dispatch":                          # a dispatch suggestion: 'theek he, bana do' takes the only one, 'doosra' picks one
         n = ordinal(text) or (1 if len(cands) == 1 and is_yes(text) else None)
         return (str(cands[n - 1]["id"]), ask.get("specialist") or "godown") if n and 0 < n <= len(cands) else None
+    if slot == "intents":                           # 'haan' to 'a payment and an order -- one card at a time?'
+        return ("intents", ask.get("specialist")) if cands and is_yes(text) else None
     if slot == "split":                             # 'haan' to 'one card per customer?'
         if cands and (is_yes(text) or (contains("dono", "donon", "both", "alag", "separate", "sab", "دونوں")(text) and len(words(fold(text))) <= 5
                                        and not customer_resolution(text, repo).ok)):
@@ -197,13 +206,17 @@ def answer(ask: dict, text: str, repo) -> tuple[str, str | None] | None:
         return f"{base} {rid}", None
     if slot == "amount":
         a = amount_in(text)
-        if a.amount is None or _leftover(text, lambda w: w in _MONEY_WORDS):
+        # the answer may repeat who it is about and add the date asked for too ('chaudhry farms 30000 agle jumme tak')
+        who = customer_resolution(base, repo)
+        if a.amount is None or _leftover(text, lambda w: w in _MONEY_WORDS or w in _DATE_WORDS or bool(date_in(w)) or (who.ok and is_res_word(w, who))):
             return None
         first = amount_in(base)
         if first.amount is None and first.problem.startswith("which amount"):
             # 'which amount? I see 4512, 50000' -> '50000': the other figures in the request were not the amount
             keep = N._fmt(a.amount)
             base = re.sub(r"(?<![\w.])\d[\d,]*(?:\.\d+)?(?![\w.])", lambda m: m.group(0) if m.group(0).replace(",", "") == keep else " ", base)
+        if date_in(text):                           # the answer's own date wins over any vaguer one in the request ('agle hafte')
+            return f"{text.strip()} -- {base}", None
         return f"{base} {text.strip()}", None
     if slot == "date":
         if not date_in(text) or _leftover(text, lambda w: bool(date_in(w)) or w in ("tak", "ko", "pe", "tomorrow", "kal", "parson", "din", "day")):
@@ -222,6 +235,15 @@ def answer(ask: dict, text: str, repo) -> tuple[str, str | None] | None:
         if len(oid) != 1 or _leftover(text, lambda w: w in ("ord", "order", "wala")):
             return None
         return f"{base} {oid[0]}", None
+    if slot == "entry":                             # 'which receipt?' -> 'doosra' / '20000 wali'
+        n = ordinal(text) or (1 if len(cands) == 1 and is_yes(text) else None)
+        if n is None:
+            a = amount_in(text).amount
+            if a is None or _leftover(text, lambda w: w in _MONEY_WORDS or w in ("payment", "receipt", "raseed", "entry", "cheque", "check")):
+                return None
+            hits = [i for i, c in enumerate(cands, 1) if abs(float(c.get("amount") or 0) - a) < 0.01]
+            n = hits[0] if len(hits) == 1 else None
+        return (f"{base} {cands[n - 1]['id']}", ask.get("specialist")) if n and 0 < n <= len(cands) else None
     if slot == "otp":
         m = re.fullmatch(r"\W*(?:(?:sorry|maaf|ji|jee|acha|ok|galti|ghalti|ye lo|yeh lo|ye|yeh|sahi|asal|correct|right|new|naya|dusra|doosra)\W+)*"
                          r"(?:otp|code|pin|او ٹی پی|کوڈ)?\s*(?:hai|he|is|:|-)?\s*(\d{4,6})\s*(?:hai|he|tha|hy)?\s*[.!]?\s*", fold(text))
@@ -288,6 +310,9 @@ def augment(text: str, topic: dict | None, repo) -> tuple[str, dict | None]:
         return f"{text} {topic['product']['sku']} stock kitna hai", {"kind": "product", "id": topic["product"]["sku"], "name": topic["product"]["name"]}
     if topic.get("product") and not named.get("product") and pron and _STOCKISH(text):
         return f"{text} {topic['product']['sku']}", {"kind": "product", **{"id": topic["product"]["sku"], "name": topic["product"]["name"]}}
+    # 'is mei se 6 bori phati hui thi, damage likh do' right after the urea truck: that product
+    if topic.get("product") and not named.get("product") and _FROM_THIS.search(fold(text)) and _DAMAGE(text) and re.search(r"\d", text):
+        return f"{text} {topic['product']['sku']}", {"kind": "product", "id": topic["product"]["sku"], "name": topic["product"]["name"]}
     if WHOLE_BUSINESS(text) and not strong:
         return text, None
     for k in ([kind] if kind in ("customer", "supplier") else []) + ["customer", "supplier"]:
@@ -296,7 +321,9 @@ def augment(text: str, topic: dict | None, repo) -> tuple[str, dict | None]:
             continue
         intent = _CUSTOMER_INTENT(text) if k == "customer" else _SUPPLIER_INTENT(text)
         items = bool(analyse_order(text, repo).items)
-        if (strong and (intent or items or short)) or (pron and intent) or (intent and short and not items):
+        # 'chalo pehle order bana do 20 urea ka' right after talking about Rana: an order for them (the card says so)
+        order_for_topic = k == "customer" and items and len(words(fold(text))) <= 10 and _ORDER_VERB(text)
+        if (strong and (intent or items or short)) or (pron and intent) or (intent and short and not items) or order_for_topic:
             return f"{text} {ent['id']}", {"kind": k, "id": ent["id"], "name": ent["name"]}
         break
     return text, None

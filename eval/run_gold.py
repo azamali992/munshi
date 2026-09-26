@@ -17,8 +17,9 @@ Every record runs on a fresh in-memory platform (so records are independent) wit
 fixtures: two extra customers (C-011 Chaudhry Traders, C-012 Malik Seeds) so 'Chaudhry'
 and 'Malik' are genuinely ambiguous, a draft order, a confirmed order, a loaded plan
 with one stop (and its OTP), and a planned-but-unloaded plan. Placeholders in the
-corpus ({ORD_DRAFT} {ORD_CONF} {DSP} {DSP_PLANNED} {STP} {OTP} {LAST_ORD}
-{NEXT_FRIDAY}) are filled from those fixtures.
+corpus ({ORD_DRAFT} {ORD_CONF} {DSP} {DSP_PLANNED} {STP} {OTP} {LAST_ORD} {LAST_RCP}
+{NEXT_FRIDAY}) are filled from those fixtures ({LAST_ORD} / {LAST_RCP}: the last order / receipt a context
+turn's reply named).
 
 Corpus schema (one JSON object per line): id, role, text, lang, tags[], context[]
 (prior turns on the same thread: {role, text, approve}), expect{specialist
@@ -279,6 +280,9 @@ def score_record(p, ctx: dict, rec: dict) -> dict:
         m = re.search(r"(ORD-[A-Z0-9]{8})", txt)
         if m:
             ctx["LAST_ORD"] = m.group(1)
+        m = re.search(r"(RCP-\d{4}-\d{6})", txt)           # the receipt an approved payment made (for a reversal record)
+        if m:
+            ctx["LAST_RCP"] = m.group(1)
     exp = fill(rec["expect"], ctx)
     text = fill(rec["text"], ctx)
     w0 = agent_writes(p)
@@ -294,6 +298,8 @@ def score_record(p, ctx: dict, rec: dict) -> dict:
     spec = reply.specialist if reply else None
     engine = getattr(reply, "engine", "rules") if reply else "rules"
     calls = turn_tool_calls(p, thread, rec["role"], spec, before, engine) if reply else []
+    if not calls and reply is not None and getattr(reply, "call", None):
+        calls = [reply.call]            # a call that ran on a graph lane (a card of this role was waiting on the main thread)
     refused = guard_refusals(p, thread, rec["role"], spec, before) if reply and engine == "model" else []
     pending = reply.pending if reply else None
     # the action is the card, else the first call that isn't a name lookup: a model looks the customer up
