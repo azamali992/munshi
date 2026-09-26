@@ -102,10 +102,12 @@ _MONEY = r"(lakh|lac|hazar|hazaar|crore|karor|\brs\b|rupay|rupees|rupe|روپ|ل
 _DESTROY = _rx(r"\b(delete|mita|mitao|mita do|wipe|erase|truncate|drop table|saaf kar)\b|مٹا|ڈیلیٹ|حذف")
 _SECRET = _rx(r"\b(pin|password|passcode|pass word)\b|پن کوڈ|پاس ورڈ|\b(otp|code|کوڈ)\b.{0,12}\b(kya|batao|bata|bhejo|dikhao|share|tell|what)\b"
               r"|\b(what|tell|share)\b.{0,12}\b(otp|code)\b|او ٹی پی.{0,12}(کیا|بتاو)")
-_EDIT = _rx(r"\b(naam|name|phone|number|address|rate|price)\b.{0,20}\b(badal|badlo|change|rename|update|edit)\b|\brename\b")
+_EDIT = _rx(r"\b(naam|name|phone|number|address|rate|price)\b.{0,20}\b(badal|badlo|change|rename|update|edit)\b|\brename\b"
+            r"|\b(rate|price|qeemat|keemat|bhao)\b\s*(?:rs\.?\s*)?\d+\s*(kar do|kardo|karo|kar dein|kr do|set)\b")
 _BYPASS = _rx(r"\b(approve|approval|manzoor)\w*\b.{0,30}\b(bina|without|khud|sab|all|every|pending)\b|\bbina (pooch|puch)|"
               r"\b(sab|all|every)\b.{0,20}\b(approve|approvals|manzoor)\b|ignore (all |the )?(previous|above|earlier) instructions|approvals? (off|disabled|band)")
-_GREET = _rx(r"^\W*(assalam|asalam|salam|slam|aoa|a\.o\.a|hello|hi|hey|salaam|adaab|good (morning|evening))\b|السلام|^\W*سلام")
+_GREET = _rx(r"^\W*(assalam|asalam|salam|slam|aoa|a\.o\.a|hello|hi|hey|salaam|adaab|good (morning|evening|afternoon)|subah? ba?khair|subha ba?khair|"
+             r"shab ba?khair)\b|السلام|^\W*سلام|صبح بخیر")
 _THANKS = _rx(r"\b(shukriya|shukria|thanks|thank you|thx|jazakallah|meherbani)\b|شکریہ")
 _BYE = _rx(r"\b(khuda hafiz|allah hafiz|bye|baad mein|kal baat)\b|خدا حافظ|اللہ حافظ")
 _ACK = _rx(r"^\W*(ok|okay|theek|thik|haan|han|ji|jee|acha|achha|done|👍|✅)\W*(hai|he|bhai|g)?\W*$")
@@ -115,7 +117,8 @@ _ARRIVED = _rx(r"\b(aaye|aaya|aayi|aye|aya|ayi|ayein|aayein|aaein|aain|aa gaye|a
 _INCREASE = _rx(r"\b(increase|brha|barha|bara do|badha|barhao|brhao|barhado|brhado|add|adjust|plus)\b|بڑھا")
 # whole-business questions: nobody named, the answer is a list across the business
 _PAID_TODAY = _all(_rx(r"\b(aaj|aj|today|todays|today's)\b|آج|اج"),
-                   _rx(r"\b(payment|payments|paid|paise|paisay|collection|collections|wasooli|wusooli|jama|received|recovery)\b|ادائیگی|جمع|وصول|پیسے"),
+                   _rx(r"\b(payment|payments|paid|paise|paisay|collection|collections|wasooli|wusooli|jama|received|recovery|bank|online|jazz ?cash|"
+                       r"easy ?paisa|cheque)\b|ادائیگی|جمع|وصول|پیسے|بینک"),
                    _none(_rx(r"\d{3,}")))
 _RECEIVABLES = _all(_rx(r"\b(kis|kin|kaun|kon|who|which|sab|sabhi|saare|sare|list|kaunse|konse|kinse)\b|کس|کون|سب|لسٹ"),
                     _rx(r"\b(paise|paisay|dena|dene|lene|lena|udhaar|udhar|owe|owes|owing|baqi|baaki|receivable|receivables|outstanding)\b|پیسے|ادھار|ادہار|باقی"),
@@ -165,6 +168,10 @@ def _stub(repo=None) -> StubToolCallingModel:
         from munshi.llm.parse import customer_resolution
         return customer_resolution(t, repo).status == "ambiguous"
 
+    def _rev_intent(t: str) -> bool:
+        from munshi.llm.turns import rev_intent
+        return rev_intent(t)
+
     def _godowns(n: int):
         def pred(t: str) -> bool:
             if repo is None:
@@ -176,8 +183,12 @@ def _stub(repo=None) -> StubToolCallingModel:
     return StubToolCallingModel(rules=[
         # 1. never business: refused by the help desk
         R(_DESTROY, "route_to_help"), R(_SECRET, "route_to_help"), R(_EDIT, "route_to_help"), R(_PERSONAL, "route_to_help"),
+        # deciding cards from chat ('malik wala reject kar do, baqi sab approve kar do'): decisions are taken on the cards
+        R(_all(_BYPASS, _rx(r"\b(approve|reject|manzoor|radd)\w*\b")), "route_to_help"),
         # reversals and credit notes (kept first: 'damaged' / 'transfer' must not pull them elsewhere) -- 'chhoot' is a discount given
         R(contains("credit note", "refund", "waive", "maaf", "chhoot", "chhot", "riayat", "riyayat", "رعایت", "چھوٹ"), "route_to_hisaab"),
+        # undoing a customer's payment ('X ki 20000 wali entry galat thi, cancel kar do'): hisaab, never the order desk's 'cancel'
+        R(_all(_rev_intent, lambda t: not _supplier(t)), "route_to_hisaab"),
         # a customer's credit limit is on their account (the order desk shows it), not a stock question
         R(_rx(r"\bcredit limit\b|\blimit (kitni|kitna|kya)\b"), "route_to_order"),
         # the day's cash: expenses, the driver's hand-in ('kharche kitne hue aaj', 'driver ka cash pura aya?')
@@ -190,11 +201,18 @@ def _stub(repo=None) -> StubToolCallingModel:
         # whole-business questions (nobody named): who paid today, who owes us -- lists, never 'which customer?'
         R(_all(_PAID_TODAY, _nobody), "route_to_report"),
         R(_all(_RECEIVABLES, _nobody), "route_to_wasooli"),
+        # 'which of my customers are over their credit terms / overdue, and our exposure': the aging list
+        R(_all(_rx(r"\b(over (their |the )?(credit )?terms|overdue|past due|exposure)\b"), _nobody), "route_to_wasooli"),
         # 2. money direction before 'transfer'
+        # money paid to a named SUPPLIER ('ali akbar ko 35000 cash de diye', 'fauji ko 5 lakh ka cheque de diya'): a supplier payment
+        R(_all(_supplier, _rx(r"\bko\b|کو"), _rx(r"\d"),
+               _rx(r"\b(de diya|de diye|de di|diye|diya|payment ki|pay ki|pay kiye|ada ki|ada kiye|bhej diye|bheje)\b|دیے|دیا")), "route_to_khareed"),
         R(_all(_rx(r"\bko\b"), _rx(_MONEY), _rx(r"\b(de do|dedo|de dein|de den|dena hai|pay kar|pay karo|ada kar|transfer kar|bhej de)\b")),
           "route_to_khareed"),
         R(_all(_rx(_MONEY), _rx(r"\b(ne|se)\b"), _rx(r"\b(transfer|diye|di|diya|kiya|kiye|bheje|bheja|jama|aaya|aaye|aayi|dale|daale|mile|mila|received|wasool|wusool|vasool)\b")),
           "route_to_hisaab"),
+        # Urdu script: 'رانا برادرز نے ۲۵۰۰۰ نقد دیے' (a sum a customer paid)
+        R(_all(_rx(r"نے"), _rx(r"\d{3,}"), _rx(r"دیے|دیا|دی|جمع|بھیجے|ادا"), lambda t: not _product(t)), "route_to_hisaab"),
         # 'Rana Brothers ne 20000 diye': a sum paid by someone, with no money word
         R(_all(_rx(r"\bne\b"), _rx(r"(?<![\w-])\d{3,}(?![\w-])"), _rx(r"\b(diye|diya|dia|di|jama|bheje|bheja|transfer|kiye|kiya|karwaye|karwa diye)\b"),
                _none(_rx(r"\b(ord|stp|dsp)-")), lambda t: not _product(t)), "route_to_hisaab"),
@@ -212,6 +230,10 @@ def _stub(repo=None) -> StubToolCallingModel:
         # stock coming in / stock count going up: a godown write, never a stock read ('drip line ke 1000 aur stock ayein')
         R(_all(_rx(r"\d"), lambda t: _product(t) or _STOCK_WORD(t), lambda t: _ARRIVED(t) or _INCREASE(t), _none(_rx(r"\bse\b|سے")), _none(_rx(_MONEY)),
                _none(_rx(r"\b(order|orders)\b"))), "route_to_godown"),
+        # a product at a named godown, no quantity ('vehari mei urea?'): a stock question
+        R(_all(_product, _nobody, _godowns(1), _none(_rx(r"\d"))), "route_to_godown"),
+        # what a product's SKU code is ('sku kya he drip ka?'): the catalogue
+        R(_all(_product, _rx(r"\bsku\b")), "route_to_order"),
         # is a product running low ('cypermethrin kam he kya'), or what does it cost ('What is the price of SOP?')
         R(_all(_product, _nobody, _rx(r"\b(kam|khatam|khatm|low|short|bacha|bachi|bache|finish)\b"), _none(_rx(r"\d{2,}"))), "route_to_godown"),
         R(_all(_product, _nobody, _rx(r"\b(price|rate|qeemat|keemat|bhao|bhav)\b"), _none(_rx(r"\d{2,}"))), "route_to_order"),
@@ -219,6 +241,9 @@ def _stub(repo=None) -> StubToolCallingModel:
         R(_all(_customer, _rx(r"\b(ledger|statement)\b")), "route_to_order"),
         R(contains("restock", "write off", "write-off", "damaged", "transfer", "allocate", "dispatch", "approve dsp", "shift"), "route_to_godown"),
         R(_all(_rx(r"\bdsp-"), _rx(r"\b(approve|load|loading|manzoor)\b")), "route_to_godown"),
+        # a new customer ('party naya he, usman traders khanewal, 0301-...'): the order desk says how one is added
+        R(_rx(r"\b(naya|nayi|naye|new)\b.{0,20}\b(party|customer|gahak|grahak|dukan|client)\b|\b(party|customer|gahak|client)\b.{0,15}\b(naya|nayi|new)\b"),
+          "route_to_order"),
         # 3. business areas
         R(contains("sales report", "profit", "munafa", "margin", "valuation", "slow stock", "dead stock", "top customers", "collection report",
                    "revenue", "bikri", "sale", "sales", "ledger", "movement", "value", "nahi bik", "bik nahi", "not selling", "kamaya", "kamai", "kamaaya",
@@ -250,7 +275,7 @@ def _stub(repo=None) -> StubToolCallingModel:
         # today's run ('aaj ki gaari bana do', 'gaari tayyar karo'): dispatch planning
         R(_rx(r"\b(gaari|gari|gaadi|gadi|گاڑی)\b.{0,20}\b(bana|banao|bana do|tayyar|tayar|ready|nikal\w*|bhej\w*|plan|laga\w*)\b"), "route_to_godown"),
         # a customer's balance asked loosely ('New Kisan Dost wale kitne ke hain abhi tak'): their khata
-        R(_all(_customer, _none(_product), _rx(r"\b(kitne|kitna|kitni)\b"), _none(_rx(r"\d"))), "route_to_order"),
+        R(_all(_customer, _none(_product), _rx(r"\b(kitne|kitna|kitni|paise|paisay|scene|haal)\b"), _none(_rx(r"\d"))), "route_to_order"),
         R(_all(_rx(r"\b(kitni|kitna|kitne|how much|how many|کتنی|کتنا)\b"), _rx(r"\b(hai|he|pari|padi|bachi|baqi hai|پڑی|ہے)\b"),
                _none(_rx(r"\b(baqi|baaki|udhaar|udhar|dena|dene|owe|paise|hisaab|hisab|balance|khata)\b|باقی|ادہار|حساب|کہاتہ|بیلنس"))),
           "route_to_godown"),

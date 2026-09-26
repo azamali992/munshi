@@ -101,6 +101,11 @@ FOLLOWUP_FLOORS = {"gold_user_session": 94.0, "gold_followups": 97.0}     # one 
 # customers merged into one card, a plan card '? on ?', ...). Achieved after the fix: 100%, 0 wrong cards. One message of margin.
 # gold_learned_memory (100%) and gold_hybrid_blind (offline rules: 95%) are gated here too, so none of them can slip unnoticed.
 FOLLOWUP_FLOORS |= {"gold_persona": 98.0, "gold_learned_memory": 96.0, "gold_hybrid_blind": 90.0}
+# Persona round 2 (218 turns with real Gemini; eval/gold_persona2.jsonl, 63 reviewed turns from its failures, re-based on the gold
+# fixture): blind baseline on main f567454 was 17.5% correct (11/63) with 8 WRONG cards (a NEW payment for 'reverse karo', reminders for
+# everyone for 'scene kya he wasooli ka', a confirm card for 'pakka? balance kitna', a close_stop that executed with the returned
+# product swapped). Achieved after the fix: 98.4%, 0 wrong cards. One message of margin.
+FOLLOWUP_FLOORS |= {"gold_persona2": 96.0}
 
 
 @pytest.fixture(scope="module")
