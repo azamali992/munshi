@@ -15,7 +15,7 @@ from PIL import Image
 
 from munshi.domain import accounts, migrations, migrations_attachments
 from munshi.domain.repository import MunshiRepository, NotFoundError
-from munshi.domain.repository.attachments import MAX_EDGE, AttachmentError, ProofsNotEnabled, check_pdf, clean_filename, sniff
+from munshi.domain.repository.attachments import MAX_EDGE, AttachmentError, check_pdf, clean_filename, sniff
 from munshi.web.routes import attachments as routes
 
 OWNER, CLERK, DRIVER, SALESMAN = ("0300-0000001", "1111"), ("0300-0000002", "2222"), ("0300-0000003", "3333"), ("0300-0000004", "4444")
