@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 from datetime import date
 
+from munshi.domain.accounts import CASH_ACCOUNT_ID, PAYROLL_METHOD, PAYROLL_REDACTED_LABEL, RECOVERY_NOTE_PREFIX, SYSTEM_EXPENSE_CATEGORIES
 from munshi.domain.models import (
     CashDeposit,
     Expense,
@@ -48,6 +49,7 @@ SHORTAGE_CATEGORY = "cash_shortage"
 _LEDGER_COLS = "entry_id, customer_id, kind, amount, ref, due_date, created_at, method, received_by, doc_no, reversal_of"
 _SUP_COLS = "entry_id, supplier_id, kind, amount, ref, method, created_at, reversal_of"
 _EXP_COLS = "expense_id, category, amount, note, method, paid_by, expense_date, created_at, reversal_of"
+_DEP_COLS = "deposit_id, plan_id, amount_counted, counted_by, deposited_at"
 _PUR_COLS = "purchase_id, supplier_id, warehouse_id, items, total, invoice_ref, paid_amount, created_at, doc_no, reversal_of"
 
 
@@ -64,11 +66,36 @@ def _approver(approved_by: str | None) -> str:
 
 
 class CashMixin(DispatchMixin):
+    # ------------------------------------------------------------ the account_id column (V8)
+    def _finance_schema(self) -> bool:
+        """V8 (money accounts) is on this file. False only for a file opened by code whose migration list stops at V7
+        (tests of the migration seams); every writer then behaves exactly as it did before V8."""
+        if not self.__dict__.get("_v8_ready"):
+            self.__dict__["_v8_ready"] = bool(self._one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='money_accounts'"))
+        return self.__dict__["_v8_ready"]
+
+    def _with_account(self, cols: str, values: tuple, account_id: str | None) -> tuple[str, tuple, str]:
+        """(columns, values, placeholders) for an INSERT, with account_id when the file has it."""
+        if self._finance_schema():
+            cols, values = cols + ", account_id", values + (account_id or None,)
+        elif account_id:
+            raise StateError("money accounts need the finance upgrade (V8) on this file")
+        return cols, values, ",".join("?" * len(values))
+
+    def _account_of(self, table: str, key: str, row_id: str) -> str | None:
+        """The explicit money account of an existing row (None on history or before V8): a reversal copies it."""
+        if not self._finance_schema(): return None
+        r = self._one(f"SELECT account_id FROM {table} WHERE {key}=?", (row_id,))
+        return r["account_id"] if r else None
+
     # ------------------------------------------------------------ deposits
-    def record_deposit(self, plan_id: str, amount_counted: float, counted_by: str, actor: str) -> dict:
+    def record_deposit(self, plan_id: str, amount_counted: float, counted_by: str, actor: str, account_id: str | None = None) -> dict:
+        """A driver hands in a plan's cash. account_id: the money account it goes into (default: the cash drawer)."""
         counted_p = to_paisa(amount_counted)
         if counted_p < 0: raise ValueError("counted amount cannot be negative")
         with immediate_tx(self) as c:
+            if account_id and not self._money_account(account_id)["active"]:
+                raise StateError(f"money account {account_id} is closed; use an active account")
             plan = self.get_plan(plan_id)
             if plan.status == "planned": raise StateError(f"plan {plan_id} hasn't been loaded yet")
             stops = self._stop_cash_paisa(plan_id)
@@ -76,8 +103,8 @@ class CashMixin(DispatchMixin):
             already_p = self._deposited_paisa(plan_id)
             variance_p = counted_p + already_p - expected_p
             dep = CashDeposit(new_id("DEP"), plan_id, to_rupees(counted_p), counted_by)
-            c.execute("INSERT INTO deposits (deposit_id, plan_id, amount_counted, counted_by, deposited_at) VALUES (?,?,?,?,?)",
-                      (dep.deposit_id, plan_id, counted_p, counted_by, dep.deposited_at))
+            cols, vals, marks = self._with_account(_DEP_COLS, (dep.deposit_id, plan_id, counted_p, counted_by, dep.deposited_at), account_id)
+            c.execute(f"INSERT INTO deposits ({cols}) VALUES ({marks})", vals)
             # attribution: the stop whose cash is closest to the shortfall is the first place to look
             suspects = []
             plate = self.get_vehicle(plan.vehicle_id).plate
@@ -118,8 +145,15 @@ class CashMixin(DispatchMixin):
         key = (SHORTAGE_CATEGORY, len(plan_id) + 1, plan_id + " ")
         booked_p = int(self._one(f"SELECT COALESCE(SUM(amount), 0) s FROM expenses WHERE expense_id IN ({own})", key)["s"])
         reversed_p = int(self._one(f"SELECT COALESCE(SUM(amount), 0) s FROM expenses WHERE reversal_of IN ({own})", key)["s"])
+        # Payroll LOSS recoveries of this plan (Stream A: a negative row, note "RECOVERY <plan_id> <run_id>", method
+        # payroll) are recoveries too: money the driver made good through his salary. They are not part of the
+        # deposit gap, so they don't move the target; but they ARE off the books, so a later hand-in can only recover
+        # what is left after them (a driver who repays twice is flagged by cash-with-drivers, never booked as a gain).
+        rec = f"{RECOVERY_NOTE_PREFIX} {plan_id} "
+        payroll_p = int(self._one("SELECT COALESCE(SUM(amount), 0) s FROM expenses WHERE category=? AND reversal_of IS NULL AND substr(note, 1, ?)=?",
+                                  (SHORTAGE_CATEGORY, len(rec), rec))["s"])
         delta_p = gap_p - booked_p
-        if delta_p < 0: delta_p = -max(0, min(-delta_p, booked_p + reversed_p))     # recover at most what is still on the books
+        if delta_p < 0: delta_p = -max(0, min(-delta_p, booked_p + reversed_p + payroll_p))     # recover at most what is still on the books
         if delta_p == 0: return None
         if delta_p > 0:
             look = "; ".join(f"{sid} {self.get_customer(cid).name} Rs {to_rupees(cash):,.0f}" for sid, cid, cash in suspects)
@@ -145,7 +179,7 @@ class CashMixin(DispatchMixin):
         d = dict(r); d["amount_counted"] = to_rupees(int(d["amount_counted"] or 0)); return CashDeposit(**d)
 
     def deposits(self, plan_id: str) -> list[CashDeposit]:
-        return [self._deposit(r) for r in self._all("SELECT * FROM deposits WHERE plan_id=?", (plan_id,))]
+        return [self._deposit(r) for r in self._all(f"SELECT {_DEP_COLS} FROM deposits WHERE plan_id=?", (plan_id,))]
 
     # ------------------------------------------------------------ khata
     @staticmethod
@@ -172,7 +206,7 @@ class CashMixin(DispatchMixin):
         return int(self._one("SELECT COALESCE(SUM(amount), 0) s FROM ledger")["s"])
 
     def add_ledger(self, customer_id: str, kind: str, amount: float, ref: str, due_date: str | None, actor: str,
-                   approved_by: str | None = None, method: str = "", received_by: str = "") -> LedgerEntry:
+                   approved_by: str | None = None, method: str = "", received_by: str = "", account_id: str | None = None) -> LedgerEntry:
         """Post one khata entry. Invoices are positive, payments and credit notes negative. Invoices,
         receipts, credit notes and opening balances take the next gapless number in their series,
         in the same transaction as the insert."""
@@ -185,17 +219,22 @@ class CashMixin(DispatchMixin):
             self.get_customer(customer_id)
             created_at = now_iso()
             entry_id = next_doc_no(self, c, series, created_at) if series else new_id(kind[:3].upper())
-            c.execute(f"INSERT INTO ledger ({_LEDGER_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                      (entry_id, customer_id, kind, amount_p, ref, due_date, created_at, method, received_by, entry_id if series else None, None))
-            self.audit(actor, f"ledger_{kind}", "ledger", entry_id, {"customer": customer_id, "amount": to_rupees(amount_p), "method": method}, approved_by)
+            cols, vals, marks = self._with_account(_LEDGER_COLS, (entry_id, customer_id, kind, amount_p, ref, due_date, created_at, method, received_by,
+                                                                  entry_id if series else None, None), account_id)
+            c.execute(f"INSERT INTO ledger ({cols}) VALUES ({marks})", vals)
+            self.audit(actor, f"ledger_{kind}", "ledger", entry_id, {"customer": customer_id, "amount": to_rupees(amount_p), "method": method}
+                       | ({"account": account_id} if account_id else {}), approved_by)
         return self.get_ledger_entry(entry_id)
 
-    def record_payment(self, customer_id: str, amount: float, method: str, ref: str, actor: str, approved_by: str | None = None, received_by: str = "") -> LedgerEntry:
-        """A payment received away from the delivery: at the counter, by bank transfer, JazzCash, Easypaisa or cheque."""
+    def record_payment(self, customer_id: str, amount: float, method: str, ref: str, actor: str, approved_by: str | None = None, received_by: str = "",
+                       account_id: str | None = None) -> LedgerEntry:
+        """A payment received away from the delivery: at the counter, by bank transfer, JazzCash, Easypaisa or cheque.
+        account_id: the money account it landed in (default: the method's route on the day -- cash -> the drawer)."""
         amount_p = to_paisa(amount)
         if amount_p <= 0: raise ValueError("payment must be positive")
         if method not in PAYMENT_METHODS: raise ValueError(f"method must be one of {', '.join(PAYMENT_METHODS)}")
-        return self.add_ledger(customer_id, "payment", to_rupees(-amount_p), ref or method, None, actor, approved_by, method, received_by or self._current_user())
+        if account_id: self._check_account_for(method, account_id)
+        return self.add_ledger(customer_id, "payment", to_rupees(-amount_p), ref or method, None, actor, approved_by, method, received_by or self._current_user(), account_id)
 
     def opening_balance(self, customer_id: str, amount: float, actor: str, approved_by: str | None = None) -> LedgerEntry:
         """Bring a customer's paper khata in: one invoice-like entry dated today (Pakistan business day)."""
@@ -218,8 +257,9 @@ class CashMixin(DispatchMixin):
             if done: raise StateError(f"{entry_id} was already reversed by {done}")
             created_at = now_iso()
             rid = next_doc_no(self, c, "reversal", created_at)
-            c.execute(f"INSERT INTO ledger ({_LEDGER_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                      (rid, r["customer_id"], r["kind"], -int(r["amount"]), r["ref"], None, created_at, r["method"] or "", r["received_by"] or "", rid, entry_id))
+            cols, vals, marks = self._with_account(_LEDGER_COLS, (rid, r["customer_id"], r["kind"], -int(r["amount"]), r["ref"], None, created_at, r["method"] or "",
+                                                                  r["received_by"] or "", rid, entry_id), self._account_of("ledger", "entry_id", entry_id))   # back out of the same account
+            c.execute(f"INSERT INTO ledger ({cols}) VALUES ({marks})", vals)
             payload = {"reverses": entry_id, "kind": r["kind"], "amount": to_rupees(-int(r["amount"])), "customer": r["customer_id"], "reason": reason}
             self.audit(actor, "reverse_ledger_entry", "ledger", entry_id, payload | {"reversal": rid}, approved_by)
             self.audit(actor, "ledger_reversal", "ledger", rid, payload, approved_by)
@@ -261,15 +301,23 @@ class CashMixin(DispatchMixin):
     def _expense(r) -> Expense:
         d = dict(r); d["amount"] = to_rupees(int(d["amount"] or 0)); return Expense(**d)
 
-    def record_expense(self, category: str, amount: float, note: str, method: str, paid_by: str, actor: str, approved_by: str | None = None, expense_date: str | None = None) -> Expense:
+    def record_expense(self, category: str, amount: float, note: str, method: str, paid_by: str, actor: str, approved_by: str | None = None,
+                       expense_date: str | None = None, account_id: str | None = None) -> Expense:
+        """A running expense. The payroll categories (accounts.SYSTEM_EXPENSE_CATEGORIES) are refused -- only an approved
+        payroll run writes them -- and so is a date inside a closed period. account_id: the money account it was paid
+        from (default: the method's route on the day -- cash -> the drawer)."""
         amount_p = to_paisa(amount)
         if amount_p <= 0: raise ValueError("expense must be positive")
+        if category in SYSTEM_EXPENSE_CATEGORIES or (method or "") == PAYROLL_METHOD:
+            raise StateError("staff pay is booked by approving the month's payroll, not as an expense")
         category = category if category in EXPENSE_CATEGORIES else "misc"
         e = Expense(new_id("EXP"), category, to_rupees(amount_p), note[:120], method or "cash", paid_by or self._current_user(), expense_date or today_iso())
+        if account_id: self._check_account_for(e.method, account_id)
         with immediate_tx(self) as c:
-            c.execute(f"INSERT INTO expenses ({_EXP_COLS}) VALUES (?,?,?,?,?,?,?,?,?)",
-                      (e.expense_id, e.category, amount_p, e.note, e.method, e.paid_by, e.expense_date, e.created_at, None))
-            self.audit(actor, "record_expense", "expense", e.expense_id, {"category": category, "amount": e.amount}, approved_by)
+            if self._finance_schema(): self.assert_period_open(e.expense_date)
+            cols, vals, marks = self._with_account(_EXP_COLS, (e.expense_id, e.category, amount_p, e.note, e.method, e.paid_by, e.expense_date, e.created_at, None), account_id)
+            c.execute(f"INSERT INTO expenses ({cols}) VALUES ({marks})", vals)
+            self.audit(actor, "record_expense", "expense", e.expense_id, {"category": category, "amount": e.amount} | ({"account": account_id} if account_id else {}), approved_by)
         return e
 
     def get_expense(self, expense_id: str) -> Expense:
@@ -280,7 +328,12 @@ class CashMixin(DispatchMixin):
     def expenses_between(self, start: str, end: str) -> list[Expense]:
         return [self._expense(r) for r in self._all(f"SELECT {_EXP_COLS} FROM expenses WHERE expense_date BETWEEN ? AND ? ORDER BY expense_date, rowid", (start, end))]
 
-    def expenses_paisa(self, start: str, end: str) -> int:
+    def expenses_paisa(self, start: str, end: str, exclude_payroll: bool = False) -> int:
+        """Expenses dated in [start, end]; exclude_payroll leaves out the rows an approved payroll run wrote (the
+        digest's "today's expenses" is money spent today, not the month's accrued pay)."""
+        if exclude_payroll:
+            return int(self._one("SELECT COALESCE(SUM(amount), 0) s FROM expenses WHERE expense_date BETWEEN ? AND ? AND COALESCE(method, '')<>?",
+                                 (start, end, PAYROLL_METHOD))["s"])
         return int(self._one("SELECT COALESCE(SUM(amount), 0) s FROM expenses WHERE expense_date BETWEEN ? AND ?", (start, end))["s"])
 
     def reverse_expense(self, expense_id: str, reason: str, actor: str, approved_by: str) -> Expense:
@@ -290,12 +343,16 @@ class CashMixin(DispatchMixin):
             r = self._one(f"SELECT {_EXP_COLS} FROM expenses WHERE expense_id=?", (expense_id,))
             if not r: raise NotFoundError(f"no such expense: {expense_id}")
             if r["reversal_of"]: raise StateError(f"{expense_id} is itself a reversal (of {r['reversal_of']})")
+            if r["method"] == PAYROLL_METHOD:
+                run = next((w for w in (r["note"] or "").split() if w.startswith("PAY-")), "PAY-...")
+                raise StateError(f"{expense_id} was booked by a payroll run: reverse payroll run {run} instead")
             done = self._one("SELECT expense_id FROM expenses WHERE reversal_of=?", (expense_id,))
             if done: raise StateError(f"{expense_id} was already reversed by {done['expense_id']}")
             e = Expense(new_id("EXP"), r["category"], to_rupees(-int(r["amount"])), f"reversal of {expense_id}: {reason}"[:120], r["method"],
                         self._current_user() or r["paid_by"], today_iso(), reversal_of=expense_id)
-            c.execute(f"INSERT INTO expenses ({_EXP_COLS}) VALUES (?,?,?,?,?,?,?,?,?)",
-                      (e.expense_id, e.category, -int(r["amount"]), e.note, e.method, e.paid_by, e.expense_date, e.created_at, expense_id))
+            cols, vals, marks = self._with_account(_EXP_COLS, (e.expense_id, e.category, -int(r["amount"]), e.note, e.method, e.paid_by, e.expense_date, e.created_at,
+                                                               expense_id), self._account_of("expenses", "expense_id", expense_id))
+            c.execute(f"INSERT INTO expenses ({cols}) VALUES ({marks})", vals)
             self.audit(actor, "reverse_expense", "expense", expense_id, {"reversal": e.expense_id, "amount": e.amount, "reason": reason}, approved_by)
         return e
 
@@ -307,12 +364,17 @@ class CashMixin(DispatchMixin):
         d["total"] = to_rupees(int(d["total"] or 0)); d["paid_amount"] = to_rupees(int(d["paid_amount"] or 0))
         return Purchase(**d)
 
-    def record_purchase(self, supplier_id: str, warehouse_id: str, items: list[dict], invoice_ref: str, paid_amount: float, actor: str, approved_by: str | None = None) -> Purchase:
+    def record_purchase(self, supplier_id: str, warehouse_id: str, items: list[dict], invoice_ref: str, paid_amount: float, actor: str, approved_by: str | None = None,
+                        method: str = "cash", account_id: str | None = None) -> Purchase:
         """Goods in from a supplier: stock up (at the bill's unit cost, into the moving average),
-        the bill on the supplier's khata, and any payment made there and then. One transaction,
-        numbered in the gapless PUR series."""
+        the bill on the supplier's khata, and any payment made there and then -- by `method` from `account_id`
+        (default: cash from the drawer, as before). One transaction, numbered in the gapless PUR series."""
         if not items: raise ValueError("a purchase needs at least one line")
         paid_p = to_paisa(paid_amount or 0)
+        method = method or "cash"
+        if method not in PAYMENT_METHODS or method == "adjustment":
+            raise ValueError(f"method must be one of {', '.join(m for m in PAYMENT_METHODS if m != 'adjustment')}")
+        if account_id and paid_p > 0: self._check_account_for(method, account_id)
         with immediate_tx(self) as c:
             sup = self.get_supplier(supplier_id); self.get_warehouse(warehouse_id)
             lines, total_p = [], 0
@@ -333,8 +395,11 @@ class CashMixin(DispatchMixin):
                     c.execute("UPDATE products SET cost_price=? WHERE sku=?", (ln["unit_cost_paisa"], ln["sku"]))
             c.execute(f"INSERT INTO supplier_ledger ({_SUP_COLS}) VALUES (?,?,?,?,?,?,?,?)", (new_id("BIL"), supplier_id, "bill", total_p, pid, "", created_at, None))
             if paid_p > 0:
-                c.execute(f"INSERT INTO supplier_ledger ({_SUP_COLS}) VALUES (?,?,?,?,?,?,?,?)", (new_id("SPY"), supplier_id, "payment", -paid_p, pid, "cash", created_at, None))
-            self.audit(actor, "record_purchase", "purchase", pid, {"supplier": sup.name, "total": to_rupees(total_p), "paid": to_rupees(paid_p), "warehouse": warehouse_id}, approved_by)
+                cols, vals, marks = self._with_account(_SUP_COLS, (new_id("SPY"), supplier_id, "payment", -paid_p, pid, method, created_at, None), account_id)
+                c.execute(f"INSERT INTO supplier_ledger ({cols}) VALUES ({marks})", vals)
+            extra = ({"method": method} if paid_p > 0 and method != "cash" else {}) | ({"account": account_id} if account_id and paid_p > 0 else {})
+            self.audit(actor, "record_purchase", "purchase", pid, {"supplier": sup.name, "total": to_rupees(total_p), "paid": to_rupees(paid_p), "warehouse": warehouse_id} | extra,
+                       approved_by)
         return self.get_purchase(pid)
 
     def list_purchases(self, limit: int = 50, supplier_id: str | None = None) -> list[Purchase]:
@@ -369,20 +434,26 @@ class CashMixin(DispatchMixin):
                 self.move_stock(r["warehouse_id"], ln["sku"], -int(ln["qty"]), "purchase_reversal", rid, value_paisa=-int(ln["qty"]) * int(ln["unit_cost_paisa"]))
             for e in self._all(f"SELECT {_SUP_COLS} FROM supplier_ledger WHERE ref=? AND reversal_of IS NULL", (purchase_id,)):
                 if self._one("SELECT 1 FROM supplier_ledger WHERE reversal_of=?", (e["entry_id"],)): continue
-                c.execute(f"INSERT INTO supplier_ledger ({_SUP_COLS}) VALUES (?,?,?,?,?,?,?,?)",
-                          (new_id("SRV"), e["supplier_id"], e["kind"], -int(e["amount"]), rid, e["method"] or "", created_at, e["entry_id"]))
+                cols, vals, marks = self._with_account(_SUP_COLS, (new_id("SRV"), e["supplier_id"], e["kind"], -int(e["amount"]), rid, e["method"] or "", created_at,
+                                                                   e["entry_id"]), self._account_of("supplier_ledger", "entry_id", e["entry_id"]))
+                c.execute(f"INSERT INTO supplier_ledger ({cols}) VALUES ({marks})", vals)
             self.audit(actor, "reverse_purchase", "purchase", purchase_id, {"reversal": rid, "total": to_rupees(-int(r["total"])), "reason": reason}, approved_by)
         return self.get_purchase(rid)
 
-    def pay_supplier(self, supplier_id: str, amount: float, method: str, ref: str, actor: str, approved_by: str | None = None) -> SupplierLedgerEntry:
+    def pay_supplier(self, supplier_id: str, amount: float, method: str, ref: str, actor: str, approved_by: str | None = None,
+                     account_id: str | None = None) -> SupplierLedgerEntry:
+        """Pay a supplier. account_id: the money account it left (default: the method's route on the day)."""
         amount_p = to_paisa(amount)
         if amount_p <= 0: raise ValueError("payment must be positive")
         if method not in PAYMENT_METHODS: raise ValueError(f"method must be one of {', '.join(PAYMENT_METHODS)}")
+        if account_id: self._check_account_for(method, account_id)
         e = SupplierLedgerEntry(new_id("SPY"), supplier_id, "payment", to_rupees(-amount_p), ref or method, method)
         with immediate_tx(self) as c:
             self.get_supplier(supplier_id)
-            c.execute(f"INSERT INTO supplier_ledger ({_SUP_COLS}) VALUES (?,?,?,?,?,?,?,?)", (e.entry_id, supplier_id, "payment", -amount_p, e.ref, method, e.created_at, None))
-            self.audit(actor, "pay_supplier", "supplier", supplier_id, {"amount": to_rupees(amount_p), "method": method, "ref": ref}, approved_by)
+            cols, vals, marks = self._with_account(_SUP_COLS, (e.entry_id, supplier_id, "payment", -amount_p, e.ref, method, e.created_at, None), account_id)
+            c.execute(f"INSERT INTO supplier_ledger ({cols}) VALUES ({marks})", vals)
+            self.audit(actor, "pay_supplier", "supplier", supplier_id, {"amount": to_rupees(amount_p), "method": method, "ref": ref}
+                       | ({"account": account_id} if account_id else {}), approved_by)
         return e
 
     def supplier_opening_balance(self, supplier_id: str, amount: float, actor: str, approved_by: str | None = None) -> SupplierLedgerEntry:
@@ -410,8 +481,9 @@ class CashMixin(DispatchMixin):
             done = self._one("SELECT entry_id FROM supplier_ledger WHERE reversal_of=?", (entry_id,))
             if done: raise StateError(f"{entry_id} was already reversed by {done['entry_id']}")
             e = SupplierLedgerEntry(new_id("SRV"), r["supplier_id"], r["kind"], to_rupees(-int(r["amount"])), r["ref"], r["method"] or "", reversal_of=entry_id)
-            c.execute(f"INSERT INTO supplier_ledger ({_SUP_COLS}) VALUES (?,?,?,?,?,?,?,?)",
-                      (e.entry_id, e.supplier_id, e.kind, -int(r["amount"]), e.ref, e.method, e.created_at, entry_id))
+            cols, vals, marks = self._with_account(_SUP_COLS, (e.entry_id, e.supplier_id, e.kind, -int(r["amount"]), e.ref, e.method, e.created_at, entry_id),
+                                                   self._account_of("supplier_ledger", "entry_id", entry_id))
+            c.execute(f"INSERT INTO supplier_ledger ({cols}) VALUES ({marks})", vals)
             self.audit(actor, "reverse_supplier_entry", "supplier", r["supplier_id"], {"reverses": entry_id, "reversal": e.entry_id, "amount": e.amount, "reason": reason}, approved_by)
         return e
 
@@ -440,13 +512,21 @@ class CashMixin(DispatchMixin):
         return sorted(out, key=lambda r: -r["balance"])
 
     # ------------------------------------------------------------ cashbook
-    def cashbook(self, day: str | None = None) -> dict:
+    def cashbook(self, day: str | None = None, redact_payroll: bool = True) -> dict:
         """Everything that touched physical cash on a Pakistan business day, in and out.
         Reversals appear on the day they were posted, with a negative amount in the section of
-        the entry they reverse (a bounced cash receipt is a negative cash-in)."""
+        the entry they reverse (a bounced cash receipt is a negative cash-in).
+
+        Besides customer payments, expenses, supplier payments and hand-ins, the day's other cash lines come from
+        the derived ledger (the cash-kind money accounts): transfers to and from the bank, journal entries (capital,
+        drawings, loans, a counted difference) and the payroll lines (salaries, staff advances, statutory challans).
+        Owner decision 2: unless redact_payroll=False (a caller WITH payroll:read), the payroll lines are summed per
+        day and direction under accounts.PAYROLL_REDACTED_LABEL -- no employee, no single salary."""
         day = day or today_iso()
         ins, outs = [], []
         ins_p = outs_p = handins_p = 0
+        v8 = self._finance_schema()
+        cash_accounts = ({r["account_id"] for r in self._all("SELECT account_id FROM money_accounts WHERE kind='cash'")} if v8 else set()) or {CASH_ACCOUNT_ID}
         for r in self._all(f"SELECT {_LEDGER_COLS} FROM ledger WHERE kind='payment' AND COALESCE(NULLIF(method, ''), 'cash')='cash' AND COALESCE(received_by, '')!='driver' AND "
                            + sql_business_date("created_at") + "=? ORDER BY created_at, rowid", (day,)):     # driver cash arrives as a hand-in
             amt = -int(r["amount"]); ins_p += amt
@@ -460,8 +540,33 @@ class CashMixin(DispatchMixin):
             amt = -int(r["amount"]); outs_p += amt
             outs.append({"kind": "supplier payment" + (" reversal" if r["reversal_of"] else ""), "who": self.get_supplier(r["supplier_id"]).name,
                          "amount": to_rupees(amt), "ref": r["entry_id"], "by": "", "at": r["created_at"]})
+        # the other cash lines, read from the derived ledger: postings on a cash account from transfers, the journal and payroll
+        other = ("transfer", "journal", "payroll_run", "salary_payment", "staff_advance", "statutory_payment")
+        payroll = ("payroll_run", "salary_payment", "staff_advance", "statutory_payment")
+        labels = {"transfer": "transfer", "journal": "journal", "salary_payment": "salary payment", "staff_advance": "staff advance",
+                  "statutory_payment": "statutory payment", "payroll_run": "payroll"}
+        nets: dict[tuple, list] = {}
+        for p in (self.postings(day, day) if v8 else []):
+            if p.money_account_id in cash_accounts and p.source in other:
+                it = nets.setdefault((p.source, p.source_id), [0, p.memo])
+                it[0] += p.net_paisa
+        hidden = {1: 0, -1: 0}
+        memos = {k: v[1] for k, v in self._narrations([k for k in nets if k[0] in ("transfer", "journal")]).items()}
+        for (source, sid), (net, memo) in nets.items():
+            if not net: continue
+            if redact_payroll and source in payroll:
+                hidden[1 if net > 0 else -1] += net; continue
+            line = {"kind": labels[source], "who": memos.get((source, sid), memo or ""), "amount": to_rupees(abs(net)), "ref": sid, "by": "", "at": day}
+            if net > 0: ins.append(line); ins_p += net
+            else: outs.append(line); outs_p -= net
+        for sign, net in hidden.items():
+            if not net: continue
+            line = {"kind": "staff payments", "who": PAYROLL_REDACTED_LABEL, "amount": to_rupees(abs(net)), "ref": "", "by": "", "at": day}
+            if sign > 0: ins.append(line); ins_p += net
+            else: outs.append(line); outs_p -= net
         deposits = []
         for r in self._all("SELECT * FROM deposits WHERE " + sql_business_date("deposited_at") + "=? ORDER BY deposited_at, rowid", (day,)):
+            if v8 and (r["account_id"] or CASH_ACCOUNT_ID) not in cash_accounts: continue      # handed straight into the bank: not the drawer's
             amt = int(r["amount_counted"]); handins_p += amt
             deposits.append({"kind": "driver hand-in", "who": self.get_vehicle(self.get_plan(r["plan_id"]).vehicle_id).plate, "amount": to_rupees(amt),
                              "ref": r["deposit_id"], "by": r["counted_by"], "at": r["deposited_at"]})

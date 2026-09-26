@@ -16,6 +16,7 @@ from datetime import timedelta
 
 from munshi.domain.models import Order, business_today, mul_div, sql_business_date, to_business_date, to_paisa, to_rupees, today_iso
 from munshi.domain.repository.collections import CollectionsMixin
+from munshi.domain.repository.finance_reports import mask_staff_categories
 
 
 def _p(e) -> int:
@@ -46,7 +47,7 @@ class ReportsMixin(CollectionsMixin):
                          "delivered": sum(s.status == "delivered" for s in stops), "short": sum(s.status == "short" for s in stops),
                          "pending": sum(s.status == "pending" for s in stops)},
             "cash": {"collected": to_rupees(cash_p), "deposited": to_rupees(deposited_p),
-                     "office_payments": to_rupees(office_p), "expenses": to_rupees(self.expenses_paisa(day, day))},
+                     "office_payments": to_rupees(office_p), "expenses": to_rupees(self.expenses_paisa(day, day, exclude_payroll=True))},
             "sales": {"invoiced": to_rupees(invoiced_p)},
             "receivables": {"customers": summary["customers"], "total": summary["total"], "overdue_60": summary["buckets"]["60+"],
                             "overdue_30": to_rupees(to_paisa(summary["buckets"]["31-60"]) + to_paisa(summary["buckets"]["60+"]))},
@@ -246,14 +247,28 @@ class ReportsMixin(CollectionsMixin):
         start = (business_today() - timedelta(days=days)).isoformat()
         return self.sales_report(start, today_iso())["by_customer"][:limit]
 
-    def profit_summary(self, start: str, end: str) -> dict:
+    def profit_summary(self, start: str, end: str, redact_payroll: bool = True) -> dict:
+        """Operating profit: sales less cost of goods less the expense rows (the payroll run's rows included, owner
+        decision 3). OWNER DECISION 2: unless redact_payroll=False (a caller WITH payroll:read -- the owner), the
+        payroll categories (accounts.SYSTEM_EXPENSE_CATEGORIES) are combined into ONE `staff_costs` line, so a clerk
+        never sees a single salary. Totals are the same either way.
+
+        Stock write-offs (damage, count differences: stock_moves 'adjust') are not expense rows; they are reported
+        here as `stock_adjustments` (a loss positive) with `net_after_stock_adjustments`, and the full income
+        statement (finance) carries them in net profit. `net` itself is unchanged: it is the operating profit the
+        income statement reconciles to."""
         s = self._sales_paisa(start, end)
         margin = s["revenue"] - s["cost"]
         by_cat: dict[str, int] = {}
         for x in self.expenses_between(start, end): by_cat[x.category] = by_cat.get(x.category, 0) + to_paisa(x.amount)
+        if redact_payroll:
+            by_cat = mask_staff_categories(by_cat)
         exp_total = sum(by_cat.values())
+        adj = -int(self._one("SELECT COALESCE(SUM(value_paisa), 0) s FROM stock_moves WHERE kind='adjust' AND ref NOT IN ('set_stock', 'import') AND "
+                             + sql_business_date("created_at") + " BETWEEN ? AND ?", (start, end))["s"])
         return {"start": start, "end": end, "revenue": to_rupees(s["revenue"]), "credit_notes": to_rupees(s["credits"]),
                 "cost_of_goods": to_rupees(s["cost"]), "gross_margin": to_rupees(margin),
                 "margin_pct": round(margin / s["revenue"] * 100, 1) if s["revenue"] > 0 else 0.0,
-                "expenses": to_rupees(exp_total), "expenses_by_category": {k: to_rupees(v) for k, v in by_cat.items()}, "net": to_rupees(margin - exp_total)} \
+                "expenses": to_rupees(exp_total), "expenses_by_category": {k: to_rupees(v) for k, v in by_cat.items()}, "net": to_rupees(margin - exp_total),
+                "stock_adjustments": to_rupees(adj), "net_after_stock_adjustments": to_rupees(margin - exp_total - adj)} \
             | self._cost_fields(s)
