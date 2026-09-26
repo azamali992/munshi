@@ -285,7 +285,7 @@ class FinanceMixin(FinanceReportsMixin):
                     if it["cleared_on"]: continue
                     if it["net"] > 0: unc_in += it["net"]
                     else: unc_out -= it["net"]
-            r = {"account_id": aid, "account": a["name"], "kind": a["kind"], "provider": a["provider"], "number_last4": a["number_last4"],
+            r = {"account_id": aid, "account": a["name"], "name": a["name"], "kind": a["kind"], "provider": a["provider"], "number_last4": a["number_last4"],
                  "is_default": bool(a["is_default"]), "active": bool(a["active"]), "balance_paisa": money.get(aid, 0),
                  "last_reconciled": last["statement_date"] if last else None,
                  "last_statement_balance": to_rupees(int(last["statement_paisa"])) if last else None,
