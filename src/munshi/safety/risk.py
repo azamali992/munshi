@@ -135,6 +135,7 @@ MONEY_TOOL_TIERS: dict[str, RiskTier] = {
     "close_period": RiskTier.HIGH_RISK,
     "reopen_period": RiskTier.HIGH_RISK,
 }
+RISK_REGISTRY.update(MONEY_TOOL_TIERS)      # Stream D: every tool above is exposed by build_tools() and has its CardBuilder._c_<tool>
 
 _ORDER = [RiskTier.READ_ONLY, RiskTier.OTP_GATED, RiskTier.LOW_RISK, RiskTier.HIGH_RISK]
 

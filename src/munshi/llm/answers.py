@@ -1127,6 +1127,10 @@ FORMATTERS: dict[str, Callable[[Any, _Ctx], str]] = {
     "send_reminder": _reminder, "log_promise": _promise,
 }
 
+from munshi.llm.answers_money import FORMATTERS as _MONEY_FORMATTERS  # noqa: E402  (payroll and company finance)
+
+FORMATTERS.update(_MONEY_FORMATTERS)
+
 _REJECTED = re.compile(r"rejected the tool call for `?(\w+)`?(?: with reason: (.*))?", re.I | re.S)
 
 

@@ -63,7 +63,8 @@ from munshi.platform import MunshiPlatform  # noqa: E402
 from munshi.safety.risk import RISK_REGISTRY, RiskTier  # noqa: E402
 
 CORPORA = [ROOT / "eval" / "gold_corpus.jsonl", ROOT / "eval" / "gold_holdout.jsonl"]
-AGENT_ACTORS = {"order_munshi", "godown_munshi", "delivery_munshi", "hisaab_munshi", "khareed_munshi", "wasooli_munshi", "report_munshi"}
+AGENT_ACTORS = {"order_munshi", "godown_munshi", "delivery_munshi", "hisaab_munshi", "khareed_munshi", "wasooli_munshi", "report_munshi",
+                "tankhwa_munshi", "accounts_munshi"}
 ENTITY_KEYS = ("customer_id", "supplier_id", "sku", "order_id", "items", "plan_id", "stop_id", "reminder_id")
 WRITE_TOOLS = {n for n, t in RISK_REGISTRY.items() if t != RiskTier.READ_ONLY}
 # The help desk answers greetings, refusals and "didn't understand" with no tools at all:

@@ -68,11 +68,17 @@ def test_a_correction_reverses_the_wrong_receipt_and_chains_the_right_amount(p):
 
 
 def test_a_clerks_reversal_is_passed_to_the_owner(p):
+    # owner decision 4 (2026-09-26): passed to the owner AS THE OWNER'S CARD (was: a notification and no card); the right
+    # amount's card is chained after it, once the owner approves
     _pay(p)
     before = len(p.repo.notifications("owner"))
     r = p.handle_message("t", "clerk", "yaar galti ho gayi, chaudhry farms ki cash payment 20000 nahi 12000 thi")
-    assert r.pending is None and "owner" in r.text and "12,000" in r.text
+    assert r.pending.tool == "reverse_ledger_entry" and r.pending.needs_role == "owner" and "owner" in r.text and "12,000" in r.text
     assert len(p.repo.notifications("owner")) == before + 1
+    with pytest.raises(PermissionError):
+        p.resolve(r.pending.approval_id, True, "clerk")
+    nxt = p.resolve(r.pending.approval_id, True, "owner")
+    assert nxt.pending and nxt.pending.tool == "record_payment" and float(nxt.pending.args["amount"]) == 12000
 
 
 # ---------------------------------------------------------------- b) questions never raise a write card
@@ -96,10 +102,7 @@ def test_bulk_reminders_need_an_explicit_bulk_instruction(p):
 
 
 # ---------------------------------------------------------------- c) owner-tier requests from a clerk / salesman
-@pytest.mark.parametrize("role,text,who", [("clerk", "urea ki 6 bori damage ho gayi multan godown mei, stock se nikal do", "owner"),
-                                           ("clerk", "credit note Rana Brothers 5000 damaged", "owner"),
-                                           ("clerk", "fauji ko 500000 payment ki cheque se", "owner"),
-                                           ("salesman", "haji sons ne counter pe 5000 cash diye", "clerk")])
+@pytest.mark.parametrize("role,text,who", [("salesman", "haji sons ne counter pe 5000 cash diye", "clerk")])
 def test_a_request_the_role_cant_make_is_passed_on_not_dropped(p, role, text, who):
     before = len(p.repo.notifications(who))
     r = p.handle_message("t", role, text, user="Bilal")
@@ -107,6 +110,20 @@ def test_a_request_the_role_cant_make_is_passed_on_not_dropped(p, role, text, wh
     assert ("owner" if who == "owner" else "office") in r.text
     notes = p.repo.notifications(who)
     assert len(notes) == before + 1 and "Bilal" in notes[0]["text"]
+
+
+# owner decision 4 (2026-09-26): a CLERK's owner-tier request (write-off, credit note, supplier payment) is the owner's approval
+# card -- these three were passed on as notifications above before the decision. The clerk still can't clear the card.
+@pytest.mark.parametrize("text,tool", [("urea ki 6 bori damage ho gayi multan godown mei, stock se nikal do", "adjust_stock"),
+                                       ("credit note Rana Brothers 5000 damaged", "credit_note"),
+                                       ("fauji ko 500000 payment ki cheque se", "pay_supplier")])
+def test_a_clerks_owner_tier_request_is_the_owners_card(p, text, tool):
+    before = len(p.repo.notifications("owner"))
+    r = p.handle_message("t", "clerk", text, user="Bilal")
+    assert r.pending is not None and r.pending.tool == tool and r.pending.needs_role == "owner" and "owner" in r.text
+    assert p.viewer_decision(r.pending, "clerk", "Bilal")["can_approve"] is False
+    notes = p.repo.notifications("owner")
+    assert len(notes) == before + 1 and notes[0]["kind"] == "approval" and "Bilal" in notes[0]["text"]
 
 
 # ---------------------------------------------------------------- d) a route's plan is every order reserved for it

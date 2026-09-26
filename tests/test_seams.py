@@ -155,7 +155,9 @@ PLAN_TIERS = {   # plan §6 (+ Stream 0 additions), spot-checked independently o
 
 
 def test_every_new_tool_has_its_tier_and_resolves_through_risk_of():
-    assert not set(MONEY_TOOL_TIERS) & set(RISK_REGISTRY), "a new tool must not re-tier an existing one"
+    # (Stream D promoted MONEY_TOOL_TIERS into RISK_REGISTRY as SEAMS §3 directs, so the two now overlap by design: what must hold
+    # is that the promotion re-tiered nothing -- every shared name has the same tier in both)
+    assert all(RISK_REGISTRY[t] == tier for t, tier in MONEY_TOOL_TIERS.items() if t in RISK_REGISTRY), "a new tool must not re-tier an existing one"
     for tool, tier in PLAN_TIERS.items():
         assert risk_of(tool) == tier, tool
     for tool, tier in MONEY_TOOL_TIERS.items():

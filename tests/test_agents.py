@@ -28,9 +28,18 @@ def test_driver_has_no_order_tool(p):
     assert r.pending is None and "office" in r.text
 
 
-def test_clerk_cannot_even_request_a_credit_note(p):
-    r = p.handle_message("c", "clerk", "credit note Rana Brothers 5000 damaged")
-    assert r.pending is None and "owner" in r.text
+def test_a_clerks_credit_note_request_is_an_owner_only_card_the_clerk_cannot_approve(p):
+    # owner decision 4 (2026-09-26): a clerk's request for an owner-tier action becomes the OWNER's approval card (was:
+    # test_clerk_cannot_even_request_a_credit_note -- no card, a notification). Tiers and four-eyes are unchanged.
+    before = p.repo.outstanding("C-005")
+    r = p.handle_message("c", "clerk", "credit note Rana Brothers 5000 damaged", user="Bilal Hussain")
+    assert r.pending and r.pending.tool == "credit_note" and r.pending.needs_role == "owner" and "owner" in r.text
+    with pytest.raises(PermissionError):
+        p.resolve(r.pending.approval_id, True, "clerk", user="Sana Malik")             # another clerk can't clear it either
+    assert p.viewer_decision(r.pending, "clerk", "Bilal Hussain")["can_approve"] is False
+    assert p.repo.outstanding("C-005") == before
+    p.resolve(r.pending.approval_id, True, "owner", user="Sultan Ahmed")
+    assert p.repo.outstanding("C-005") == before - 5000
 
 
 def test_clerk_cannot_approve_an_owner_action(p):
@@ -84,7 +93,12 @@ def test_khareed_munshi_receives_stock_and_owner_pays(p):
     p.resolve(r.pending.approval_id, True, "clerk")
     assert p.repo.get_stock("WH-MULTAN", "UREA-50").on_hand == before + 100 and p.repo.supplier_balance("S-001") == 900000
     r = p.handle_message("k", "clerk", "pay Fauji 100000 by bank")
-    assert r.pending is None and "owner" in r.text                      # clerk has no pay_supplier tool
+    # owner decision 4: the clerk's supplier payment is the OWNER's card (was: no card); the owner declines this one
+    assert r.pending and r.pending.tool == "pay_supplier" and r.pending.needs_role == "owner" and "owner" in r.text
+    with pytest.raises(PermissionError):
+        p.resolve(r.pending.approval_id, True, "clerk")
+    p.resolve(r.pending.approval_id, False, "owner")
+    assert p.repo.supplier_balance("S-001") == 900000
     r = p.handle_message("k2", "owner", "pay Fauji 100000 by bank")
     assert r.pending.tool == "pay_supplier" and r.pending.needs_role == "owner"
     p.resolve(r.pending.approval_id, True, "owner")

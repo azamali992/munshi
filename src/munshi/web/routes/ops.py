@@ -26,6 +26,9 @@ router = APIRouter(prefix="/api", tags=["operations"])
 class ChatIn(BaseModel):
     thread_id: str = Field(default="main", max_length=40, pattern="^[A-Za-z0-9_-]+$")
     text: str = Field(min_length=1, max_length=1000)
+    # payment proofs uploaded first (POST /api/attachments): they ride on the card this message raises. Ownership is checked
+    # in the platform against the stored upload (uploaded_by == this session's user), never trusted from here.
+    attachment_ids: list[str] = Field(default_factory=list, max_length=5)
 
 
 class Decision(BaseModel):
@@ -150,7 +153,8 @@ def _confirm_needs(c: Ctx, o: Order) -> tuple[str, str]:
 # ---------------------------------------------------------------- chat + approvals
 @router.post("/chat")
 def chat(body: ChatIn, c: Ctx = Depends(context("chat"))):
-    r = c.platform.handle_message(body.thread_id, c.role, body.text.strip(), user=c.who)
+    r = c.platform.handle_message(body.thread_id, c.role, body.text.strip(), user=c.who, user_id=c.principal.user_id,
+                                  attachment_ids=[a.strip()[:40] for a in body.attachment_ids if a.strip()])
     return {"text": r.text, "specialist": r.specialist, "pending": _reply_card(c, r)} | _tables(r)
 
 

@@ -67,10 +67,12 @@ def test_every_reversal_is_high_risk_and_owner_approved_only():
 
 def test_reversal_tools_are_bound_to_the_owner_only_on_the_right_munshi(p):
     hisaab, khareed = p.specialists["hisaab"].role_tools, p.specialists["khareed"].role_tools
+    # owner decision 4 (2026-09-26): the clerk is bound the reversals too -- to REQUEST them (the card is the owner's; see
+    # test_every_reversal_is_high_risk_and_owner_approved_only). Salesmen and drivers still have none.
     for t in ("reverse_ledger_entry", "reverse_expense"):
-        assert t in hisaab["owner"] and not any(t in hisaab[r] for r in ("clerk", "salesman", "driver"))
+        assert t in hisaab["owner"] and t in hisaab["clerk"] and not any(t in hisaab[r] for r in ("salesman", "driver"))
     for t in ("reverse_purchase", "reverse_supplier_entry"):
-        assert t in khareed["owner"] and not any(t in khareed[r] for r in ("clerk", "salesman", "driver"))
+        assert t in khareed["owner"] and t in khareed["clerk"] and not any(t in khareed[r] for r in ("salesman", "driver"))
     others = [b.role_tools[r] for n, b in p.specialists.items() if n not in ("hisaab", "khareed") for r in b.role_tools]
     assert not any(t in tools for tools in others for t in REVERSALS)
     assert not any(t in hisaab["owner"] for t in ("reverse_purchase", "reverse_supplier_entry"))
@@ -236,9 +238,11 @@ def test_chat_owner_reverses_an_expense_after_approval_over_http(c):
     x = c.post("/api/expenses", json={"category": "fuel", "amount": 55000, "note": "diesel", "method": "cash"}, headers=K).json()
     tot = c.get("/api/expenses", headers=O).json()["total"]
 
-    # a clerk can't even ask for it (no such tool for the clerk role, like credit notes)
+    # owner decision 4 (2026-09-26): a clerk's request is the OWNER's card (was: no card); the clerk can't clear it, nothing moves
     r = c.post("/api/chat", json={"thread_id": "k", "text": f"reverse expense {x['expense_id']} typed 55000 instead of 5500"}, headers=K).json()
-    assert r["pending"] is None and "owner" in r["text"] and c.get("/api/expenses", headers=O).json()["total"] == tot
+    assert r["pending"]["tool"] == "reverse_expense" and r["pending"]["needs_role"] == "owner" and r["pending"]["can_approve"] is False
+    assert "owner" in r["text"] and c.get("/api/expenses", headers=O).json()["total"] == tot
+    assert c.post(f"/api/approvals/{r['pending']['approval_id']}", json={"approve": False, "note": "owner does it"}, headers=O).status_code == 200
 
     r = c.post("/api/chat", json={"thread_id": "o", "text": f"reverse expense {x['expense_id']} typed 55000 instead of 5500"}, headers=O).json()
     assert r["specialist"] == "hisaab" and r["pending"]["tool"] == "reverse_expense" and r["pending"]["needs_role"] == "owner"
@@ -280,7 +284,9 @@ def test_chat_khareed_reverses_a_purchase_for_the_owner_only(p):
     pur = p.repo.record_purchase("S-001", "WH-MULTAN", [{"sku": "UREA-50", "qty": 50, "unit_cost": 3600}], "FF-9", 0, "khareed_munshi", "clerk")
     stock, bal = p.repo.get_stock("WH-MULTAN", "UREA-50").on_hand, p.repo.supplier_balance("S-001")
     r = p.handle_message("k", "clerk", f"reverse purchase {pur.purchase_id} wrong bill")
-    assert r.specialist == "khareed" and r.pending is None and "owner" in r.text      # clerk has no reverse_purchase tool
+    # owner decision 4 (2026-09-26): the clerk's reversal request is the OWNER's card (was: no card); the owner declines it here
+    assert r.specialist == "khareed" and r.pending.tool == "reverse_purchase" and r.pending.needs_role == "owner" and "owner" in r.text
+    p.resolve(r.pending.approval_id, False, "owner")
     r = p.handle_message("k2", "owner", f"reverse purchase {pur.purchase_id} wrong bill")
     assert r.pending.tool == "reverse_purchase" and r.pending.needs_role == "owner" and r.pending.args["purchase_id"] == pur.purchase_id
     assert p.repo.get_stock("WH-MULTAN", "UREA-50").on_hand == stock

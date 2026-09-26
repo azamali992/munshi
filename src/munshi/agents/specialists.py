@@ -423,11 +423,13 @@ def build_order_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChat
 def build_godown_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChatModel | None = None, checkpointer=None, guarded: bool | None = None) -> AgentBundle:
     T = build_tools(ops); B = _biz(repo)
     read = [T["get_stock"], T["list_orders"], T["get_order"], T["list_routes"], T["list_vehicles"], T["suggest_dispatch"], T["get_plan"]] + _lookups(model, T["search_products"])
-    clerk = read + [T["allocate_order"], T["create_dispatch_plan"], T["approve_dispatch_plan"], T["transfer_stock"]]
-    owner = clerk + [T["adjust_stock"]]
+    owner = read + [T["allocate_order"], T["create_dispatch_plan"], T["approve_dispatch_plan"], T["transfer_stock"], T["adjust_stock"]]
+    # owner decision 4 (2026-09-26): a clerk's request for an owner-tier action (a stock adjustment) becomes the OWNER's card --
+    # the tool is bound for the clerk too; its tier, and so who may approve it, is unchanged (was: a notification to the owner)
+    clerk = owner
     prompts = {
         "owner": f"You are the Godown Munshi for {B}. Allocate confirmed orders against real stock, plan dispatch onto routes and vehicles within capacity, move stock between godowns, and adjust stock only with a reason. Never promise stock that isn't available.",
-        "clerk": f"You are the Godown Munshi for {B}. Allocate confirmed orders, plan dispatch, transfer between godowns. Stock adjustments need the owner.",
+        "clerk": f"You are the Godown Munshi for {B}. Allocate confirmed orders, plan dispatch, transfer between godowns. A stock adjustment is the owner's to approve.",
         "salesman": "You are the Godown Munshi. Salesmen can check stock but not allocate or plan.",
         "driver": "You are the Godown Munshi. Drivers can view their plan but not change allocation.",
     }
@@ -934,11 +936,11 @@ def _expense_category(t: str) -> str:
 def build_hisaab_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChatModel | None = None, checkpointer=None, guarded: bool | None = None) -> AgentBundle:
     T = build_tools(ops); B = _biz(repo)
     read = [T["get_digest"], T["get_plan"], T["list_stops"], T["get_customer_khata"], T["cashbook"]] + _lookups(model, T["find_customer"])
-    clerk = read + [T["record_deposit"], T["record_payment"], T["record_expense"]]
-    owner = clerk + [T["credit_note"], T["reverse_ledger_entry"], T["reverse_expense"]]
+    owner = read + [T["record_deposit"], T["record_payment"], T["record_expense"], T["credit_note"], T["reverse_ledger_entry"], T["reverse_expense"]]
+    clerk = owner          # owner decision 4: a clerk's credit note / reversal request is the OWNER's card (tiers unchanged)
     prompts = {
         "owner": f"You are the Hisaab Munshi for {B}. Reconcile cash handed in against cash collected on each plan, attribute any shortfall to a stop, record payments received at the office (cash, bank, JazzCash, Easypaisa, cheque) and expenses, keep the khata honest, and issue credit notes only with a stated reason. Nothing is ever edited or deleted: a mis-keyed khata entry, a bounced cheque or a wrong expense is cancelled by reversing that one entry, by its ID, with a stated reason.",
-        "clerk": f"You are the Hisaab Munshi for {B}. Record deposits, office payments and expenses; reconcile. Credit notes and reversals need the owner.",
+        "clerk": f"You are the Hisaab Munshi for {B}. Record deposits, office payments and expenses; reconcile. Credit notes and reversals are the owner's to approve.",
         "salesman": "You are the Hisaab Munshi. Salesmen don't record money; they can ask the office.",
         "driver": "You are the Hisaab Munshi. Drivers hand cash to the cashier; they don't record deposits.",
     }
@@ -1096,11 +1098,11 @@ def build_hisaab_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCha
 def build_khareed_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChatModel | None = None, checkpointer=None, guarded: bool | None = None) -> AgentBundle:
     T = build_tools(ops); B = _biz(repo)
     read = [T["find_supplier"], T["list_suppliers"], T["supplier_khata"], T["payables_report"], T["get_stock"], T["search_products"]]
-    clerk = read + [T["record_purchase"]]
-    owner = clerk + [T["pay_supplier"], T["reverse_purchase"], T["reverse_supplier_entry"]]
+    owner = read + [T["record_purchase"], T["pay_supplier"], T["reverse_purchase"], T["reverse_supplier_entry"]]
+    clerk = owner          # owner decision 4: a clerk's supplier payment / reversal request is the OWNER's card (tiers unchanged)
     prompts = {
         "owner": f"You are the Khareed Munshi for {B}, in charge of buying. Receive stock from suppliers into the godown with the bill on their account, track what we owe each supplier, and pay suppliers only with a stated method and reference. Nothing is ever edited or deleted: a mis-keyed purchase is undone with reverse_purchase (the goods go back too), a bounced or misdirected supplier payment with reverse_supplier_entry, each by its ID and with a stated reason.",
-        "clerk": f"You are the Khareed Munshi for {B}. Record stock received from suppliers and show what we owe. Supplier payments and reversals need the owner.",
+        "clerk": f"You are the Khareed Munshi for {B}. Record stock received from suppliers and show what we owe. Supplier payments and reversals are the owner's to approve.",
         "salesman": "You are the Khareed Munshi. Salesmen don't handle purchases.",
         "driver": "You are the Khareed Munshi. Drivers don't handle purchases.",
     }
@@ -1342,3 +1344,8 @@ BUILDERS = {
     "order": build_order_munshi, "godown": build_godown_munshi, "delivery": build_delivery_munshi, "hisaab": build_hisaab_munshi,
     "khareed": build_khareed_munshi, "wasooli": build_wasooli_munshi, "report": build_report_munshi, "help": build_help_munshi,
 }
+
+# payroll and company finance (agents/specialists_money.py; imported last: it reuses the helpers above)
+from munshi.agents.specialists_money import build_accounts_munshi, build_tankhwa_munshi  # noqa: E402
+
+BUILDERS.update({"tankhwa": build_tankhwa_munshi, "accounts": build_accounts_munshi})

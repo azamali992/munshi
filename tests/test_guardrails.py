@@ -248,7 +248,11 @@ def test_a_model_cannot_run_a_tool_its_role_was_not_offered(repo):
     pay = "Fauji ko 100000 cash pay kar do"
     fake.routes[pay], fake.plan[pay] = "khareed", [[("pay_supplier", {"supplier_id": "S-001", "amount": 100000, "method": "cash"})]]
     r2 = p.handle_message("c", "clerk", pay)
-    assert r2.pending is None and not p.pending                              # a clerk can't raise the owner's card either
+    # owner decision 4 (2026-09-26): pay_supplier IS offered to the clerk now -- to request; the card is the owner's, the clerk
+    # can't clear it (was: a clerk can't raise the owner's card either)
+    assert r2.pending is not None and r2.pending.tool == "pay_supplier" and r2.pending.needs_role == "owner"
+    with pytest.raises(PermissionError):
+        p.resolve(r2.pending.approval_id, True, "clerk")
     rows = [a for a in repo.audit_log(20) if a["action"] == "model_turn"]
     assert len(rows) == 2 and all(a["payload"]["calls"] == 2 for a in rows)
 
