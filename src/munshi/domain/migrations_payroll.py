@@ -382,4 +382,4 @@ def v9(conn: sqlite3.Connection) -> None:
                          [(k, j, v, eff, src, VERIFIED_ON, g, note, stamp) for k, j, v, eff, src, g, note in SEEDS])
 
 
-STEP: Callable[[sqlite3.Connection], None] | None = None     # Stream A: v9 is written; the lead sets STEP = v9 at merge (after V8)
+STEP: Callable[[sqlite3.Connection], None] | None = v9

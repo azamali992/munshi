@@ -216,6 +216,12 @@ def test_the_worked_month(clock):
     assert repo.staff_advances_report()["outstanding"] == 5_000.0
     assert repo.staff_advances_report()["advances"][0]["next_period"] == "2026-10"
 
+    # ---------------- the books (Stream B) see the real payroll: the balance sheet balances and shows what is owed
+    bs = repo.balance_sheet("2026-09-30")
+    assert bs["balanced"], bs
+    ok = repo.verify_books("2026-09-30")
+    assert not [a for a in ok["alarms"] if a["code"] != "negative_money"], ok["alarms"]   # the test's banks start empty
+
     # ---------------- reversal: refused while payments stand; after reversing them, every expense row nets to zero
     with pytest.raises(StateError, match="reverse those payments first"):
         repo.reverse_payroll_run(run_id, "wrong month", "owner", OWNER)
