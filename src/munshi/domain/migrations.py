@@ -12,6 +12,7 @@ import sqlite3
 import uuid
 from typing import Callable
 
+from munshi.domain import migrations_attachments, migrations_finance, migrations_payroll
 from munshi.domain.models import now_iso, sql_business_date, to_paisa
 
 V1 = """
@@ -461,7 +462,48 @@ def _v7(conn: sqlite3.Connection) -> None:
 
 
 Step = str | Callable[[sqlite3.Connection], None]
-MIGRATIONS: list[tuple[int, Step]] = [(1, V1), (2, V2), (3, V3), (4, V4), (5, _v5), (6, V6), (7, _v7)]
+CORE_MIGRATIONS: list[tuple[int, Step]] = [(1, V1), (2, V2), (3, V3), (4, V4), (5, _v5), (6, V6), (7, _v7)]
+
+# ============================================================================ V8+ (payroll / finance / payment proofs)
+# Each lives in its own module owned by one stream, which exports STEP: None until its schema is written. A step is
+# registered only when it is written AND every lower extension step is too (contiguity). Why: migrate() skips every
+# version at or below the file's highest applied one, forever -- so registering an empty stub (or V9 before V8)
+# would stamp real files past a step that never ran, stranding them with the version and without the tables.
+# Adding V11+: append (11, module) here; the module follows migrations_finance.py's docstring.
+_EXTENSIONS = ((8, migrations_finance), (9, migrations_payroll), (10, migrations_attachments))
+
+
+def extension_steps() -> list[tuple[int, Step]]:
+    """The written V8+ steps, stopping at the first unwritten one."""
+    out: list[tuple[int, Step]] = []
+    for version, module in _EXTENSIONS:
+        step = getattr(module, "STEP", None)
+        if step is None:
+            break
+        if getattr(module, "VERSION", version) != version:
+            raise MigrationError(f"{module.__name__} says it is V{module.VERSION}, registered as V{version}")
+        out.append((version, step))
+    return out
+
+
+MIGRATIONS: list[tuple[int, Step]] = CORE_MIGRATIONS + extension_steps()
+
+
+def run_step_unstamped(conn: sqlite3.Connection, step: Step) -> None:
+    """FOR TESTS OF A STEP THAT IS NOT REGISTERED YET: apply it in one transaction WITHOUT recording a version, so
+    the file is never stamped with a version whose step might still change."""
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if callable(step):
+            step(conn)
+        else:
+            _run_sql(conn, step)
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def current_version(conn: sqlite3.Connection) -> int:
@@ -485,6 +527,9 @@ def migrate(conn: sqlite3.Connection) -> list[int]:
     transaction. Returns the versions applied. Safe against a second process migrating
     the same file at the same time: the version is re-read under the write lock."""
     applied = []
+    versions = [v for v, _ in MIGRATIONS]
+    if versions != list(range(1, len(versions) + 1)):
+        raise MigrationError(f"migration steps must be numbered 1..N with no gap, got {versions}")
     current_version(conn)
     if conn.in_transaction:
         conn.commit()

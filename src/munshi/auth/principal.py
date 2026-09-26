@@ -41,6 +41,24 @@ PERMISSIONS: dict[str, frozenset[str]] = {
     "backup":          frozenset({"owner"}),
     "settings:write":  frozenset({"owner"}),
     "notifications":   frozenset(ROLES),
+    # ---- payroll (Stream 0, 2026-09-26). OWNER DECISION: salaries are visible to the owner only. A clerk records
+    # attendance but never sees pay; every employee (any role) sees only their own payslips. This deliberately
+    # narrows the plan's §6 table (which gave clerks payroll:read/write) and drops its payroll_clerk_access setting.
+    "employees:read":   frozenset({"owner", "clerk"}),     # names, emp_no, designation, status, login badge -- NEVER a pay field
+    "attendance:write": frozenset({"owner", "clerk"}),     # days worked, leave, OT minutes, trips: no rupee in or out
+    "payroll:read":     frozenset({"owner"}),              # register, anyone's payslip, pay structures, commission, advances, statutory
+    "payroll:write":    frozenset({"owner"}),              # employees' pay terms, adjustments, advances, salary payments, rates, settings
+    "payroll:approve":  frozenset({"owner"}),              # approve / reverse a payroll run
+    "payroll:self":     frozenset(ROLES),                  # MY payslips only: employees.user_id == principal.user_id
+    # ---- books and company finance
+    "books:read":       frozenset({"owner", "clerk"}),     # money accounts + account books (salary lines redacted for non-owners)
+    "books:write":      frozenset({"owner", "clerk"}),     # transfers, cash counts, clearing ticks, reconciliations
+    "finance:read":     frozenset({"owner"}),              # P&L, balance sheet, cash flow, TB, KPIs, capital, drawings, loans
+    "finance:write":    frozenset({"owner"}),              # accounts, journal, assets, loans, capital, period close / reopen
+    # ---- payment proofs (Stream E): uploading is not a money write; linking rides on an approved action
+    "attachments:write": frozenset(ROLES),                 # a driver photographs a cheque
+    "attachments:read":  frozenset({"owner", "clerk"}),    # everyone else: only their OWN uploads (uploaded_by == user_id),
+                                                           # checked in the route with attachments:write, not granted here
 }
 
 
@@ -51,6 +69,7 @@ class Principal:
     role: str
     name: str
     phone: str = ""
+    must_change_pin: bool = False     # set by the registry after an owner-issued PIN; web/deps gates on it (Stream A)
 
     def can(self, permission: str) -> bool:
         try:

@@ -13,14 +13,20 @@ Split by bounded context; `MunshiRepository` is the composition:
     approvals    persisted human-in-the-loop approvals
     memory       learned names (per business, across conversations) and order habits
     office       the desktop office console: price changes + history, stock matrix, physical counts, client list
+    finance      money accounts, transfers, journal, period close, the derived ledger and statements (Stream B)
+    payroll      employees + logins, pay, attendance, payroll runs, payslips, advances, statutory (Stream A)
+    attachments  payment proofs linked to money entries (Stream E)
 """
+from munshi.domain.repository.attachments import AttachmentsMixin
 from munshi.domain.repository.base import DOMAIN_ERRORS, CapacityError, CreditHoldError, InsufficientStockError, NotFoundError, OtpError, StateError, new_id
 from munshi.domain.repository.cash import EXPENSE_CATEGORIES, PAYMENT_METHODS
+from munshi.domain.repository.finance import FinanceMixin
 from munshi.domain.repository.memory import MemoryMixin
 from munshi.domain.repository.office import OfficeMixin
+from munshi.domain.repository.payroll import PayrollMixin
 
 
-class MunshiRepository(OfficeMixin, MemoryMixin):
+class MunshiRepository(AttachmentsMixin, PayrollMixin, FinanceMixin, OfficeMixin, MemoryMixin):
     """One business's data. Open with a file path, or ":memory:" for tests."""
 
 

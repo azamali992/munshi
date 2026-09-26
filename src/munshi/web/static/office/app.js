@@ -1,21 +1,35 @@
 /* Office console shell: sign-in (the same phone + PIN, the same session as the phone app), the role gate
    (owner and clerk only), the left nav and a hash router. Each screen is its own module. */
-import { $, $$, api, esc, post, signOut, state, store, toast } from './lib.js';
+import { $, $$, api, can, esc, post, signOut, state, store, toast } from './lib.js';
 import products from './products.js';
 import inventory from './inventory.js';
 import clients from './clients.js';
 import { godowns, suppliers } from './suppliers.js';
 import importExport from './import.js';
+import employees from './employees.js';
+import payroll from './payroll.js';
+import accounts from './accounts.js';
+import finance from './finance.js';
+import close from './close.js';
 
+// [route, label, icon, permissions (any of; omitted = every office role)]. Payroll and finance screens (Stream C)
+// show only to the roles that hold their permission: salaries are the owner's alone (a clerk sees Payroll for
+// attendance only), company finance is the owner's.
 const NAV = [
   ['products', 'Products & prices', '▦'],
   ['inventory', 'Inventory', '▤'],
   ['clients', 'Clients', '☰'],
   ['suppliers', 'Suppliers', '⇲'],
   ['godowns', 'Godowns', '⌂'],
+  ['employees', 'Employees', '☺', ['employees:read']],
+  ['payroll', 'Payroll', '₨', ['payroll:read', 'attendance:write']],
+  ['accounts', 'Accounts & banks', '⊟', ['books:read']],
+  ['finance', 'Finance', '∑', ['finance:read']],
+  ['close', 'Month close', '✓', ['finance:write']],
   ['import', 'Import / export', '⇅'],
 ];
-const SCREENS = { products, inventory, clients, suppliers, godowns, import: importExport };
+const SCREENS = { products, inventory, clients, suppliers, godowns, employees, payroll, accounts, finance, close, import: importExport };
+const allowed = ([, , , perms]) => !perms || perms.some(p => can(p));
 const OFFICE_ROLES = ['owner', 'clerk'];
 const root = $('#root');
 
@@ -65,7 +79,7 @@ function shell() {
     <nav class="o-nav" aria-label="Office">
       <div class="o-brand"><span class="brand-mark"></span>Munshi</div>
       <div class="o-biz">${esc(me.business.name)} · office</div>
-      ${NAV.map(([k, label, ico]) => `<a href="#/${k}" data-nav="${k}"><span class="ico" aria-hidden="true">${ico}</span>${esc(label)}</a>`).join('')}
+      ${NAV.filter(allowed).map(([k, label, ico]) => `<a href="#/${k}" data-nav="${k}"><span class="ico" aria-hidden="true">${ico}</span>${esc(label)}</a>`).join('')}
       <div class="grow"></div>
       <a href="/" title="The chat-first phone app"><span class="ico" aria-hidden="true">✎</span>Phone app</a>
       <a href="#" id="themeT"><span class="ico" aria-hidden="true">◐</span>${store.get('theme', 'light') === 'dark' ? 'Light theme' : 'Dark theme'}</a>
@@ -101,7 +115,7 @@ async function _render() {
   shell();
   const [name, ...rest] = (location.hash.replace(/^#\/?/, '') || 'products').split('/');
   const screen = SCREENS[name];
-  if (!screen) { location.hash = '#/products'; return; }
+  if (!screen || !allowed(NAV.find(n => n[0] === name))) { location.hash = '#/products'; return; }
   $$('[data-nav]').forEach(a => { const on = a.dataset.nav === name; a.classList.toggle('active', on); on ? a.setAttribute('aria-current', 'page') : a.removeAttribute('aria-current'); });
   document.title = `${NAV.find(n => n[0] === name)[1]} · Munshi Office`;
   view.page.innerHTML = '<p class="muted">Loading…</p>'; view.header(NAV.find(n => n[0] === name)[1]);
