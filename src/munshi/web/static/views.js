@@ -856,3 +856,4 @@
     btn.addEventListener('pointerdown', start); btn.addEventListener('pointerup', stop); btn.addEventListener('pointerleave', stop);
   }
 })();
+import('/static/money_views.js').catch(e => console.warn('money views failed to load:', e.message));   // payslips, Money card, change PIN (Stream C)

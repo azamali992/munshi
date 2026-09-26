@@ -75,12 +75,77 @@ RISK_REGISTRY: dict[str, RiskTier] = {
     "log_promise": RiskTier.LOW_RISK,
 }
 
+# Payroll, company finance and payment proofs (plan §6; frozen by Stream 0 on 2026-09-26). The tiers are FINAL here.
+# They live in their own table only because tests/test_safety.py requires RISK_REGISTRY == the tools tools/ exposes
+# today, and these tools are not written yet (Stream D writes them). risk_of() already answers for them (approver_for,
+# the guard and the stub model see the right tier). tools_requiring_approval() -- the HITL interrupt list -- does NOT
+# yet include them, because tests/test_approval_cards requires a card builder for each. So Stream D, in the change
+# that exposes a tool in build_tools() AND adds its CardBuilder._c_<tool>, promotes it into RISK_REGISTRY:
+# RISK_REGISTRY.update(MONEY_TOOL_TIERS) (or a subset) -- the one permitted edit to this file. Exposing a gated tool
+# without promoting it would leave it un-interrupted: tests/test_safety (registry == tools) catches that. Every LOW/HIGH tool below is also in
+# eval/run_eval.py ALWAYS_GATED (registry-independent), with its audit action from domain/accounts.AUDIT_ACTION.
+# Salary visibility (owner decision 2) is not a tier: see domain/accounts.TOOL_PERMISSION.
+MONEY_TOOL_TIERS: dict[str, RiskTier] = {
+    # ---- reads
+    **{t: RiskTier.READ_ONLY for t in (
+        "list_employees", "find_employee", "payroll_preview", "payroll_register", "payslip", "my_payslips",
+        "staff_advances_report", "statutory_summary", "money_accounts", "account_book", "reconciliation_status",
+        "trial_balance", "income_statement", "balance_sheet", "cash_flow", "owner_kpis", "margins_report",
+        "fixed_assets_register", "loans_report", "period_status", "list_attachments")},
+    # ---- clerical entry: clerk or owner, four-eyes
+    "record_attendance": RiskTier.LOW_RISK,            # days / leave / OT minutes / trips: no pay figure on the card
+    "transfer_between_accounts": RiskTier.LOW_RISK,    # money stays inside owner-created accounts
+    "count_cash": RiskTier.LOW_RISK,                   # records only; the difference is posted by the owner
+    "mark_cleared": RiskTier.LOW_RISK,
+    "save_reconciliation": RiskTier.LOW_RISK,
+    # ---- someone's pay: owner
+    "add_employee": RiskTier.HIGH_RISK,
+    "update_employee": RiskTier.HIGH_RISK,
+    "rehire_employee": RiskTier.HIGH_RISK,
+    "set_pay_structure": RiskTier.HIGH_RISK,
+    "set_commission_rule": RiskTier.HIGH_RISK,
+    "end_employment": RiskTier.HIGH_RISK,
+    "add_payroll_adjustment": RiskTier.HIGH_RISK,      # bonus / fine / loss recovery: fines are legally capped
+    "void_payroll_adjustment": RiskTier.HIGH_RISK,
+    "approve_payroll_run": RiskTier.HIGH_RISK,         # books the month's salary cost (accrual)
+    "reverse_payroll_run": RiskTier.HIGH_RISK,
+    "pay_salaries": RiskTier.HIGH_RISK,                # money out, like pay_supplier
+    "reverse_salary_payment": RiskTier.HIGH_RISK,
+    "give_staff_advance": RiskTier.HIGH_RISK,          # money out; PLC s.18
+    "repay_staff_advance": RiskTier.HIGH_RISK,         # money in, but an advance balance is owner-only (decision 2)
+    "reverse_staff_advance": RiskTier.HIGH_RISK,
+    "record_statutory_payment": RiskTier.HIGH_RISK,
+    "add_statutory_rate": RiskTier.HIGH_RISK,          # changes every future payslip
+    "set_payroll_settings": RiskTier.HIGH_RISK,        # the PLC 2026 / old-law switch, registrations
+    # ---- the books: owner
+    "add_money_account": RiskTier.HIGH_RISK,           # the theft vector for transfers
+    "set_method_route": RiskTier.HIGH_RISK,            # where 'bank' money lands
+    "record_capital": RiskTier.HIGH_RISK,
+    "record_drawing": RiskTier.HIGH_RISK,
+    "record_loan": RiskTier.HIGH_RISK,
+    "repay_loan": RiskTier.HIGH_RISK,
+    "add_fixed_asset": RiskTier.HIGH_RISK,
+    "dispose_fixed_asset": RiskTier.HIGH_RISK,
+    "run_depreciation": RiskTier.HIGH_RISK,
+    "post_journal_entry": RiskTier.HIGH_RISK,
+    "reverse_journal_entry": RiskTier.HIGH_RISK,
+    "reverse_account_transfer": RiskTier.HIGH_RISK,
+    "post_cash_difference": RiskTier.HIGH_RISK,
+    "record_opening_balances": RiskTier.HIGH_RISK,
+    "close_period": RiskTier.HIGH_RISK,
+    "reopen_period": RiskTier.HIGH_RISK,
+}
+
 _ORDER = [RiskTier.READ_ONLY, RiskTier.OTP_GATED, RiskTier.LOW_RISK, RiskTier.HIGH_RISK]
 
 
 def risk_of(tool_name: str) -> RiskTier:
     try:
         return RISK_REGISTRY[tool_name]
+    except KeyError:
+        pass
+    try:
+        return MONEY_TOOL_TIERS[tool_name]
     except KeyError as e:
         raise ValueError(f"unregistered tool {tool_name!r}: add it to RISK_REGISTRY before exposing it") from e
 
@@ -88,6 +153,8 @@ def risk_of(tool_name: str) -> RiskTier:
 def tools_requiring_approval() -> list[str]:
     """Tools that pause for a human in the app. OTP-gated tools are not here:
     the customer's code is their approval, and it is verified in the repository."""
+    # Live tools only: every one needs an approval-card builder (platform.CardBuilder._c_<tool>, tests/test_approval_cards).
+    # A MONEY_TOOL_TIERS tool joins this list when Stream D promotes it into RISK_REGISTRY with its card builder.
     return [n for n, t in RISK_REGISTRY.items() if t in (RiskTier.LOW_RISK, RiskTier.HIGH_RISK)]
 
 

@@ -33,6 +33,14 @@ DOC_SERIES: dict[str, str | None] = {
     "reversal": "REV",           # a reversing entry on the customer khata (e.g. bounced cheque)
     "purchase": "PUR",           # goods received from a supplier
     "purchase_return": "PRN",    # reversal of a purchase (goods and bill go back)
+    # payroll and finance (Stream 0; names and prefixes frozen in domain/accounts.MONEY_SERIES)
+    "payroll": "PAY",            # a payroll run (and its reversal run)
+    "payslip": "PSL",            # one employee's slip in a run
+    "salary_payment": "SPM",     # salary paid out against a slip
+    "advance": "ADV",            # staff advance / loan / direct repayment
+    "statutory": "STY",          # EOBI / social security / withholding-tax challan paid (NOT 'STP': that is a delivery stop's id)
+    "journal": "JV",             # journal voucher: capital, drawings, loans, assets, depreciation, openings, adjustments
+    "transfer": "XFR",           # transfer between the business's own money accounts (NOT 'TRF': a stock transfer's ref)
 }
 RESERVED_PREFIXES = {p for p in DOC_SERIES.values() if p}
 

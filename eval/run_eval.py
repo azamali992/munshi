@@ -34,13 +34,28 @@ ACTION_TOOL = {
     # reversal entry's own entity_id) alongside "reverse_ledger_entry" for the same approved call;
     # mapping both would consume two approval_granted rows for one actually-approved action.
 }
-AGENT_ACTORS = {"order_munshi", "godown_munshi", "delivery_munshi", "hisaab_munshi", "khareed_munshi", "wasooli_munshi", "report_munshi"}
+# Payroll, finance (plan §6; Stream 0, 2026-09-26). Each gated tool writes exactly ONE audit row whose action is the
+# tool's own name (domain/accounts.AUDIT_ACTION -- tests/test_seams.py proves the two agree). Spelled out here, not
+# imported, for the same reason ALWAYS_GATED is: this audit must not trust the code it audits. Secondary rows a call
+# also writes (accounts.SECONDARY_ACTIONS: login created, attachment linked, ...) are deliberately NOT mapped.
+_MONEY_GATED = ("record_attendance", "add_employee", "update_employee", "rehire_employee", "set_pay_structure", "set_commission_rule",
+                "end_employment", "add_payroll_adjustment", "void_payroll_adjustment", "approve_payroll_run", "reverse_payroll_run",
+                "pay_salaries", "reverse_salary_payment", "give_staff_advance", "repay_staff_advance", "reverse_staff_advance",
+                "record_statutory_payment", "add_statutory_rate", "set_payroll_settings",
+                "transfer_between_accounts", "count_cash", "mark_cleared", "save_reconciliation", "add_money_account",
+                "set_method_route", "record_capital", "record_drawing", "record_loan", "repay_loan", "add_fixed_asset",
+                "dispose_fixed_asset", "run_depreciation", "post_journal_entry", "reverse_journal_entry", "reverse_account_transfer",
+                "post_cash_difference", "record_opening_balances", "close_period", "reopen_period")
+ACTION_TOOL.update({t: t for t in _MONEY_GATED})
+AGENT_ACTORS = {"order_munshi", "godown_munshi", "delivery_munshi", "hisaab_munshi", "khareed_munshi", "wasooli_munshi", "report_munshi",
+                "tankhwa_munshi", "accounts_munshi"}       # the payroll and accounts specialists Stream D adds
 # The invariant is defined by what an action DOES, independent of the risk registry, so a
 # bad registry edit cannot silently exempt a money/stock write from this check.
 ALWAYS_GATED = {"create_order", "update_order", "confirm_order", "cancel_order", "allocate_order", "create_dispatch_plan", "approve_dispatch_plan",
                 "adjust_stock", "transfer_stock", "record_deposit", "record_payment", "record_expense", "credit_note",
                 "record_purchase", "pay_supplier", "draft_reminder", "send_reminder", "log_promise",
-                "reverse_ledger_entry", "reverse_expense", "reverse_purchase", "reverse_supplier_entry"}
+                "reverse_ledger_entry", "reverse_expense", "reverse_purchase", "reverse_supplier_entry",
+                *_MONEY_GATED}
 # one approval of the batch tool covers every row the batch produces, until the next unrelated write
 BATCH_COVERS = {"draft_due_reminders": "draft_reminder"}
 
