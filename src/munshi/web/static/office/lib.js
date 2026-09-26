@@ -81,12 +81,12 @@ export function toast(msg, ms = 3000) {
 // ---------------------------------------------------------------- side panel
 /* panel({title, body, onSubmit, submitLabel, wide, onOpen}) -- a right-hand drawer holding a form. onSubmit(data, form)
    may return false to keep the panel open; a thrown error is shown inside the panel, in plain words, not as a toast. */
-export function panel({ title, body, onSubmit = null, submitLabel = 'Save', wide = false, onOpen = null, footer = '' }) {
+export function panel({ title, body, onSubmit = null, submitLabel = 'Save', wide = false, onOpen = null, footer = '', closeLabel = 'Cancel' }) {
   const wrap = $('#drawer'); wrap.hidden = false;
   wrap.innerHTML = `<div class="scrim"></div><form class="o-panel${wide ? ' wide' : ''}" novalidate role="dialog" aria-modal="true" aria-label="${esc(title)}">
     <div class="o-panel-h"><h2>${esc(title)}</h2><button type="button" class="x" aria-label="Close">✕</button></div>
     <div class="o-panel-b">${body}<p class="formerr" role="alert"></p></div>
-    ${onSubmit || footer ? `<div class="o-panel-f">${footer}<button type="button" class="btn ghost" data-close>Cancel</button>${onSubmit ? `<button class="btn primary" type="submit">${esc(submitLabel)}</button>` : ''}</div>` : ''}</form>`;
+    ${onSubmit || footer ? `<div class="o-panel-f">${footer}<button type="button" class="btn ghost" data-close>${esc(closeLabel)}</button>${onSubmit ? `<button class="btn primary" type="submit">${esc(submitLabel)}</button>` : ''}</div>` : ''}</form>`;
   const form = $('form', wrap), err = $('.formerr', wrap);
   const onKey = e => { if (e.key === 'Escape') close(); };
   const close = () => { wrap.hidden = true; wrap.innerHTML = ''; document.removeEventListener('keydown', onKey); };
@@ -165,3 +165,148 @@ export function table(container, opts) {
     render,
   };
 }
+
+// ================================================================ payroll, finance and proofs (Stream C)
+// ---------------------------------------------------------------- words
+/* The console's words for the payroll / finance screens live in ../i18n.js (English + Urdu, one key each) so the
+   phone and the console share one dictionary. The console is English today (OFFICE_LANG); the Urdu keys are ready
+   for when it gets a language switch. t('key', {n: 3}) fills {n}. */
+try { await import('/static/i18n.js'); } catch { /* keys fall back to themselves; never blocks the console */ }
+export const OFFICE_LANG = 'en';
+export const t = (k, vars) => {
+  const L = window.MUNSHI_I18N || {}; let s = (L[OFFICE_LANG] || {})[k] ?? (L.en || {})[k] ?? k;
+  if (vars) s = s.replace(/\{(\w+)\}/g, (m, v) => (v in vars ? String(vars[v]) : m));
+  return s;
+};
+
+// ---------------------------------------------------------------- dates
+export const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+export const monthLabel = p => { const m = /^(\d{4})-(\d{2})$/.exec(p || ''); return m ? `${MONTHS[+m[2] - 1]} ${m[1]}` : String(p || ''); };
+export const thisPeriod = () => todayPk().slice(0, 7);
+export const shiftPeriod = (p, n) => { const [y, m] = p.split('-').map(Number); const d = new Date(Date.UTC(y, m - 1 + n, 1)); return d.toISOString().slice(0, 7); };
+export const monthEnd = p => { const [y, m] = p.split('-').map(Number); return new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10); };
+export const monthStart = p => p + '-01';
+
+// ---------------------------------------------------------------- the shared table shape
+/* renderTable(spec, opts) -> html. `spec` is exactly the server's table payload (domain/accounts.table, the same shape
+   the chat bubble renders): {title, columns:[{key,label,align,kind,badge?}], rows (a row may carry _em), totals, note}.
+   Money is right-aligned with tabular numerals, always two decimals (so a column's decimal points line up), a real
+   minus sign, and no "Rs" in every cell -- the table says "Amounts in Rs" once. Badge columns are a word in a
+   bordered pill with a glyph (never colour alone). opts: {caption (visible title, default spec.title), rowAttr(row, i)
+   -> extra <tr> attributes, cell(col, row) -> html|undefined to override a cell, empty (text), id, compact}. */
+const MONEY_FMT = new Intl.NumberFormat('en-PK', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const GOOD_WORDS = new Set(['cleared', 'paid', 'active', 'ok', 'yes', 'approved', 'in use', 'reconciled', 'open']);
+export function fmtCell(v, kind) {
+  if (v === null || v === undefined || v === '') return '';
+  const n = Number(v);
+  if (kind === 'money') return isFinite(n) ? (n < 0 ? '−' : '') + MONEY_FMT.format(Math.abs(n)) : esc(v);
+  if (kind === 'qty' || kind === 'days') return isFinite(n) ? (n < 0 ? '−' : '') + Math.abs(n).toLocaleString('en-PK', { maximumFractionDigits: 2 }) : esc(v);
+  if (kind === 'pct') return isFinite(n) ? (n < 0 ? '−' : '') + Math.abs(n).toLocaleString('en-PK', { maximumFractionDigits: 1 }) + '%' : esc(v);
+  if (kind === 'date') { const m = String(v).match(/^(\d{4})-(\d{2})-(\d{2})/); return m ? `${+m[3]} ${MONTHS[+m[2] - 1].slice(0, 3)} ${m[1]}` : esc(v); }
+  return esc(v);
+}
+export const badge = v => {
+  if (v === null || v === undefined || v === '' || v === false) return '';
+  const w = String(v); const good = GOOD_WORDS.has(w.toLowerCase());
+  return `<span class="pill ${good ? 'good' : 'warn'} o-badge"><span aria-hidden="true">${good ? '✓' : '⚑'}</span> ${esc(w)}</span>`;
+};
+const isNum = c => c.align === 'right' || ['money', 'qty', 'days', 'pct'].includes(c.kind);
+export function renderTable(spec, opts = {}) {
+  const cols = spec?.columns || [], rows = spec?.rows || [];
+  const hasMoney = cols.some(c => c.kind === 'money');
+  const cell = (c, r) => {
+    const o = opts.cell?.(c, r); if (o !== undefined) return o;
+    const v = r[c.key]; if (c.badge) return badge(v);
+    // statement lines keep their indentation ("  Fuel" under "Operating expenses"): leading spaces become a padding
+    const lead = c.kind === 'text' && typeof v === 'string' ? v.length - v.trimStart().length : 0;
+    return lead ? `<span style="padding-inline-start:${Math.min(lead, 8) * 0.6}em">${esc(v.trimStart())}</span>` : fmtCell(v, c.kind);
+  };
+  const title = opts.caption ?? spec?.title ?? '';
+  const head = `<thead><tr>${cols.map((c, i) => `<th scope="col" class="${isNum(c) ? 'n' : ''}${i === 0 ? ' o-first' : ''}">${esc(c.label)}</th>`).join('')}</tr></thead>`;
+  const body = rows.length ? rows.map((r, i) => `<tr class="${r._em ? 'em' : ''}" ${opts.rowAttr ? opts.rowAttr(r, i) : ''}>${cols.map((c, j) => j === 0
+    ? `<th scope="row" class="o-first ${isNum(c) ? 'n' : ''}">${cell(c, r)}</th>` : `<td class="${isNum(c) ? 'n' : ''}${c.kind === 'money' && Number(r[c.key]) < 0 ? ' neg' : ''}">${cell(c, r)}</td>`).join('')}</tr>`).join('')
+    : `<tr><td colspan="${cols.length || 1}" class="o-empty">${esc(opts.empty || t('st.empty'))}</td></tr>`;
+  const tot = spec?.totals && rows.length ? `<tfoot><tr>${cols.map((c, j) => j === 0 ? `<th scope="row" class="o-first">${esc(spec.totals[c.key] ?? t('st.total'))}</th>`
+    : `<td class="${isNum(c) ? 'n' : ''}${c.kind === 'money' && Number(spec.totals[c.key]) < 0 ? ' neg' : ''}">${c.key in spec.totals && spec.totals[c.key] !== null ? fmtCell(spec.totals[c.key], c.kind) : ''}</td>`).join('')}</tr></tfoot>` : '';
+  return `<figure class="o-st${opts.compact ? ' compact' : ''}" ${opts.id ? `id="${esc(opts.id)}"` : ''}>
+    ${title || hasMoney ? `<figcaption class="o-st-h">${title ? `<span class="o-st-t">${esc(title)}</span>` : ''}${hasMoney ? `<span class="o-st-u">${esc(t('st.amounts_rs'))}</span>` : ''}</figcaption>` : ''}
+    <div class="o-tw free"><table class="o-t o-stt">${title ? `<caption class="sr">${esc(title)}</caption>` : ''}${head}<tbody>${body}</tbody>${tot}</table></div>
+    ${spec?.note ? `<p class="o-st-note">${esc(spec.note)}</p>` : ''}</figure>`;
+}
+/* The skeleton a table shows while it loads: the same frame and roughly the same height, so nothing jumps. */
+export const skeleton = (rows = 6, cols = 5) => `<div class="o-skel" aria-hidden="true">${Array.from({ length: rows }, () => `<div class="o-skel-r">${Array.from({ length: cols }, (_, i) => `<i style="flex:${i === 0 ? 3 : 1}"></i>`).join('')}</div>`).join('')}</div><span class="sr" role="status">${esc(t('loading'))}</span>`;
+
+// ---------------------------------------------------------------- tabs
+export const tabsNav = (base, tabs, cur, label) => `<nav class="o-tabs" aria-label="${esc(label)}">${tabs.map(([k, l]) => `<a href="#/${base}${k ? '/' + k : ''}" class="${k === cur ? 'active' : ''}" ${k === cur ? 'aria-current="page"' : ''}>${esc(l)}</a>`).join('')}</nav>`;
+export const refresh = () => window.dispatchEvent(new HashChangeEvent('hashchange'));
+
+// ---------------------------------------------------------------- confirm dialog
+/* confirmDialog({title, body (html), confirmLabel, danger, onConfirm, fields}) -- a centred modal for the decisions
+   that change the books: approve payroll, close a month, end someone's employment. It restates the effect in plain
+   words, the safe choice (Cancel) has focus first, Escape cancels, focus stays inside while it is open and returns to
+   the button that opened it. onConfirm(data) may throw: the message is shown in the dialog. `fields` is extra form
+   html (a reason, a date); its values arrive in `data`. */
+/* Modals get their own layer above the side panel, so a confirm opened from a panel returns to it on Cancel. */
+const modalRoot = () => {
+  let m = document.getElementById('oModal');
+  if (!m) { m = document.createElement('div'); m.id = 'oModal'; m.className = 'o-drawer o-modal-root'; m.hidden = true; document.body.appendChild(m); }
+  return m;
+};
+export function confirmDialog({ title, body = '', confirmLabel = t('confirm'), danger = false, onConfirm, fields = '' }) {
+  const wrap = modalRoot(); const back = document.activeElement; wrap.hidden = false;
+  wrap.innerHTML = `<div class="scrim"></div><form class="o-modal${danger ? ' danger' : ''}" role="alertdialog" aria-modal="true" aria-labelledby="cdT" aria-describedby="cdB" novalidate>
+    <h2 id="cdT">${esc(title)}</h2><div id="cdB" class="o-modal-b">${body}</div>${fields}
+    <p class="formerr" role="alert"></p>
+    <div class="o-modal-f"><button type="button" class="btn ghost" data-close>${esc(t('cancel'))}</button><button type="submit" class="btn ${danger ? 'danger solid' : 'primary'}">${esc(confirmLabel)}</button></div></form>`;
+  const form = $('form', wrap), err = $('.formerr', wrap);
+  const close = () => { wrap.hidden = true; wrap.innerHTML = ''; document.removeEventListener('keydown', onKey, true); back?.focus?.(); };
+  const onKey = e => {
+    if (e.key === 'Escape') { e.preventDefault(); e.stopImmediatePropagation(); close(); return; }
+    if (e.key !== 'Tab') return;
+    const f = $$('button,input,select,textarea,a[href]', form).filter(x => !x.disabled); if (!f.length) return;
+    if (e.shiftKey && document.activeElement === f[0]) { e.preventDefault(); f[f.length - 1].focus(); }
+    else if (!e.shiftKey && document.activeElement === f[f.length - 1]) { e.preventDefault(); f[0].focus(); }
+  };
+  document.addEventListener('keydown', onKey, true);
+  $('.scrim', wrap).onclick = close; $('[data-close]', wrap).onclick = close;
+  form.onsubmit = async e => {
+    e.preventDefault(); if (!form.checkValidity()) { form.reportValidity(); return; }
+    const data = {}; for (const [k, v] of new FormData(form).entries()) data[k] = v;
+    const btn = $('button[type=submit]', form); btn.disabled = true; err.textContent = '';
+    try { const r = await onConfirm?.(data); if (r !== false) close(); } catch (x) { err.textContent = x.message; } finally { btn.disabled = false; }
+  };
+  setTimeout(() => (fields ? $('input,select,textarea', form) : $('[data-close]', form))?.focus(), 30);
+  return { close, el: form };
+}
+
+// ---------------------------------------------------------------- a generated PIN, shown once
+/* pinOnce({name, phone, pin, text}) -- the only place a generated PIN is ever shown. It lives in this dialog's DOM and
+   in this closure, nowhere else: it is never stored (localStorage, sessionStorage), never logged, never sent to any
+   endpoint. "Send on WhatsApp" is a wa.me link built here in the browser from the API's ready text; the PIN leaves
+   the device only when the owner taps Send in WhatsApp itself. Closing the dialog wipes it; it cannot be shown again. */
+export const waNumber = phone => { const d = String(phone || '').replace(/\D/g, ''); return /^03\d{9}$/.test(d) ? '92' + d.slice(1) : /^923\d{9}$/.test(d) ? d : ''; };
+export function pinOnce({ name, phone, pin, text }) {
+  const wrap = modalRoot(); wrap.hidden = false;
+  const wa = `https://wa.me/${waNumber(phone)}?text=${encodeURIComponent(text || '')}`;
+  wrap.innerHTML = `<div class="scrim"></div><div class="o-modal o-pinbox" role="alertdialog" aria-modal="true" aria-labelledby="pinT" aria-describedby="pinW">
+    <h2 id="pinT">${esc(t('pr.pin_for', { name }))}</h2>
+    <p id="pinW" class="o-note warn"><span aria-hidden="true">⚠</span> ${esc(t('pr.pin_once_warn'))}</p>
+    <div class="o-pin" aria-label="${esc(t('pr.pin_is'))} ${esc(pin.split('').join(' '))}"><span aria-hidden="true">${esc(pin.slice(0, 3))}</span><span aria-hidden="true">${esc(pin.slice(3))}</span></div>
+    <p class="hint" style="margin:0">${esc(t('pr.pin_first_signin'))}${phone ? ` · ${esc(phone)}` : ''}</p>
+    <div class="o-modal-f"><button type="button" class="btn" id="pinCopy">${esc(t('pr.copy_pin'))}</button>
+      <a class="btn" id="pinWa" href="${esc(wa)}" target="_blank" rel="noopener noreferrer">${esc(t('pr.send_whatsapp'))}</a>
+      <button type="button" class="btn primary" id="pinDone">${esc(t('pr.pin_given'))}</button></div></div>`;
+  const onKey = e => { if (e.key === 'Escape') { e.preventDefault(); e.stopImmediatePropagation(); ask(); } };
+  const close = () => { wrap.hidden = true; wrap.innerHTML = ''; document.removeEventListener('keydown', onKey, true); pin = ''; text = ''; };
+  // closing loses the PIN for good: an accidental Escape or scrim click asks first
+  const ask = () => { if (confirm(t('pr.pin_close_q'))) close(); };
+  document.addEventListener('keydown', onKey, true);
+  $('.scrim', wrap).onclick = ask; $('#pinDone').onclick = close;
+  $('#pinCopy').onclick = async () => { try { await navigator.clipboard.writeText(pin); toast(t('copied')); } catch { toast(t('pr.copy_failed'), 4000); } };
+  setTimeout(() => $('#pinCopy')?.focus(), 30);
+}
+
+// ---------------------------------------------------------------- the statutory boundary line
+export const boundary = (txt, verified) => `<p class="o-boundary"><b>${esc(t('pr.not_advice'))}</b> ${esc(txt || t('pr.boundary', { verified_on: verified || '—' }))}</p>`;
+export const rupees = v => Math.round(Number(v || 0) * 100);           // paisa, for exact client-side arithmetic
+export const fromPaisa = p => p / 100;

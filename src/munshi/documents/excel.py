@@ -120,6 +120,30 @@ def import_xlsx(repo: MunshiRepository, data: bytes, actor: str) -> dict:
     return result
 
 
+def _safe(v):
+    """A text cell that starts like a formula is written as text (no formula injection when the accountant opens it)."""
+    return "'" + v if isinstance(v, str) and v[:1] in ("=", "+", "-", "@") else v
+
+
+def finance_sheets(repo: MunshiRepository, sheet, start: str = "2000-01-01", end: str | None = None) -> None:
+    """The accountant's sheets (Stream B): the general journal (every derived posting), the trial balance, and each
+    money account's book. Owner-only like the whole export (permission 'export'), so the books are not redacted."""
+    from munshi.domain.models import today_iso
+    end = end or today_iso()
+    gj = repo.general_journal(start, end)
+    cols = ["date", "doc", "source", "code", "account", "party", "debit", "credit", "memo"]
+    sheet("GeneralJournal", [{k: _safe(r[k]) for k in cols} for r in gj["rows"]], cols)
+    tb = repo.trial_balance(end)
+    sheet("TrialBalance", [{k: _safe(r.get(k)) for k in ("code", "account", "debit", "credit")} for r in tb["table"]["rows"]]
+          + [{"code": "", "account": "Total", "debit": tb["debits"], "credit": tb["credits"]}], ["code", "account", "debit", "credit"])
+    rows = []
+    for a in repo.list_money_accounts(include_inactive=True)["accounts"]:
+        book = repo.account_book(a["account_id"], start, end)
+        for r in book["table"]["rows"]:
+            rows.append({"account": a["account"]} | {k: _safe(r.get(k)) for k in ("date", "doc", "kind", "narration", "money_in", "money_out", "balance", "cleared", "by")})
+    sheet("Books", rows, ["account", "date", "doc", "kind", "narration", "money_in", "money_out", "balance", "cleared", "by"])
+
+
 def export_xlsx(repo: MunshiRepository) -> bytes:
     wb = Workbook(); wb.remove(wb.active)
 
@@ -144,5 +168,6 @@ def export_xlsx(repo: MunshiRepository) -> bytes:
     sheet("Purchases", [asdict(p) | {"items": ", ".join(f"{i['qty']}×{i['sku']}@{i['unit_cost']}" for i in p.items)} for p in repo.list_purchases(5000)], ["purchase_id", "created_at", "supplier_id", "warehouse_id", "items", "total", "paid_amount", "invoice_ref"])
     sheet("Expenses", [asdict(x) for x in repo.expenses_between("2000-01-01", "2999-12-31")], ["expense_id", "expense_date", "category", "amount", "method", "note", "paid_by"])
     sheet("StockMoves", [m.__dict__ for m in repo.stock_moves(limit=20000)], ["created_at", "warehouse_id", "sku", "delta", "kind", "ref"])
+    finance_sheets(repo, sheet)
     sheet("Audit", repo.audit_log(5000), ["created_at", "actor", "user", "action", "entity", "entity_id", "approved_by"])
     buf = io.BytesIO(); wb.save(buf); return buf.getvalue()

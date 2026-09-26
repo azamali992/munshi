@@ -24,12 +24,22 @@ def token_of(x_session: str | None = Header(default=None), authorization: str | 
     return None
 
 
+# While a user still carries an owner-issued PIN (Principal.must_change_pin) these are the ONLY routes they can reach:
+# who am I, change my PIN, sign out. Everything else answers 403 {"detail": {"error": "pin_change_required", ...}}.
+# Enforced here, in the one dependency every authenticated route goes through -- not in middleware.
+PIN_CHANGE_ALLOWED = frozenset({("GET", "/api/me"), ("POST", "/api/me/pin"), ("POST", "/api/session/logout")})
+
+
 def current(request: Request, token: str | None = Depends(token_of)) -> Principal:
     try:
         p = hub_of(request).registry.resolve(token)
     except AuthError as e:
         raise HTTPException(401, str(e))
     request.state.principal = p
+    # scope["path"], not request.url.path: request.url is rebuilt from the Host header, and a malformed Host made that
+    # path lie to path-based auth checks before Starlette 1.0.1 (CVE-2026-48710 "BadHost"; this venv has 1.7.0).
+    if p.must_change_pin and (request.method, str(request.scope.get("path", "")).rstrip("/")) not in PIN_CHANGE_ALLOWED:
+        raise HTTPException(403, {"error": "pin_change_required", "message": "choose your own PIN before using Munshi"})
     return p
 
 

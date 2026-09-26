@@ -22,6 +22,7 @@ from munshi.auth.principal import PERMISSIONS, ROLES, Principal, roles_with
 from munshi.domain import accounts, migrations, migrations_attachments, migrations_finance, migrations_payroll
 from munshi.domain.models import Customer, Product
 from munshi.domain.repository import MunshiRepository
+from munshi.domain.repository.base import NotFoundError
 from munshi.domain.repository.numbering import DOC_SERIES, RESERVED_PREFIXES, next_doc_no
 from munshi.safety.risk import MONEY_TOOL_TIERS, RISK_REGISTRY, RiskTier, approver_for, risk_of, tools_requiring_approval
 
@@ -268,13 +269,16 @@ def test_repository_skeletons_compose_without_shadowing_and_default_safely():
         assert not own & old, f"{mixin.__name__} would shadow {own & old}"
     r = MunshiRepository(":memory:")
     assert r.assert_period_open("2026-09-26") is None
-    assert (r.resolve_account("cash"), r.resolve_account("bank"), r.resolve_account("bank", "ACC-HBL")) == ("CASH", None, "ACC-HBL")
+    # Stream B landed: an unrouted method resolves to the virtual UNASSIGNED account, never None (SEAMS §7)
+    assert (r.resolve_account("cash"), r.resolve_account("bank"), r.resolve_account("bank", "ACC-HBL")) == ("CASH", accounts.UNASSIGNED_ACCOUNT_ID, "ACC-HBL")
     assert r.payroll_profile() == accounts.PROFILE_PLC_2026 == accounts.DEFAULT_PAYROLL_PROFILE      # owner decision 1
     r.set_setting("payroll_profile", "legacy_1969"); assert r.payroll_profile() == "legacy_1969"
     assert r._payroll_postings("2026-09-01", "2026-09-30") == [] and set(r.payroll_liabilities_paisa().values()) == {0}
-    for call in (lambda: r.payroll_register(period="2026-09"), lambda: r.balance_sheet(), lambda: r.store_attachment(b"x", "a.jpg", "image/jpeg", "u", "a")):
-        with pytest.raises(NotImplementedError):
-            call()
+    assert r.balance_sheet()["balanced"]                                  # Stream B landed
+    with pytest.raises(NotFoundError):                                    # Stream A landed: a real lookup, not a stub
+        r.payroll_register(period="2026-09")
+    with pytest.raises(ValueError):                                      # Stream E landed: the bytes are checked
+        r.store_attachment(b"x", "a.jpg", "image/jpeg", "u", "a")
 
 
 def test_plc_limits_are_the_ones_the_owner_chose():

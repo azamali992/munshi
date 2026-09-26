@@ -5,6 +5,7 @@ query that touches tenant B — isolation is by file, not by WHERE clause."""
 from __future__ import annotations
 
 import os
+import shutil
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -117,6 +118,7 @@ class TenantHub:
                 for suffix in (".db", ".db-wal", ".db-shm", ".agents.db", ".agents.db-wal", ".agents.db-shm"):
                     f = self.data_dir / "tenants" / f"{DEMO_BUSINESS_ID}{suffix}"
                     if f.exists(): f.unlink()
+                shutil.rmtree(self.data_dir / "files" / DEMO_BUSINESS_ID, ignore_errors=True)   # the demo's payment proofs
                 repo = MunshiRepository(self.db_path(DEMO_BUSINESS_ID)); seed(repo); repo.close()
             else:
                 self._platforms[DEMO_BUSINESS_ID] = MunshiPlatform(seed(MunshiRepository(":memory:")), self.model, enable_tracing=self.enable_tracing)
