@@ -122,6 +122,7 @@ window.MUNSHI_I18N = {
     "ap.w_big_order": "Above the big-order limit of {limit}: the owner must approve.",
     "ap.w_short_stock": "Not enough stock: {product} needs {need}, only {available} available.",
     "ap.w_below_zero": "Only {on_hand} {product} on hand at {godown}: stock can't go below zero, so approving will fail.",
+    "ap.w_stock_gain": "This adds {value} of stock with no supplier bill, so it counts as profit. If it came from a supplier, record a purchase instead.",
     "ap.w_bad_status": "{what} {id} is {status}: approving will fail.",
     "ap.w_over_capacity": "{units} units won't fit: the vehicle holds {capacity}.",
     "ap.w_overpay": "More than is owed: the balance goes to {after}.",
@@ -941,6 +942,7 @@ window.MUNSHI_I18N = {
     'ap.w_big_order': 'بڑے آرڈر کی حد {limit} سے زیادہ: مالک کی منظوری درکار۔',
     'ap.w_short_stock': 'اسٹاک کم: {product} کے {need} چاہییں، صرف {available} دستیاب۔',
     'ap.w_below_zero': '{godown} میں {product} کے صرف {on_hand} موجود: اسٹاک صفر سے کم نہیں ہو سکتا، منظوری ناکام ہو گی۔',
+    'ap.w_stock_gain': 'اس سے {value} کا اسٹاک بغیر سپلائر بل کے بڑھے گا، یعنی منافع میں گنا جائے گا۔ اگر سپلائر سے آیا ہے تو خریداری درج کریں۔',   // (?)
     'ap.w_bad_status': '{what} {id} کی حالت {status} ہے: منظوری ناکام ہو گی۔',
     'ap.w_over_capacity': '{units} یونٹ نہیں سمائیں گے: گاڑی کی گنجائش {capacity}۔',
     'ap.w_overpay': 'واجب سے زیادہ: بقایا {after} ہو جائے گا۔',

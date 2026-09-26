@@ -335,6 +335,7 @@ CARD_EN = {
     "w_big_order": "Above the big-order limit of {limit}: the owner must approve.",
     "w_short_stock": "Not enough stock: {product} needs {need}, only {available} available.",
     "w_below_zero": "Only {on_hand} {product} on hand at {godown}: stock can't go below zero, so approving will fail.",
+    "w_stock_gain": "This adds {value} of stock with no supplier bill, so it counts as profit. If it came from a supplier, record a purchase instead.",
     "w_bad_status": "{what} {id} is {status}: approving will fail.",
     "w_empty_order": "No lines would be left: cancel the order instead. Approving will fail.",
     "w_over_capacity": "{units} units won't fit: the vehicle holds {capacity}.",
@@ -772,6 +773,8 @@ class CardBuilder:
         warns = [] if p else [_t("w_unknown_product", sku=sku)]
         if after < 0:
             warns.append(_t("w_below_zero", on_hand=before, product=pname, godown=gname))
+        if delta > 0 and cost_p:                                      # a stock-take gain, not a delivery: say what it does to profit
+            warns.append(_t("w_stock_gain", value=_rs(delta * cost_p)))
         facts = [{"key": "reason", "value": str(a["reason"])}] if a.get("reason") else []
         return {"title": _t("t_write_off" if delta < 0 else "t_add_stock", qty=abs(delta), product=pname, godown=gname),
                 "effect": _t("stock_adjust", product=pname, godown=gname, before=before, after=after, value=_rs(abs(delta) * cost_p)),
