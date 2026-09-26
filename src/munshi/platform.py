@@ -91,6 +91,7 @@ from munshi.domain.seed import seeded_repository
 from munshi.llm import answers
 from munshi.llm import followup as FU
 from munshi.llm import grounding as GR
+from munshi.llm import guardrails as GRD
 from munshi.llm import memory as MEM
 from munshi.llm import replies as RP
 from munshi.llm import turns as TURNS
@@ -975,8 +976,9 @@ class MunshiPlatform:
         return None, None
 
     def handle_message(self, thread_id: str, role: str, text: str, user: str = "") -> Reply:
-        # Every write this turn makes -- including any tool the agent runs on a worker thread -- is `user`'s.
-        with self._lock, self.repo.acting_as(user):
+        # Every write this turn makes -- including any tool the agent runs on a worker thread -- is `user`'s; every read is
+        # scoped to what `role` may see (llm/guardrails.py: viewing_as / check_scope), whichever engine runs it.
+        with self._lock, self.repo.acting_as(user), GRD.viewing_as(role):
             self.repo.add_chat(thread_id, role, text, {"user": user})
             try:
                 said = self._memory_command(role, text, user)
@@ -1026,7 +1028,9 @@ class MunshiPlatform:
                                 meta["learned"] = learned
                         except Exception:
                             log.exception("couldn't learn from the answer on %s", thread_id)
+                    reply.text = GRD.redact_reply(reply.text, role, self.repo)     # the role's data policy on the folded details
                     if reply.tables:
+                        reply.tables = GRD.redact_tables(reply.tables, role, self.repo)   # ...and on the tables built from the same data
                         meta["tables"] = reply.tables
                     self.repo.add_chat(thread_id, "munshi", reply.text, meta)
                     return reply
@@ -1931,8 +1935,9 @@ class MunshiPlatform:
             read = (read + " " if read else "") + f"This message is about the {fc['kind']} of the conversation: {fc['name']} = {fc['id']}."
         rows = self.repo.chat_history(thread_id, self._CONTEXT_LINES + 1)[:-1]
         lines = "\n".join(f"{'munshi' if r['role'] == 'munshi' else 'user'}: {str(r['text'])[:240]}" for r in rows)
+        read, lines = GRD.data_text(read), GRD.data_text(lines)        # names and past lines are data: instruction-like text withheld
         earlier = f"\nEarlier in this chat, for context only -- act on the next message:\n{lines}" if rows else ""
-        return [HumanMessage(f"(Note from the system, not from the user. {script}" + (f" {read}" if read else "") + f"{earlier})")]
+        return [HumanMessage(f"(Note from the system, not from the user. {script} {GRD.DATA_NOTICE}" + (f" {read}" if read else "") + f"{earlier})")]
 
     # A model reply that says something was done (recorded, created, received...) when no write ran and no card was
     # raised this turn. Seen on real traffic: "Green Valley ka payment record kar diya gaya" with no tool call at all.
@@ -1989,10 +1994,20 @@ class MunshiPlatform:
             reply, meta = fallback, dict(fallback_meta)
             reply.model_error = meta["model_error"] = "ModelUnavailable"
             return reply, meta | {"engine": reply.engine, "model_calls": 0, "model_tokens": 0, "model_down_until": self._model_down_until.isoformat()}
+        # guardrails (llm/guardrails.py): an over-long, adversarial or over-budget message never reaches the model
+        gate = GRD.admit(self.repo, role, user, text)
+        if not gate.go:
+            reply, meta = fallback, dict(fallback_meta) | {"guardrail": gate.reason}
+            if gate.reply:
+                reply.text = gate.reply if gate.reason.startswith("injection") else f"{gate.reply}\n\n{reply.text}"
+                reply.ask = None
+            GRD.log_turn(self.repo, gate, 0, 0, "kept_from_model")
+            return reply, meta | {"engine": reply.engine, "model_calls": 0, "model_tokens": 0}
+        text = gate.text
         token = guard.set_history(self._history_lines(thread_id))
         ttoken = guard.set_topic(self._topic)
         try:
-            reply, meta, _ = self._turn(MODEL, thread_id, role, text, user, tr, config={"callbacks": [calls]}, context=self._context(thread_id, text))
+            reply, meta, _ = self._turn(MODEL, thread_id, role, text, user, tr, config={"callbacks": [calls, gate.budget]}, context=self._context(thread_id, text))
             if reply.specialist is None:                   # the model routed nowhere either: the rules' answer stands
                 reply, meta = fallback, dict(fallback_meta)
             elif reply.pending is None and reply.waiting is None and not self._guard_refused(reply, thread_id, role):
@@ -2010,6 +2025,9 @@ class MunshiPlatform:
             guard.reset_history(token)
             guard.reset_topic(ttoken)
         reply.model_calls, reply.model_tokens = calls.n, calls.tokens
+        outcome = (f"error:{reply.model_error}" if reply.model_error else "card" if reply.pending else "waiting" if reply.waiting else
+                   "output_blocked" if meta.get("output_blocked") else str(meta.get("grounded") and "grounded" or ("replaced" if meta.get("model_text_replaced") else "answered")))
+        GRD.log_turn(self.repo, gate, calls.n, calls.tokens, outcome, reply.specialist, reply.model_error)
         return reply, meta | {"engine": reply.engine, "model_calls": calls.n, "model_tokens": calls.tokens}
 
     def _ground(self, reply: Reply, meta: dict, thread_id: str, role: str, text: str, fallback: Reply) -> tuple[Reply, dict]:
@@ -2023,12 +2041,17 @@ class MunshiPlatform:
             msgs = self._bundle(MODEL, reply.specialist).agent.get_state(self._cfg(thread_id, role, reply.specialist, MODEL)).values.get("messages", [])
         except Exception:
             msgs = []
+        msgs = GRD.restore(msgs)                   # code renders the real records, not the model's sanitised copy of them
+        blocked = GRD.model_text_ok(model_text, role, self.repo)       # the output filter, on top of the grounding rules below
+        if blocked:
+            meta["output_blocked"] = blocked
         h = GR.human_index(msgs)
         results = GR.turn_results(msgs, h) if h >= 0 else []
         said, raw, tables = GR.render_turn(results, self.repo, text, self._is_write)
         reply.tables = tables if said else []
         if said:
             q = GR.last_question(model_text)
+            q = q if q and GRD.model_text_ok(q, role, self.repo) is None else ""
             body = "\n".join(said) + (f"\n{GR.strip_ids(q, self.repo)}" if q and not self._claims_done(model_text) else "")
             if reply.ask and reply.ask.get("slot") == "dispatch" and len(reply.ask.get("candidates") or []) == 1:
                 body = body.rstrip(".") + ". Say 'theek he, bana do' and I'll ask for approval of this plan."
@@ -2036,7 +2059,7 @@ class MunshiPlatform:
             if results:
                 reply.tool, reply.call = results[-1][0], {"name": results[-1][0], "args": results[-1][1]}
             return reply, meta | {"grounded": [t for t, _, _ in results][-6:]}
-        if GR.ok_question(model_text) and not self._claims_done(model_text):
+        if GR.ok_question(model_text) and not self._claims_done(model_text) and not blocked:
             q = GR.strip_ids(model_text, self.repo)
             if not is_urdu(text):
                 q = self._latin_only(q)
@@ -2055,7 +2078,7 @@ class MunshiPlatform:
         if not approve:
             return "Rejected. Nothing was done." + (f" ({note[:80]})" if note else "")
         try:
-            msgs = bundle.agent.get_state(cfg).values.get("messages", [])
+            msgs = GRD.restore(bundle.agent.get_state(cfg).values.get("messages", []))
         except Exception:
             return None
         call = next((tc for m in reversed(msgs) if isinstance(m, AIMessage) for tc in (m.tool_calls or []) if tc["name"] == pa.tool), None)
@@ -2417,7 +2440,7 @@ class MunshiPlatform:
                                     {"tool": pa.tool, "args": pa.args, "specialist": pa.specialist, "note": note}, approved_by=role)
                     signature = (f"{role}:{user}" if user.strip() else role) if approve else ""
                     meta = {"specialist": pa.specialist, "resolved": approval_id, "approved": approve}
-                    run_cfg = cfg | ({"callbacks": [calls]} if engine == MODEL and self.hybrid else {})
+                    run_cfg = cfg | ({"callbacks": [calls, GRD.TurnBudget()]} if engine == MODEL and self.hybrid else {})
                     # The resumed turn may go on to ask for another gated action ("confirm A, then B"): that gets its
                     # own card, on the requester's behalf, instead of a bare "Done." over a paused graph. Anything the
                     # agent does while settling is the requester's too, but no longer covered by this approval.
@@ -2449,6 +2472,9 @@ class MunshiPlatform:
                             reply.text = done + (("\n\n" + reply.text[len(lead):] if reply.text.startswith(lead) else "\n\n" + reply.text)
                                                  if reply.pending else "")
                     reply.engine, reply.model_calls, reply.model_tokens = engine, calls.n, calls.tokens
+                    if calls.n:
+                        GRD.log_turn(self.repo, GRD.Gate(True, pa.approval_id, user=user or role, role=role), calls.n, calls.tokens,
+                                     "resume", pa.specialist, reply.model_error)
                     ran = approve and self._ran(bundle, cfg, pa.tool)
                     self._settle_memory(pa, approve, ran and not warned, "warnings" if warned else "action failed", user or role)
                     if reply.pending:
@@ -2473,7 +2499,9 @@ class MunshiPlatform:
                                     reply.text = f"{head}\n\n{more}{sep}{tail}"
                         except Exception:
                             log.exception("couldn't raise the next card of the chain after %s", approval_id)
+                    reply.text = GRD.redact_reply(reply.text, role, self.repo)
                     if reply.tables:
+                        reply.tables = GRD.redact_tables(reply.tables, role, self.repo)
                         meta["tables"] = reply.tables
                     self.repo.add_chat(pa.thread_id, "munshi", reply.text, meta)
                     if approve: self.deliver_messages()
@@ -2491,7 +2519,7 @@ class MunshiPlatform:
             return None
         try:
             state = bundle.agent.get_state(cfg)
-            msgs = state.values.get("messages", []) if state.values else []
+            msgs = GRD.restore(state.values.get("messages", []) if state.values else [])
         except Exception:
             msgs = []
         call = next((tc for m in reversed(msgs) if isinstance(m, AIMessage) for tc in m.tool_calls if tc["name"] == pa.tool), None)

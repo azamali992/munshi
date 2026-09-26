@@ -640,9 +640,9 @@ def _slow(d, c: _Ctx) -> str:
         return c.t("Everything in stock has sold in the last {d} days.", "Pichle {d} din mein sab maal bika hai.", "پچھلے {d} دن میں سارا مال بکا ہے۔", d=days)
     head = c.t("Not sold in the last {d} days ({n} products): ", "Pichle {d} din se nahi bika ({n} products): ", "پچھلے {d} دن سے نہیں بکا ({n} اشیاء): ", d=days, n=len(rows))
     c.tab(c.t("Slow stock", "Nahi bika", "نہ بکنے والا مال"), _lead(head),
-          [("name", c.lb("product"), "text"), ("on_hand", c.lb("on_hand"), "qty"), ("value", c.lb("value_cost"), "money")],
-          [{"name": r.get("name") or c.product(r.get("sku")), "on_hand": r.get("on_hand"), "value": r.get("value_at_cost")} for r in rows],
-          totals={"value": round(sum(float(r.get("value_at_cost") or 0) for r in rows), 2)})
+          [("name", c.lb("product"), "text"), ("on_hand", c.lb("on_hand"), "qty"), ("value_at_cost", c.lb("value_cost"), "money")],
+          [{"name": r.get("name") or c.product(r.get("sku")), "on_hand": r.get("on_hand"), "value_at_cost": r.get("value_at_cost")} for r in rows],
+          totals={"value_at_cost": round(sum(float(r.get("value_at_cost") or 0) for r in rows), 2)})
     return head + _listing(c, rows, lambda r: f"{r.get('name') or c.product(r.get('sku'))} {_n(r.get('on_hand'))}" + c.t(" on hand", " pada", " موجود")
                            + f" ({rs(r.get('value_at_cost'))})")
 
@@ -683,10 +683,10 @@ def _sales(d, c: _Ctx) -> str:
               lead + (c.t(" Margin by product:", " Product ke hisaab se margin:", " ہر چیز کا منافع:") if margin_first
                       else c.t(" By product:", " Product ke hisaab se:", " ہر چیز کی سیل:")),
               [("name", c.lb("product"), "text"), ("qty", c.lb("qty"), "qty"), ("sales", c.lb("sales"), "money"), ("cost", c.lb("cost"), "money"),
-               ("margin", c.lb("margin"), "money"), ("pct", c.lb("margin_pct"), "pct")],
+               ("margin", c.lb("margin"), "money"), ("margin_pct", c.lb("margin_pct"), "pct")],
               [{"name": x.get("name") or c.product(x.get("sku")), "qty": x.get("qty"), "sales": x.get("revenue"), "cost": x.get("cost"),
-                "margin": x.get("margin"), "pct": pct_of(x)} for x in items],
-              totals={"sales": round(rev, 2), "cost": round(cost, 2), "margin": round(rev - cost, 2), "pct": round((rev - cost) / rev * 100, 1) if rev else None},
+                "margin": x.get("margin"), "margin_pct": pct_of(x)} for x in items],
+              totals={"sales": round(rev, 2), "cost": round(cost, 2), "margin": round(rev - cost, 2), "margin_pct": round((rev - cost) / rev * 100, 1) if rev else None},
               note=note)
     if prods and re.search(r"\b(margin|munafa|profit)\b|منافع", fold(c.text)) and re.search(r"\b(cheez|cheezen|product|products|maal|item|items)\b|چیز|مال", fold(c.text)):
         # margin BY PRODUCT, largest first, from the report's own product lines

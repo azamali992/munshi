@@ -174,7 +174,7 @@ def test_other_lists_have_tables_with_matching_totals(p):
     slow = p.ops.slow_stock()
     s, t = full("slow_stock", slow, p.repo, "slow stock 30 days")
     check_shape(t)
-    assert t["totals"]["value"] == total(slow, "value_at_cost") and col(t, "name") == [r["name"] for r in slow]
+    assert t["totals"]["value_at_cost"] == total(slow, "value_at_cost") and col(t, "name") == [r["name"] for r in slow]
     sups = p.ops.list_suppliers()
     if len(sups) >= 2:
         _, t = full("list_suppliers", sups, p.repo, "suppliers")
