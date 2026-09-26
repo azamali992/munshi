@@ -157,6 +157,44 @@ label.f{display:grid;gap:5px;font-size:13px;color:var(--muted);font-weight:600}
 .ap-actions{display:flex;gap:8px} .ap-actions .btn{flex:1 1 0;min-height:52px;font-size:16px}
 .ap-q{margin:0;font-size:17px;font-weight:700} .ap-sum{margin:0;font-weight:800}
 .ltr{direction:ltr;unicode-bidi:isolate;font-family:var(--latin);font-variant-numeric:tabular-nums;line-height:1.5}
+/* ---- a table inside a chat reply (views.js tableBlock) ----
+   A reply bubble with a table takes the full width; the table scrolls sideways in its own container with the name
+   column pinned (inline-start, so it pins on the right in Urdu). Zebra rows, a bold totals row under a rule, figures
+   end-aligned with tabular numerals in the Latin UI font. Consumes semantic tokens only; the zebra tint is surface-2
+   Measured (WCAG 2.x): cell text ink/surface 17.2 L, 14.6 D; ink/surface-2 (zebra) 14.7 L, 12.8 D; header muted/surface 7.7 L,
+   7.7 D; column rule line/surface 3.66 L, 4.13 D (line/surface-2 3.14 L); totals rule ink-2/surface 12.8 L, 11.1 D; low-stock
+   badge warn/warn-soft 6.3 L, 7.6 D (plus a ▼ glyph and the word, never colour alone). */
+.msg.bot.has-table,[dir=rtl] .msg.bot.has-table{justify-self:stretch;max-width:100%;white-space:normal}
+.msg.has-table .msg-t{display:block;white-space:pre-wrap;margin-bottom:6px}
+.dt-lead{margin:0 0 8px;white-space:pre-wrap}
+.dt{--dt-edge:color-mix(in srgb,var(--ink) 18%,transparent);margin:0 0 8px;display:grid;gap:6px;min-width:0}
+.dt-head{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+.dt-title{font-family:var(--display);font-weight:700;font-size:13.5px;color:var(--ink-2)}
+.dt-count{font-size:12px;color:var(--muted);white-space:nowrap}
+.dt-wrap{position:relative;min-width:0}
+/* isolate: the pinned column's z-index stays inside the table, never above the sticky composer or the top bar */
+.dt-scroll{overflow-x:auto;overscroll-behavior-x:contain;border:1px solid var(--line);border-radius:10px;background:var(--surface);max-width:100%;isolation:isolate}
+/* more columns this way: a soft edge on the side the table continues to (views.js sets data-more-x while it can scroll further) */
+.dt-wrap::after{content:'';position:absolute;top:1px;bottom:1px;inset-inline-end:1px;width:24px;border-start-end-radius:9px;border-end-end-radius:9px;pointer-events:none;opacity:0;background:linear-gradient(to left,var(--dt-edge),transparent);transition:opacity .15s var(--ease-out)}
+[dir=rtl] .dt-wrap::after{background:linear-gradient(to right,var(--dt-edge),transparent)}
+.dt-wrap[data-more-x]::after{opacity:1}
+.dt table{border-collapse:separate;border-spacing:0;width:max-content;min-width:100%;font-size:13.5px;line-height:1.4}
+.dt th,.dt td{padding:8px 10px;text-align:start;white-space:nowrap;vertical-align:baseline;background:var(--surface);color:var(--ink)}
+.dt thead th{font-size:11.5px;font-weight:700;color:var(--muted);letter-spacing:.02em;border-bottom:1px solid var(--line);white-space:normal;min-width:5.5em}
+.dt tbody tr:nth-child(even)>*{background:var(--surface-2)}
+/* figures are Latin numerals in both languages: always right-aligned so units line up, in RTL too */
+.dt .n{text-align:right;font-family:var(--latin);font-variant-numeric:tabular-nums}
+.dt .dt-name{position:sticky;inset-inline-start:0;z-index:1;white-space:normal;min-width:7.5em;max-width:11em;font-weight:600;border-inline-end:1px solid var(--line)}
+.dt thead .dt-name{z-index:2}
+.dt td.wide{white-space:normal;min-width:11em}
+.dt tr.em>*{font-weight:800}
+.dt tfoot th,.dt tfoot td,.dt tfoot .dt-name{font-weight:800;border-top:2px solid var(--ink-2);font-size:14px}
+.dt-nil{color:var(--muted)}
+.dt-flag{display:inline-flex;align-items:center;gap:4px;padding:1px 8px;border-radius:999px;border:1px solid currentColor;background:var(--warn-soft);color:var(--warn);font-weight:700;font-size:12px}
+.dt-note{margin:0;font-size:12.5px;color:var(--muted)}
+.dt-actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+body.ur .dt table{line-height:1.8}
+.sr{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
 .composer{position:sticky;bottom:calc(var(--nav-h) + var(--safe-b) + 6px);display:flex;gap:8px;padding:10px 0 0;background:var(--ground)}
 .composer .input{flex:1}
 .mic{width:var(--tap);height:var(--tap);border-radius:11px;display:grid;place-items:center}

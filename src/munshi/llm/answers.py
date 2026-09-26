@@ -72,16 +72,150 @@ def _day(iso: Any) -> str:
     return f"{int(m.group(3))} {mon}"
 
 
+def _bdate(iso: Any) -> str | None:
+    """A stored timestamp (UTC) or date as the BUSINESS's calendar date, ISO ('2026-09-25'); None if there is none."""
+    s = str(iso or "")
+    if len(s) > 10 and re.match(r"\d{4}-\d{2}-\d{2}[T ]", s):
+        try:
+            from munshi.domain.models import to_business_date
+            return to_business_date(s).isoformat()
+        except Exception:
+            return s[:10]
+    return s[:10] if re.match(r"\d{4}-\d{2}-\d{2}", s) else None
+
+
+bdate = _bdate          # public: the platform's own tables (approvals, learned names) date things the same way
+
+
+def _time(iso: Any) -> str | None:
+    """A stored UTC timestamp as the business's clock time ('14:05'); None if it has no time."""
+    s = str(iso or "")
+    if len(s) <= 10:
+        return None
+    try:
+        from datetime import datetime
+
+        from munshi.domain.models import BUSINESS_TZ
+        d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            from datetime import UTC
+            d = d.replace(tzinfo=UTC)
+        return d.astimezone(BUSINESS_TZ).strftime("%H:%M")
+    except Exception:
+        return None
+
+
+# ------------------------------------------------------------------ tables
+# A list-shaped answer also carries a TABLE, built by the same formatter from the same rows as its sentence (never a
+# second read of the books): {title, lead, columns: [{key, label, align, kind}], rows, totals, note, count, lang, text}.
+#   kind   text | money (rupees, a number) | qty | days | pct | date (the business's ISO date) -- the app formats them
+#   lead   the short sentence the app shows above the table (instead of the run-on list)
+#   text   the full sentence the table stands for (the app swaps it for lead + table; other clients keep the sentence)
+#   totals keyed like a row; the first column holds the word "Total" (or the statement's last line); None if none
+#   rows   at most MAX_ROWS (count says how many there were); a row may carry "_em": True (a statement's subtotal)
+# Labels are in the language of the question; names are names (never a customer / product / godown code).
+MAX_ROWS = 300
+_RIGHT = frozenset(("money", "qty", "days", "pct"))
+_LABELS: dict[str, tuple[str, str, str]] = {
+    "customer": ("Customer", "Customer", "گاہک"), "supplier": ("Supplier", "Supplier", "سپلائر"), "product": ("Product", "Product", "چیز"),
+    "balance": ("Balance", "Baqi", "باقی"), "days": ("Days overdue", "Din overdue", "دن"), "bucket": ("Age", "Muddat", "مدت"),
+    "limit": ("Credit limit", "Credit limit", "کریڈٹ حد"), "last_paid": ("Last paid", "Aakhri payment", "آخری ادائیگی"),
+    "amount": ("Amount", "Raqam", "رقم"), "method": ("Method", "Tareeqa", "طریقہ"), "time": ("Time", "Waqt", "وقت"),
+    "date": ("Date", "Tareekh", "تاریخ"), "items": ("Items", "Maal", "اشیاء"), "total": ("Total", "Kul", "کل"),
+    "status": ("Status", "Status", "حالت"), "available": ("Available", "Available", "دستیاب"), "reserved": ("Reserved", "Reserved", "ریزرو"),
+    "reorder": ("Reorder", "Reorder", "ری آرڈر"), "sales": ("Sales", "Sale", "سیل"), "cost": ("Cost", "Laagat", "لاگت"),
+    "margin": ("Margin", "Margin", "منافع"), "margin_pct": ("Margin %", "Margin %", "منافع %"), "qty": ("Qty", "Tadaad", "تعداد"),
+    "on_hand": ("On hand", "Pada hai", "موجود"), "value_cost": ("Value at cost", "Laagat par qeemat", "لاگت پر قیمت"),
+    "in": ("In", "Aaye", "آئے"), "out": ("Out", "Gaye", "گئے"), "running": ("Balance", "Baqaya", "بقایا"),
+    "entry": ("Entry", "Tafseel", "تفصیل"), "type": ("Type", "Qisam", "قسم"), "line": ("Item", "Tafseel", "تفصیل"),
+    "stop": ("Stop", "Stop", "اسٹاپ"), "bill": ("Bill", "Bill", "بل"), "cash": ("Cash", "Cash", "نقد"), "godown": ("Godown", "Godown", "گودام"),
+    "change": ("Change", "Tabdeeli", "تبدیلی"), "promised": ("Promised", "Wada", "وعدہ"), "due_by": ("Due by", "Kab tak", "کب تک"),
+    "route": ("Route", "Route", "روٹ"), "orders": ("Orders", "Orders", "آرڈر"), "units": ("Units", "Units", "یونٹ"),
+    "vehicle": ("Vehicle", "Gaari", "گاڑی"), "tier": ("Tier", "Darja", "درجہ"), "price": ("Price", "Qeemat", "قیمت"),
+    "unit": ("Unit", "Unit", "اکائی"), "capacity": ("Capacity", "Gunjaish", "گنجائش"), "request": ("Request", "Darkhwast", "درخواست"),
+    "asked_by": ("Asked by", "Kis ne manga", "کس نے مانگا"), "name_said": ("Name said", "Bola gaya naam", "بولا گیا نام"),
+    "means": ("Means", "Matlab", "مطلب"), "taught_by": ("Taught by", "Kis ne sikhaya", "کس نے سکھایا"), "uses": ("Uses", "Istemal", "استعمال"),
+}
+_WORDS: dict[str, tuple[str, str, str]] = {
+    # order / stop / plan statuses
+    "draft": ("Draft", "Draft", "ڈرافٹ"), "confirmed": ("Confirmed", "Confirmed", "کنفرم"), "allocated": ("Reserved", "Reserved", "ریزرو"),
+    "dispatched": ("On the way", "Raste mein", "راستے میں"), "delivered": ("Delivered", "Deliver", "ڈیلیور"), "short": ("Short", "Short", "کم ڈیلیور"),
+    "cancelled": ("Cancelled", "Cancel", "منسوخ"), "pending": ("Pending", "Baqi", "باقی"), "skipped": ("Skipped", "Chhor diya", "چھوڑ دیا"),
+    # payment methods
+    "cash": ("Cash", "Cash", "نقد"), "bank": ("Bank", "Bank", "بینک"), "online": ("Bank", "Bank", "بینک"), "jazzcash": ("JazzCash", "JazzCash", "جاز کیش"),
+    "easypaisa": ("Easypaisa", "Easypaisa", "ایزی پیسہ"), "cheque": ("Cheque", "Cheque", "چیک"),
+    # aging buckets
+    "current": ("Not due", "Abhi due nahi", "ابھی واجب نہیں"), "1-30": ("1-30 days", "1-30 din", "1-30 دن"), "31-60": ("31-60 days", "31-60 din", "31-60 دن"),
+    "60+": ("60+ days", "60+ din", "60+ دن"),
+    # reminder tiers
+    "gentle": ("Gentle", "Narm", "نرم"), "firm": ("Firm", "Sakht", "سخت"), "final": ("Final", "Aakhri", "آخری"),
+}
+
+
+def label(lang: str, key: str) -> str:
+    """A column label (see _LABELS) in `lang` (en / ru / ur)."""
+    return _LABELS[key][("en", "ru", "ur").index(lang if lang in ("en", "ru", "ur") else "en")]
+
+
+def make_table(lang: str, title: str, lead: str, cols: list[tuple[str, str, str]], rows: list[dict], totals: dict | None = None,
+               note: str | None = None, badges: tuple[str, ...] = ()) -> dict:
+    """A table payload (see the block comment above). `cols`: (key, label, kind); `badges`: text columns whose non-empty
+    cells the app shows as an alert badge (a low-stock flag). Pure."""
+    lang = lang if lang in ("en", "ru", "ur") else "en"
+    keys = [k for k, _, _ in cols]
+    out = []
+    for r in rows[:MAX_ROWS]:
+        row = {k: r.get(k) for k in keys}
+        if r.get("_em"):
+            row["_em"] = True
+        out.append(row)
+    if totals is not None:
+        totals = {keys[0]: _LABELS["total"][("en", "ru", "ur").index(lang)]} | totals
+    if len(rows) > MAX_ROWS:
+        more = {"en": "Showing the first {m} of {n}.", "ru": "Pehle {m} dikhaye, kul {n}.", "ur": "پہلے {m}، کل {n}۔"}[lang].format(m=MAX_ROWS, n=len(rows))
+        note = f"{note} {more}" if note else more
+    cap = lambda s: (s[:1].upper() + s[1:]) if s else s  # noqa: E731   ('aaj ki payments' -> 'Aaj ki payments')
+    return {"title": cap(title), "lead": cap(lead), "columns": [{"key": k, "label": lb, "align": "right" if kind in _RIGHT else "left", "kind": kind}
+                                                      | ({"badge": True} if k in badges else {}) for k, lb, kind in cols],
+            "rows": out, "totals": totals, "note": (note or "").strip() or None, "count": len(rows), "lang": lang, "text": ""}
+
+
 class _Ctx:
     def __init__(self, repo, text: str, args: dict) -> None:
         self.repo, self.text, self.args = repo, text or "", dict(args or {})
         self.lang = lang_of(self.text)
         # 'for all the products?', 'sab dikhao', 'puri list': the whole list, never cut to the top few
         self.all = bool(re.search(r"\b(all|sab|sabhi|saare|sare|saari|sari|tamam|puri|poori|pura|poora|full|complete|every|mukammal)\b|سب|تمام|پوری", fold(self.text)))
+        self.table: dict | None = None      # the table this answer carries, if it is list-shaped (set by the formatter)
 
     def t(self, en: str, ru: str | None = None, ur: str | None = None, **kw) -> str:
         s = {"en": en, "ru": ru or en, "ur": ur or en}[self.lang]
         return s.format(**kw)
+
+    def lb(self, key: str) -> str:
+        """A column label in this answer's language."""
+        return _LABELS[key][("en", "ru", "ur").index(self.lang)]
+
+    def w(self, word: Any) -> str:
+        """A status / method / bucket / tier word in this answer's language (the word itself if it has no entry)."""
+        k = str(word or "").strip().lower()
+        return _WORDS[k][("en", "ru", "ur").index(self.lang)] if k in _WORDS else str(word or "")
+
+    def tab(self, title: str, lead: str, cols: list[tuple[str, str, str]], rows: list[dict], totals: dict | None = None,
+            note: str | None = None, min_rows: int = 2, badges: tuple[str, ...] = ()) -> None:
+        """Attach the answer's table (only when there are at least `min_rows` rows: one row is a sentence, not a table)."""
+        if len(rows) >= min_rows:
+            self.table = make_table(self.lang, title, lead.strip(), cols, rows, totals, note, badges)
+
+    def last_payment(self, cid: str):
+        """The customer's latest payment still in effect (not a reversal, not reversed), or None. A read (repository getter)."""
+        try:
+            entries = self.repo.ledger_for(str(cid or ""))
+        except Exception:
+            return None
+        gone = {e.reversal_of for e in entries if e.reversal_of}
+        pays = [e for e in entries if e.kind == "payment" and not e.reversal_of and e.entry_id not in gone and float(e.amount or 0) < 0]
+        return max(pays, key=lambda e: str(e.created_at)) if pays else None
 
     def more(self, n: int) -> str:
         if n <= 0:
@@ -123,6 +257,11 @@ class _Ctx:
 
     def join(self, parts: list[str]) -> str:
         return "; ".join(p for p in parts if p)
+
+
+def _lead(head: str) -> str:
+    """A list sentence's head ('7 customers owe Rs 1,320,000 in all, most overdue first: ') as the line above its table."""
+    return head.rstrip().rstrip(":").rstrip() + ":"
 
 
 def _listing(c: _Ctx, rows: list, fmt: Callable[[Any], str], top: int | None = None) -> str:
@@ -173,6 +312,33 @@ def _stock(d, c: _Ctx) -> str:
         sku, levels = next(iter(by.items()))
         return c.t("Stock -- ", "Stock -- ", "اسٹاک — ") + (f"{only}: " if only else "") + one(sku, levels) + "."
     order = sorted(by.items(), key=lambda kv: c.product(kv[0]))
+
+    def min_of(sku):
+        try:
+            return int(c.repo.get_product(sku).min_stock or 0)
+        except Exception:
+            return 0
+
+    def table(items, title, lead):
+        # product | one column per godown (available there) | total available | reserved | the low-stock flag
+        gds = sorted({x.get("warehouse_id") for _, lv in items for x in lv}, key=c.godown) if many_godowns else []
+        out = []
+        for sku, levels in items:
+            total = sum(int(x.get("available") or 0) for x in levels)
+            m = min_of(sku)
+            row = {"name": c.product(sku), "available": total, "reserved": sum(int(x.get("reserved") or 0) for x in levels) or None,
+                   "low": c.t("Low · reorder {m}", "Kam · reorder {m}", "کم · ری آرڈر {m}", m=_n(m)) if m and total <= m else ""}
+            for i, g in enumerate(gds):
+                here = [x for x in levels if x.get("warehouse_id") == g]
+                row[f"g{i}"] = sum(int(x.get("available") or 0) for x in here) if here else None
+            out.append(row)
+        cols = [("name", c.lb("product"), "text")] + [(f"g{i}", c.godown(g), "qty") for i, g in enumerate(gds)]
+        cols += [("available", c.lb("total") if gds else c.lb("available"), "qty")]
+        if any(r["reserved"] for r in out):
+            cols.append(("reserved", c.lb("reserved"), "qty"))
+        if any(r["low"] for r in out):
+            cols.append(("low", c.lb("reorder"), "text"))
+        c.tab(title, lead, cols, out, badges=("low",))
     if len(by) > 1 and _LOW_ASK.search(fold(c.text)):
         # 'kya kya kam hai jo mangwana chahiye': only what is at or below its reorder level (at the godown named, if any)
         def low(kv):
@@ -184,8 +350,12 @@ def _stock(d, c: _Ctx) -> str:
         where = f" ({c.godown(named[0])})" if len(named) == 1 else ""
         if not lows:
             return c.t("Nothing is below its reorder level{w}.", "Koi cheez reorder level se kam nahi{w}.", "کوئی چیز ری آرڈر سے کم نہیں{w}۔", w=where)
-        return c.t("Running low{w}, order these: ", "Kam hai{w}, ye mangwa lein: ", "کم ہے{w}، یہ منگوا لیں: ", w=where) + _listing(c, lows, lambda kv: one(*kv))
+        head = c.t("Running low{w}, order these: ", "Kam hai{w}, ye mangwa lein: ", "کم ہے{w}، یہ منگوا لیں: ", w=where)
+        table(lows, c.t("Low stock", "Kam stock", "کم اسٹاک"), c.t("{n} products running low{w}, order these:", "{n} cheezen kam hain{w}, ye mangwa lein:",
+                                                                     "{n} چیزیں کم ہیں{w}، یہ منگوا لیں:", n=len(lows), w=where))
+        return head + _listing(c, lows, lambda kv: one(*kv))
     head = c.t("Stock available now, {n} products: ", "Is waqt stock, {n} products: ", "اس وقت اسٹاک، {n} اشیاء: ", n=len(order))
+    table(order, c.t("Stock", "Stock", "اسٹاک") + (f" — {only}" if only else ""), _lead(head))
     return head + _listing(c, order, lambda kv: one(*kv))
 
 
@@ -239,6 +409,15 @@ def _aging(d, c: _Ctx) -> str:
         top = max(rows, key=lambda r: float(r.get("balance") or 0))
         head = c.t("{w} owes the most: {a}. ", "Sab se zyada {w} ke baqi hain: {a}. ", "سب سے زیادہ {w} کے ذمے ہیں: {a}۔ ", w=top.get("name"),
                    a=rs(top.get("balance"))) + head
+
+    def row(r):
+        lp = c.last_payment(r.get("customer_id"))
+        return {"name": r.get("name") or c.customer(r.get("customer_id")), "balance": r.get("balance"), "days": int(r.get("days_overdue") or 0) or None,
+                "bucket": c.w(r.get("bucket")), "limit": float(r.get("credit_limit") or 0) or None, "last_paid": _bdate(lp.created_at) if lp else None}
+    c.tab(c.t("Who owes", "Kis ke kitne baqi", "کس کے ذمے کتنا"), _lead(head),
+          [("name", c.lb("customer"), "text"), ("balance", c.lb("balance"), "money"), ("days", c.lb("days"), "days"), ("bucket", c.lb("bucket"), "text"),
+           ("limit", c.lb("limit"), "money"), ("last_paid", c.lb("last_paid"), "date")],
+          [row(r) for r in rows], totals={"balance": round(total, 2)})
     return head + _listing(c, rows, lambda r: f"{r.get('name')} {rs(r.get('balance'))}" + (c.t(" ({d} days)", " ({d} din)", " ({d} دن)", d=int(r["days_overdue"])) if r.get("days_overdue") else ""))
 
 
@@ -276,6 +455,12 @@ def _orders(d, c: _Ctx) -> str:
         head = (c.t("{n} {s}order(s){sc}{when}: ", "{n} {s}orders{sc}{when}: ", "{n} {s}آرڈر{sc}{when}: ", n=n, s=status, sc=scope,
                     when=c.t(" today", " aaj", " آج") if int(a.get("days") or 0) == 1 else ""))
     # people know an order by who it is for, what is on it and when -- not by its code (the ids stay in the details)
+    c.tab(c.t("Orders", "Orders", "آرڈر"), _lead(head),
+          [("name", c.lb("customer"), "text"), ("items", c.lb("items"), "text"), ("total", c.lb("total"), "money"), ("status", c.lb("status"), "text"),
+           ("date", c.lb("date"), "date")],
+          [{"name": o.get("customer_name") or c.customer(o.get("customer_id")), "items": c.items(o.get("items")), "total": o.get("total"),
+            "status": c.w(o.get("status")), "date": _bdate(o.get("created_at"))} for o in rows],
+          totals={"total": round(sum(float(o.get("total") or 0) for o in rows), 2)})
     return head + _listing(c, rows, lambda o: f"{o.get('customer_name') or c.customer(o.get('customer_id'))} -- {c.items(o.get('items'))}, "
                            f"{rs(o.get('total'))} ({o.get('status')}, {_day(o.get('created_at'))})")
 
@@ -319,17 +504,32 @@ def _payments_block(d, c: _Ctx) -> str:
     total = sum(float(p.get("amount") or 0) for p in pays)
     n = len(pays)
     how = _method_asked(c.text)
+
+    def table(ps, lead, note):
+        # who paid, how much, how and when (the business's clock); the date too when the list spans days
+        days = len({p.get("day") or _bdate(p.get("at")) for p in ps}) > 1
+        cols = [("name", c.lb("customer"), "text"), ("amount", c.lb("amount"), "money"), ("method", c.lb("method"), "text")]
+        cols += [("date", c.lb("date"), "date")] if days else []
+        cols += [("time", c.lb("time"), "text")]
+        c.tab(c.t("Payments {w}", "{w} ki payments", "{w} کی ادائیگیاں", w=when), lead, cols,
+              [{"name": p.get("name") or c.customer(p.get("customer_id")), "amount": p.get("amount"), "method": c.w(p.get("method") or "cash"),
+                "date": p.get("day") or _bdate(p.get("at")), "time": _time(p.get("at"))} for p in ps],
+              totals={"amount": round(sum(float(p.get("amount") or 0) for p in ps), 2)}, note=note)
     if how:
         # 'bank mei kitna aya aaj': that method's payments first, then the day's total -- all read from the rows in code
         mine = [p for p in pays if _METHOD_OF.get(str(p.get("method") or "cash").lower(), "cash") == how]
         label = {"bank": "bank", "cash": "cash", "jazzcash": "JazzCash", "easypaisa": "Easypaisa", "cheque": "cheque"}[how]
         amt = sum(float(p.get("amount") or 0) for p in mine)
-        part = (c.t("{w} by {m}: {a} in {n} payment(s): ", "{w} {m} se {a} aaye ({n} payment): ", "{w} {m} سے {a} آئے ({n} ادائیگی): ", w=when, m=label, a=rs(amt), n=len(mine))
-                + _listing(c, mine, lambda p: f"{p.get('name')} {rs(p.get('amount'))}")) if mine else \
+        mhead = c.t("{w} by {m}: {a} in {n} payment(s): ", "{w} {m} se {a} aaye ({n} payment): ", "{w} {m} سے {a} آئے ({n} ادائیگی): ", w=when, m=label, a=rs(amt), n=len(mine))
+        part = (mhead + _listing(c, mine, lambda p: f"{p.get('name')} {rs(p.get('amount'))}")) if mine else \
             c.t("Nothing came by {m} {w}.", "{w} {m} se kuch nahi aaya.", "{w} {m} سے کچھ نہیں آیا۔", w=when, m=label)
-        return part + c.t(" All payments {w}: {a} ({n}).", " {w} kul payments: {a} ({n}).", " {w} کل ادائیگیاں: {a} ({n})۔", w=when, a=rs(total), n=n) + rev_txt
+        all_txt = c.t(" All payments {w}: {a} ({n}).", " {w} kul payments: {a} ({n}).", " {w} کل ادائیگیاں: {a} ({n})۔", w=when, a=rs(total), n=n)
+        if mine:
+            table(mine, _lead(mhead), (all_txt + rev_txt).strip())
+        return part + all_txt + rev_txt
     head = c.t("Payments received {w}: {amt} in {n} payment(s): ", "{w} {n} payments aayin, kul {amt}: ", "{w} {n} ادائیگیاں آئیں، کل {amt}: ",
                w=when, amt=rs(total), n=n)
+    table(pays, _lead(head), rev_txt.strip() or None)
     return head + _listing(c, pays, lambda p: f"{p.get('name')} {rs(p.get('amount'))} ({p.get('method') or 'cash'})") + rev_txt
 
 
@@ -352,6 +552,7 @@ def _cashbook(d, c: _Ctx) -> str:
     s = c.t("Cash book {day}: in {i}, driver hand-ins {h}, out {o}; net {n}.", "Cash book {day}: aaye {i}, driver se {h}, gaye {o}; net {n}.",
             "کیش بک {day}: آئے {i}، ڈرائیور سے {h}، گئے {o}؛ خالص {n}۔", day=_day(d.get("date")), i=rs(d.get("total_in")), h=rs(d.get("total_handins")),
             o=rs(d.get("total_out")), n=rs(d.get("net")))
+    _cash_table(d, c, s)
     if ins:
         s += c.t(" Cash payments: ", " Cash payments: ", " نقد ادائیگیاں: ") + _listing(c, ins, lambda x: f"{x.get('who')} {rs(x.get('amount'))}")
     outs = [x for x in d.get("cash_out") or [] if isinstance(x, dict)]
@@ -365,6 +566,41 @@ def _cashbook(d, c: _Ctx) -> str:
     elif re.search(r"\b(driver|short|pura|poora)\b|ڈرائیور", fold(c.text)):
         s += c.t(" No driver cash is short.", " Driver ka cash pura hai, kuch short nahi.", " ڈرائیور کی نقدی پوری ہے۔")
     return s
+
+
+def _cash_kind(kind: str, c: _Ctx) -> str:
+    """A cash book line's kind ('customer payment', 'expense · diesel', 'driver hand-in', 'supplier payment', '... reversal') in words."""
+    k = str(kind or "")
+    rev = k.endswith(" reversal")
+    k = k.removesuffix(" reversal")
+    if k.startswith("expense"):
+        cat = k.split("·", 1)[1].strip() if "·" in k else ""
+        out = c.t("Expense", "Kharcha", "خرچہ") + (f" · {cat}" if cat else "")
+    else:
+        out = {"customer payment": c.t("Payment", "Wusooli", "وصولی"), "driver hand-in": c.t("Driver hand-in", "Driver se jama", "ڈرائیور سے جمع"),
+               "supplier payment": c.t("Supplier paid", "Supplier ko diya", "سپلائر کو ادا")}.get(k, k)
+    return out + (c.t(" (reversed)", " (reverse)", " (واپس)") if rev else "")
+
+
+def _cash_table(d: dict, c: _Ctx, lead: str) -> None:
+    """The day's cash lines in time order -- in, out and the running balance -- ending on the book's own net."""
+    lines = [(x, "in") for x in d.get("cash_in") or [] if isinstance(x, dict)] + [(x, "in") for x in d.get("driver_handins") or [] if isinstance(x, dict)]
+    lines += [(x, "out") for x in d.get("cash_out") or [] if isinstance(x, dict)]
+    lines.sort(key=lambda t: str(t[0].get("at") or ""))
+    rows, bal = [], 0.0
+    for x, way in lines:
+        amt = float(x.get("amount") or 0)
+        bal += amt if way == "in" else -amt
+        rows.append({"who": _no_codes(str(x.get("who") or "")) or _cash_kind(x.get("kind"), c), "time": _time(x.get("at")), "type": _cash_kind(x.get("kind"), c),
+                     "in": amt if way == "in" else None, "out": amt if way == "out" else None, "running": round(bal, 2)})
+    short = float(d.get("total_shortfall") or 0)
+    note = c.t("Driver cash short {a} (not in the drawer, so not in the balance).", "Driver ka cash {a} short (galle mein nahi aaya, is liye baqaya mein nahi).",
+               "ڈرائیور کی نقدی {a} کم (دراز میں نہیں آئی، اس لیے بقایا میں نہیں)۔", a=rs(short)) if short else None
+    c.tab(c.t("Cash book {d}", "Cash book {d}", "کیش بک {d}", d=_day(d.get("date"))), lead,
+          [("who", c.lb("entry"), "text"), ("in", c.lb("in"), "money"), ("out", c.lb("out"), "money"), ("running", c.lb("running"), "money"),
+           ("time", c.lb("time"), "text"), ("type", c.lb("type"), "text")], rows,
+          totals={"in": round(float(d.get("total_in") or 0) + float(d.get("total_handins") or 0), 2), "out": d.get("total_out"), "running": d.get("net")},
+          note=note, min_rows=1)
 
 
 _CODES = re.compile(r"\b(?:DSP|DEP|STP|ORD|REM|PRM|TRF)-[A-Z0-9]{4,}\b")
@@ -390,6 +626,9 @@ def _digest(d, c: _Ctx) -> str:
             ex=rs(cash.get("expenses")), rv=rs(rec.get("total")))
     low = [x for x in d.get("low_stock") or [] if isinstance(x, dict)]
     if low:
+        c.tab(c.t("Low stock", "Kam stock", "کم اسٹاک"), s + c.t(" Low stock:", " Kam stock:", " کم اسٹاک:"),
+              [("name", c.lb("product"), "text"), ("godown", c.lb("godown"), "text"), ("available", c.lb("available"), "qty")],
+              [{"name": c.product(x.get("sku")), "godown": c.godown(x.get("warehouse_id")), "available": x.get("available")} for x in low])
         s += c.t(" Low stock: ", " Kam stock: ", " کم اسٹاک: ") + _listing(c, low, lambda x: f"{c.product(x.get('sku'))} {_n(x.get('available'))} ({c.godown(x.get('warehouse_id'))})")
     return s
 
@@ -400,6 +639,10 @@ def _slow(d, c: _Ctx) -> str:
     if not rows:
         return c.t("Everything in stock has sold in the last {d} days.", "Pichle {d} din mein sab maal bika hai.", "پچھلے {d} دن میں سارا مال بکا ہے۔", d=days)
     head = c.t("Not sold in the last {d} days ({n} products): ", "Pichle {d} din se nahi bika ({n} products): ", "پچھلے {d} دن سے نہیں بکا ({n} اشیاء): ", d=days, n=len(rows))
+    c.tab(c.t("Slow stock", "Nahi bika", "نہ بکنے والا مال"), _lead(head),
+          [("name", c.lb("product"), "text"), ("on_hand", c.lb("on_hand"), "qty"), ("value", c.lb("value_cost"), "money")],
+          [{"name": r.get("name") or c.product(r.get("sku")), "on_hand": r.get("on_hand"), "value": r.get("value_at_cost")} for r in rows],
+          totals={"value": round(sum(float(r.get("value_at_cost") or 0) for r in rows), 2)})
     return head + _listing(c, rows, lambda r: f"{r.get('name') or c.product(r.get('sku'))} {_n(r.get('on_hand'))}" + c.t(" on hand", " pada", " موجود")
                            + f" ({rs(r.get('value_at_cost'))})")
 
@@ -410,6 +653,9 @@ def _top(d, c: _Ctx) -> str:
     if not rows:
         return c.t("No sales in the last {d} days.", "Pichle {d} din mein koi sale nahi.", "پچھلے {d} دن میں کوئی سیل نہیں۔", d=days)
     head = c.t("Top customers, last {d} days: ", "Pichle {d} din ke top customers: ", "پچھلے {d} دن کے بڑے گاہک: ", d=days)
+    c.tab(c.t("Top customers", "Top customers", "بڑے گاہک"), _lead(head), [("name", c.lb("customer"), "text"), ("sales", c.lb("sales"), "money")],
+          [{"name": r.get("name") or c.customer(r.get("customer_id")), "sales": r.get("revenue")} for r in rows],
+          totals={"sales": round(sum(float(r.get("revenue") or 0) for r in rows), 2)})
     return head + _listing(c, rows, lambda r: f"{r.get('name')} {rs(r.get('revenue'))}")
 
 
@@ -418,23 +664,55 @@ def _sales(d, c: _Ctx) -> str:
     s = c.t("Sales {a} to {b}: {rev} from {n} invoices, margin {m} ({p}%).", "Sale {a} se {b}: {rev}, {n} bill, margin {m} ({p}%).",
             "سیل {a} سے {b}: {rev}، {n} بل، منافع {m} ({p}%)۔", a=_day(d.get("start")), b=_day(d.get("end")), rev=rs(d.get("revenue")), n=d.get("invoices", 0),
             m=rs(d.get("gross_margin")), p=d.get("margin_pct", 0))
+    lead = s
     cust = [x for x in d.get("by_customer") or [] if isinstance(x, dict)]
     if cust:
         s += c.t(" Biggest buyers: ", " Sab se zyada: ", " سب سے زیادہ: ") + _listing(c, cust[:3], lambda x: f"{x.get('name')} {rs(x.get('revenue'))}")
     prods = [x for x in d.get("by_product") or [] if isinstance(x, dict)]
+    note = _caveat(d, c).strip().removeprefix("Note:").removeprefix("نوٹ:").strip() or None
+    period = f"{_day(d.get('start'))} – {_day(d.get('end'))}"
+
+    def pct_of(x):
+        r = float(x.get("revenue") or 0)
+        return round(float(x.get("margin") or 0) / r * 100, 1) if r else None
+
+    def product_table(items, margin_first):
+        # the report's own product lines (delivered goods, gross of credit notes): qty, sales, cost, margin, margin %
+        rev, cost = sum(float(x.get("revenue") or 0) for x in items), sum(float(x.get("cost") or 0) for x in items)
+        c.tab(c.t("Sales by product, {p}", "Product-wise sale, {p}", "ہر چیز کی سیل، {p}", p=period),
+              lead + (c.t(" Margin by product:", " Product ke hisaab se margin:", " ہر چیز کا منافع:") if margin_first
+                      else c.t(" By product:", " Product ke hisaab se:", " ہر چیز کی سیل:")),
+              [("name", c.lb("product"), "text"), ("qty", c.lb("qty"), "qty"), ("sales", c.lb("sales"), "money"), ("cost", c.lb("cost"), "money"),
+               ("margin", c.lb("margin"), "money"), ("pct", c.lb("margin_pct"), "pct")],
+              [{"name": x.get("name") or c.product(x.get("sku")), "qty": x.get("qty"), "sales": x.get("revenue"), "cost": x.get("cost"),
+                "margin": x.get("margin"), "pct": pct_of(x)} for x in items],
+              totals={"sales": round(rev, 2), "cost": round(cost, 2), "margin": round(rev - cost, 2), "pct": round((rev - cost) / rev * 100, 1) if rev else None},
+              note=note)
     if prods and re.search(r"\b(margin|munafa|profit)\b|منافع", fold(c.text)) and re.search(r"\b(cheez|cheezen|product|products|maal|item|items)\b|چیز|مال", fold(c.text)):
         # margin BY PRODUCT, largest first, from the report's own product lines
         ranked = sorted(prods, key=lambda x: float(x.get("margin") or 0), reverse=True)
         def pct(x):
             r = float(x.get("revenue") or 0)
             return f" ({float(x.get('margin') or 0) / r * 100:.1f}%)" if r else ""
+        product_table(ranked, True)
         s += c.t(" Margin by product: ", " Product ke hisaab se margin: ", " ہر چیز کا منافع: ") + _listing(
             c, ranked, lambda x: f"{x.get('name') or c.product(x.get('sku'))} {rs(x.get('margin'))}{pct(x)}")
         return s + _caveat(d, c)
     if prods and re.search(r"\b(cheez|cheezen|product|products|maal|item|items|bik\w*|seller)\b|چیز|مال", fold(c.text)):
         key = lambda x: float(x.get("revenue") or x.get("qty") or 0)  # noqa: E731
+        product_table(sorted(prods, key=key, reverse=True), False)
         s += c.t(" Best sellers: ", " Sab se zyada bikne wali: ", " سب سے زیادہ بکنے والی: ") + _listing(
             c, sorted(prods, key=key, reverse=True)[:3], lambda x: f"{x.get('name') or c.product(x.get('sku'))} {rs(x.get('revenue'))}")
+        return s + _caveat(d, c)
+    if cust:
+        # by customer, net of credit notes; the report keeps its top 20, so the rows add up to the revenue only when all are here
+        whole = len(cust) < 20
+        c.tab(c.t("Sales by customer, {p}", "Customer-wise sale, {p}", "ہر گاہک کی سیل، {p}", p=period),
+              lead + c.t(" By customer:", " Customer ke hisaab se:", " ہر گاہک کی سیل:"),
+              [("name", c.lb("customer"), "text"), ("sales", c.lb("sales"), "money")],
+              [{"name": x.get("name") or c.customer(x.get("customer_id")), "sales": x.get("revenue")} for x in cust],
+              totals={"sales": round(sum(float(x.get("revenue") or 0) for x in cust), 2)},
+              note=" ".join(p for p in (None if whole else c.t("The top 20 customers only.", "Sirf top 20 customers.", "صرف پہلے 20 گاہک۔"), note) if p) or None)
     return s + _caveat(d, c)
 
 
@@ -457,6 +735,23 @@ def _caveat(d: dict, c: _Ctx) -> str:
 
 def _profit(d, c: _Ctx) -> str:
     d = d or {}
+    # a two-column statement: sales, less cost of goods = gross profit, less each expense = net profit (the caveat as its note)
+    cats = sorted(((str(k), float(v or 0)) for k, v in (d.get("expenses_by_category") or {}).items()), key=lambda kv: -kv[1])
+    gp = c.t("Gross profit", "Gross munafa", "مجموعی منافع") + (f" ({d.get('margin_pct')}%)" if float(d.get("revenue") or 0) > 0 else "")
+    rows = [{"line": c.t("Sales", "Sale", "سیل"), "amount": d.get("revenue"), "_em": True},
+            {"line": c.t("Less: cost of goods", "Minus: maal ki laagat", "منفی: مال کی لاگت"), "amount": d.get("cost_of_goods")},
+            {"line": gp, "amount": d.get("gross_margin"), "_em": True}]
+    rows += [{"line": c.t("Less: {k}", "Minus: {k}", "منفی: {k}", k=k.replace("_", " ")), "amount": v} for k, v in cats]
+    rows += [{"line": c.t("Total expenses", "Kul kharche", "کل خرچے"), "amount": d.get("expenses"), "_em": True}]
+    note = _caveat(d, c).strip().removeprefix("Note:").removeprefix("نوٹ:").strip()
+    if float(d.get("credit_notes") or 0):
+        note = (c.t("Sales are after {a} of credit notes.", "Sale mein se {a} ke credit notes kam kiye gaye hain.", "سیل میں سے {a} کے کریڈٹ نوٹ کم کیے گئے ہیں۔",
+                    a=rs(d.get("credit_notes"))) + " " + note).strip()
+    c.tab(c.t("Profit, {a} – {b}", "Munafa, {a} – {b}", "منافع، {a} – {b}", a=_day(d.get("start")), b=_day(d.get("end"))),
+          c.t("{a} to {b}: net profit {net}.", "{a} se {b}: net munafa {net}.", "{a} سے {b}: خالص منافع {net}۔", a=_day(d.get("start")), b=_day(d.get("end")),
+              net=rs(d.get("net"))),
+          [("line", c.lb("line"), "text"), ("amount", c.lb("amount"), "money")], rows,
+          totals={"line": c.t("Net profit", "Net munafa", "خالص منافع"), "amount": d.get("net")}, note=note or None, min_rows=1)
     return c.t("{a} to {b}: sales {rev}, cost of goods {cogs}, gross profit {gm}, expenses {ex}, net profit {net}.",
                "{a} se {b}: sale {rev}, maal ki laagat {cogs}, gross munafa {gm}, kharche {ex}, net munafa {net}.",
                "{a} سے {b}: سیل {rev}، مال کی لاگت {cogs}، مجموعی منافع {gm}، خرچے {ex}، خالص منافع {net}۔",
@@ -476,6 +771,10 @@ def _stock_ledger(d, c: _Ctx) -> str:
     head = c.t("{p} -- last movements: ", "{p} -- aakhri movements: ", "{p} — آخری نقل و حرکت: ", p=d.get("name") or c.product(d.get("sku")))
     if not moves:
         return head + c.t("none.", "koi nahi.", "کوئی نہیں۔")
+    c.tab(c.t("Stock movements", "Stock movements", "اسٹاک کی نقل و حرکت"), _lead(head),
+          [("godown", c.lb("godown"), "text"), ("change", c.lb("change"), "qty"), ("type", c.lb("type"), "text"), ("date", c.lb("date"), "date")],
+          [{"godown": c.godown(m.get("warehouse_id")), "change": int(m.get("delta") or 0), "type": str(m.get("kind") or "").replace("_", " "),
+            "date": _bdate(m.get("created_at"))} for m in moves])
     return head + _listing(c, moves, lambda m: f"{int(m.get('delta') or 0):+,} {m.get('kind')} {c.godown(m.get('warehouse_id'))} ({_day(m.get('created_at'))})")
 
 
@@ -485,6 +784,9 @@ def _payables(d, c: _Ctx) -> str:
         return c.t("We don't owe any supplier anything.", "Kisi supplier ka kuch dena nahi.", "کسی سپلائر کا کچھ دینا نہیں۔")
     total = sum(float(r.get("balance") or 0) for r in rows)
     head = c.t("We owe suppliers {amt}: ", "Suppliers ko kul {amt} dena hai: ", "سپلائرز کو کل {amt} دینا ہے: ", amt=rs(total))
+    c.tab(c.t("What we owe suppliers", "Suppliers ka dena", "سپلائرز کا دینا"), _lead(head),
+          [("name", c.lb("supplier"), "text"), ("balance", c.lb("balance"), "money")],
+          [{"name": r.get("name") or c.supplier(r.get("supplier_id")), "balance": r.get("balance")} for r in rows], totals={"balance": round(total, 2)})
     return head + _listing(c, rows, lambda r: f"{r.get('name')} {rs(r.get('balance'))}")
 
 
@@ -502,6 +804,10 @@ def _supplier_khata(d, c: _Ctx) -> str:
 
 def _suppliers(d, c: _Ctx) -> str:
     rows = [r for r in d or [] if isinstance(r, dict)]
+    c.tab(c.t("Suppliers", "Suppliers", "سپلائرز"), c.t("{n} suppliers:", "{n} suppliers:", "{n} سپلائرز:", n=len(rows)),
+          [("name", c.lb("supplier"), "text"), ("balance", c.t("We owe", "Dena hai", "دینا ہے"), "money")],
+          [{"name": r.get("name"), "balance": float(r.get("balance") or 0) or None} for r in rows],
+          totals={"balance": round(sum(float(r.get("balance") or 0) for r in rows), 2)})
     return c.t("Suppliers: ", "Suppliers: ", "سپلائرز: ") + _listing(c, rows, lambda r: f"{r.get('name')}" + (c.t(" (we owe {a})", " ({a} dena)", " ({a} دینا)", a=rs(r["balance"])) if float(r.get("balance") or 0) else ""))
 
 
@@ -510,6 +816,10 @@ def _broken(d, c: _Ctx) -> str:
     if not rows:
         return c.t("No broken promises -- everyone who promised has paid or still has time.", "Koi wada nahi toota.", "کوئی وعدہ نہیں ٹوٹا۔")
     head = c.t("{n} broken promise(s): ", "{n} wade toote: ", "{n} وعدے ٹوٹے: ", n=len(rows))
+    c.tab(c.t("Broken promises", "Toote wade", "ٹوٹے وعدے"), _lead(head),
+          [("name", c.lb("customer"), "text"), ("amount", c.lb("promised"), "money"), ("date", c.lb("due_by"), "date")],
+          [{"name": r.get("name") or c.customer(r.get("customer_id")), "amount": r.get("amount"), "date": _bdate(r.get("date"))} for r in rows],
+          totals={"amount": round(sum(float(r.get("amount") or 0) for r in rows), 2)})
     return head + _listing(c, rows, lambda r: c.t("{who} promised {a} by {day}", "{who} ne {a} ka wada kiya tha, {day} tak", "{who} نے {day} تک {a} کا وعدہ کیا تھا",
                                                   who=r.get("name") or c.customer(r.get("customer_id")), a=rs(r.get("amount")), day=_day(r.get("date"))))
 
@@ -518,6 +828,12 @@ def _suggest(d, c: _Ctx) -> str:
     rows = [r for r in d or [] if isinstance(r, dict)]
     if not rows:
         return c.t("Nothing is ready to dispatch: no reserved (allocated) orders waiting.", "Dispatch ke liye kuch tayyar nahi.", "ڈسپیچ کے لیے کچھ تیار نہیں۔")
+    c.tab(c.t("Suggested dispatch", "Dispatch ki tajweez", "ڈسپیچ کی تجویز"), c.t("Suggested dispatch:", "Dispatch ki tajweez:", "ڈسپیچ کی تجویز:"),
+          [("route", c.lb("route"), "text"), ("orders", c.lb("orders"), "qty"), ("units", c.lb("units"), "qty"), ("vehicle", c.lb("vehicle"), "text")],
+          [{"route": c.route(r.get("route_id")) if r.get("route_id") != "UNROUTED" else c.t("No route", "Route nahi", "کوئی روٹ نہیں"),
+            "orders": len(r.get("order_ids") or []), "units": r.get("load_units"),
+            "vehicle": c.vehicle(r["vehicle_id"]) if r.get("vehicle_id") else _no_codes(str(r.get("note") or ""))} for r in rows],
+          totals={"orders": sum(len(r.get("order_ids") or []) for r in rows), "units": sum(int(r.get("load_units") or 0) for r in rows)})
     return c.t("Suggested dispatch: ", "Dispatch ki tajweez: ", "ڈسپیچ کی تجویز: ") + _listing(c, rows, lambda r: (
         f"{c.route(r.get('route_id'))}: {len(r.get('order_ids') or [])} order(s), {_n(r.get('load_units'))} units"
         + (f" on {c.vehicle(r['vehicle_id'])}" if r.get("vehicle_id") else f" -- {r.get('note')}")))
@@ -556,6 +872,10 @@ def _stops(d, c: _Ctx) -> str:
         paid = [s for s in rows if float(s.get("cash_collected") or 0)]
         tot = sum(float(s.get("cash_collected") or 0) for s in paid)
         head = c.t("Cash collected on this run: {a}", "Is chakkar ka cash: {a}", "اس چکر کی نقدی: {a}", a=rs(tot))
+        c.tab(c.t("Cash on this run", "Is chakkar ka cash", "اس چکر کی نقدی"), head + ":",
+              [("name", c.lb("customer"), "text"), ("cash", c.lb("cash"), "money")],
+              [{"name": s.get("customer_name") or c.customer(s.get("customer_id")), "cash": s.get("cash_collected")} for s in paid],
+              totals={"cash": round(tot, 2)}, note=c.t("Hand it in at the office.", "Office mein jama karwa dein.", "دفتر میں جمع کروا دیں۔"))
         return head + (" (" + ", ".join(f"{s.get('customer_name') or c.customer(s.get('customer_id'))} {rs(s.get('cash_collected'))}" for s in paid) + ")"
                        if paid else "") + c.t(". Hand it in at the office.", ". Office mein jama karwa dein.", "۔ دفتر میں جمع کروا دیں۔")
     if (re.search(r"\b(address|pata|kahan|location)\b|پتہ", f) or _PHONE_ASK.search(f)) and _FIRST_STOP.search(f):
@@ -573,6 +893,13 @@ def _stops(d, c: _Ctx) -> str:
         mine = [s for s in rows if s.get("customer_id") == who.id]
         if len(mine) == 1:
             return _one_stop(mine[0], c)
+    bills = [float(s["order_total"]) for s in rows if s.get("order_total") is not None]
+    c.tab(c.t("Stops", "Stops", "اسٹاپ"), c.t("{n} stops, in order:", "{n} stops, tarteeb se:", "{n} اسٹاپ، ترتیب سے:", n=len(rows)),
+          [("name", c.lb("customer"), "text"), ("stop", c.lb("stop"), "qty"), ("status", c.lb("status"), "text"), ("items", c.lb("items"), "text"),
+           ("bill", c.lb("bill"), "money"), ("cash", c.lb("cash"), "money")],
+          [{"name": s.get("customer_name") or c.customer(s.get("customer_id")), "stop": s.get("sequence"), "status": c.w(s.get("status")),
+            "items": c.items(s.get("items")) or None, "bill": s.get("order_total"), "cash": float(s.get("cash_collected") or 0) or None} for s in rows],
+          totals={"bill": round(sum(bills), 2) if bills else None, "cash": round(sum(float(s.get("cash_collected") or 0) for s in rows), 2)})
     return c.t("Stops, in order: ", "Stops, tarteeb se: ", "اسٹاپ، ترتیب سے: ") + _listing(c, rows, lambda s: (
         f"{s.get('sequence')}. {s.get('customer_name') or c.customer(s.get('customer_id'))} -- {s.get('status')}"
         + (f", {c.items(s['items'])}" if s.get("items") else "")
@@ -585,7 +912,10 @@ def _plan(d, c: _Ctx) -> str:
     s = c.t("Plan: {r} on {v}, {n} order(s), {st}.", "Plan: {r}, gaari {v}, {n} order, {st}.", "پلان: {r}، گاڑی {v}، {n} آرڈر، {st}۔",
             r=c.route(d.get("route_id")), v=c.vehicle(d.get("vehicle_id")), n=len(d.get("order_ids") or []), st=d.get("status"))
     if d.get("stops"):
+        head = s
         s += " " + _stops(d["stops"], c)
+        if c.table:
+            c.table["lead"] = f"{head} {c.table['lead']}"
     return s
 
 
@@ -603,6 +933,9 @@ def _search_products(d, c: _Ctx) -> str:
     if not rows:
         return c.t("No product by that name.", "Is naam ka koi maal nahi.", "اس نام کا کوئی مال نہیں۔")
     code = bool(re.search(r"\b(sku|code)\b", fold(c.text)))        # the product code only when that is what was asked
+    c.tab(c.t("Products", "Products", "اشیاء"), c.t("{n} products match:", "{n} products milte hain:", "{n} اشیاء ملتی ہیں:", n=len(rows)),
+          [("name", c.lb("product"), "text")] + ([("sku", "SKU", "text")] if code else []) + [("price", c.lb("price"), "money"), ("unit", c.lb("unit"), "text")],
+          [{"name": p.get("name"), "sku": p.get("sku"), "price": p.get("unit_price"), "unit": p.get("unit") or "bag"} for p in rows])
     return _listing(c, rows, lambda p: f"{p.get('name')}" + (f" (SKU {p.get('sku')})" if code else "") + f" {rs(p.get('unit_price'))}/{p.get('unit') or 'bag'}")
 
 
@@ -611,6 +944,10 @@ def _routes(d, c: _Ctx) -> str:
 
 
 def _vehicles(d, c: _Ctx) -> str:
+    vs = [r for r in d or [] if isinstance(r, dict)]
+    c.tab(c.t("Vehicles", "Gaariyan", "گاڑیاں"), c.t("{n} vehicles:", "{n} gaariyan:", "{n} گاڑیاں:", n=len(vs)),
+          [("plate", c.lb("vehicle"), "text"), ("capacity", c.lb("capacity"), "qty")],
+          [{"plate": v.get("plate"), "capacity": v.get("capacity_units")} for v in vs])
     return c.t("Vehicles: ", "Gaariyan: ", "گاڑیاں: ") + _listing(c, [r for r in d or [] if isinstance(r, dict)], lambda v: f"{v.get('plate')} ({v.get('capacity_units')} units)")
 
 
@@ -761,6 +1098,10 @@ def _reminders(d, c: _Ctx) -> str:
     rows = [r for r in d or [] if isinstance(r, dict) and r.get("reminder_id")]
     if not rows:
         return c.t("No reminders needed: nobody is past that many days.", "Koi reminder nahi bana.", "کوئی یاد دہانی نہیں بنی۔")
+    c.tab(c.t("Reminders drafted", "Reminders tayyar", "یاد دہانیاں تیار"), c.t("{n} reminder(s) drafted:", "{n} reminders tayyar:", "{n} یاد دہانیاں تیار:", n=len(rows)),
+          [("name", c.lb("customer"), "text"), ("amount", c.lb("amount"), "money"), ("days", c.lb("days"), "days"), ("tier", c.lb("tier"), "text")],
+          [{"name": c.customer(r.get("customer_id")), "amount": r.get("amount_due"), "days": r.get("days_overdue"), "tier": c.w(r.get("tier"))} for r in rows],
+          totals={"amount": round(sum(float(r.get("amount_due") or 0) for r in rows), 2)})
     return c.t("{n} reminder(s) drafted: ", "{n} reminders tayyar: ", "{n} یاد دہانیاں تیار: ", n=len(rows)) + _listing(
         c, rows, lambda r: f"{c.customer(r.get('customer_id'))} {rs(r.get('amount_due'))} ({r.get('tier')})")
 
@@ -791,21 +1132,36 @@ _REJECTED = re.compile(r"rejected the tool call for `?(\w+)`?(?: with reason: (.
 
 def render(tool: str, raw: Any, repo, text: str = "", args: dict | None = None) -> str | None:
     """The sentence for one tool result (raw: the JSON text or the parsed value). None if there is none."""
+    return render_full(tool, raw, repo, text, args)[0]
+
+
+def render_full(tool: str, raw: Any, repo, text: str = "", args: dict | None = None) -> tuple[str | None, dict | None]:
+    """(sentence, table) for one tool result: ONE formatter run builds both from the same rows, so the table's totals are
+    the sentence's totals. The table is None unless the answer is list-shaped (see make_table). Never raises."""
     c = _Ctx(repo, text, args or {})
     try:
         if isinstance(raw, str):
             m = _REJECTED.search(raw)
             if m:
                 why = (m.group(2) or "").strip().rstrip(".")
-                return c.t("Nothing was done", "Kuch nahi kiya gaya", "کچھ نہیں کیا گیا") + (f" -- {why}." if why else ".")
+                return c.t("Nothing was done", "Kuch nahi kiya gaya", "کچھ نہیں کیا گیا") + (f" -- {why}." if why else "."), None
             try:
                 raw = json.loads(raw)
             except (ValueError, TypeError):
-                return None
+                return None, None
         if isinstance(raw, dict) and raw.get("error"):
-            return None
+            return None, None
         fn = FORMATTERS.get(tool)
-        return fn(raw, c) if fn else None
+        s = fn(raw, c) if fn else None
     except Exception:
         log.warning("no readable reply for %s", tool, exc_info=True)
-        return None
+        return None, None
+    table = c.table if s else None
+    if table is not None:
+        try:
+            table["text"] = s
+            json.dumps(table)                       # stored in the chat log's meta: it must be plain JSON
+        except (TypeError, ValueError):
+            log.warning("table for %s is not JSON; sentence only", tool)
+            table = None
+    return s, table
