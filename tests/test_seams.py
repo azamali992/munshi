@@ -275,7 +275,7 @@ def test_repository_skeletons_compose_without_shadowing_and_default_safely():
     assert r.balance_sheet()["balanced"]                                  # Stream B landed
     with pytest.raises(NotFoundError):                                    # Stream A landed: a real lookup, not a stub
         r.payroll_register(period="2026-09")
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(ValueError):                                      # Stream E landed: the bytes are checked
         r.store_attachment(b"x", "a.jpg", "image/jpeg", "u", "a")
 
 

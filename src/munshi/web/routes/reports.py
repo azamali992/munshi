@@ -1,7 +1,9 @@
 """Reports, documents (invoices, receipts, statements), audit, export, backup."""
 from __future__ import annotations
 
+import io
 import os
+import zipfile
 from datetime import date, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -179,3 +181,20 @@ def backup(request: Request, c: Ctx = Depends(context("backup"))):
         c.repo._conn.execute("VACUUM INTO ?", (str(target),))
     c.repo.audit(c.role, "backup", "business", target.name, {}, approved_by=c.signature)
     return FileResponse(str(target), media_type="application/x-sqlite3", filename=f"munshi-backup-{today_iso()}.db")
+
+
+@router.get("/api/backup/proofs")
+def backup_proofs(request: Request, c: Ctx = Depends(context("backup"))):
+    """The payment-proof files (photos and PDFs), which live beside the database file, as one zip."""
+    hub = hub_of(request)
+    if hub.in_memory:
+        raise HTTPException(501, "backup needs an on-disk installation")
+    root = Path(hub.data_dir) / "files" / c.principal.business_id
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:          # photos and PDFs are already compressed
+        if root.is_dir():
+            for f in sorted(root.rglob("*")):
+                if f.is_file(): z.write(f, f.relative_to(root).as_posix())
+    c.repo.audit(c.role, "backup", "business", "proofs", {}, approved_by=c.signature)
+    return Response(buf.getvalue(), media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="munshi-proofs-{today_iso()}.zip"'})

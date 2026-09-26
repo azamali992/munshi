@@ -101,6 +101,4 @@ def v10(conn: sqlite3.Connection) -> None:
         conn.execute(stmt)
 
 
-# v10 is WRITTEN. The lead sets `STEP = v10` at merge, after V8 and V9 are registered (SEAMS §6); extension_steps()
-# would refuse to register it before them anyway (contiguity).
-STEP: Callable[[sqlite3.Connection], None] | None = None
+STEP: Callable[[sqlite3.Connection], None] | None = v10

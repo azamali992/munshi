@@ -97,16 +97,12 @@ def up(client, headers, data: bytes, name="proof.png", ctype="image/png"):
 
 
 # ============================================================================ V10 schema
-def test_v10_is_written_but_waits_for_v8_and_v9():
-    assert migrations_attachments.VERSION == 10 and callable(migrations_attachments.v10)
-    assert all(v != 10 for v, _ in migrations.MIGRATIONS)          # the lead registers it after V8 and V9
+def test_v10_is_registered_after_v8_and_v9():
+    assert migrations_attachments.VERSION == 10 and migrations_attachments.STEP is migrations_attachments.v10
+    assert [v for v, _ in migrations.MIGRATIONS][-3:] == [8, 9, 10]
     r = MunshiRepository(":memory:")
-    with pytest.raises(ProofsNotEnabled) as e:                      # without V10 the feature says so, cleanly
-        r.store_attachment(png(), "a.png", "image/png", "U-1", "api")
-    assert e.value.code == "not_enabled" and isinstance(e.value, NotImplementedError)
-    before = migrations.current_version(r._conn)
-    with_v10(r); with_v10(r)                                        # idempotent, never stamped
-    assert migrations.current_version(r._conn) == before
+    assert migrations.current_version(r._conn) == 10
+    assert r.store_attachment(png(), "a.png", "image/png", "U-1", "api")["status"] == "pending"
     assert r._conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
@@ -349,8 +345,10 @@ def test_validate_proofs_for_card_hides_other_peoples_uploads(repo):
 
 
 def test_pay_proofs_are_owner_only(repo):
-    repo._conn.execute("CREATE TABLE salary_payments (payment_id TEXT PRIMARY KEY)")      # stands in for Stream A's V9
-    repo._conn.execute("INSERT INTO salary_payments VALUES ('SPM-2026-000001')")
+    repo._conn.execute("PRAGMA foreign_keys=OFF")                   # a bare salary payment row, without a whole payroll month
+    repo._conn.execute("INSERT INTO salary_payments (payment_id, slip_id, employee_id, amount_paisa, method, account_id, paid_on, created_at)"
+                       " VALUES ('SPM-2026-000001', 'PSL-X', 'E-X', 100, 'bank', 'CASH', '2026-09-30', '2026-09-30T00:00:00')")
+    repo._conn.execute("PRAGMA foreign_keys=ON")
     a = repo.store_attachment(png(), "a.png", "image/png", "U-CLERK", "api")
     repo.link_attachment(a["att_id"], "salary_payment", "SPM-2026-000001", "api")
     att = repo.get_attachment(a["att_id"])
@@ -409,10 +407,7 @@ def test_file_response_headers(app_client):
     cd = r.headers["content-disposition"]
     assert cd.startswith('inline; filename="weird') and cd.count('"') == 2 and "\r" not in cd and "\n" not in cd
     assert ".png\"; filename*=UTF-8''" in cd
-    # the route sets routes._FILE_CSP; web/app.py's header middleware currently overwrites every CSP with the app's
-    # (which still forbids inline and foreign scripts). Either way a served proof can't run script from elsewhere.
-    csp = r.headers["content-security-policy"]
-    assert csp == routes._FILE_CSP["image"] or "script-src 'self'" in csp
+    assert r.headers["content-security-policy"] == routes._FILE_CSP["image"]      # the app's header middleware keeps it
     t = client.get(f"/api/attachments/{att}/thumb", headers=owner)
     assert t.status_code == 200 and t.headers["content-type"] == "image/jpeg"
     pdf = up(client, owner, clean_pdf(), "st.pdf", "application/pdf").json()
@@ -543,3 +538,25 @@ def test_proof_read_is_off_by_default_and_only_suggests(monkeypatch):
     class Broken:
         def invoke(self, msgs): raise TimeoutError("provider down")
     assert routes.read_proof(Broken(), png(), "image/png") is None
+
+
+def test_backups_carry_the_proof_files(tmp_path):
+    from munshi.web.app import build_app, nightly_backup
+    app = build_app(data_dir=str(tmp_path), in_memory=False, demo=True, scheduler=False)
+    client = TestClient(app)
+    owner = login(client, OWNER)
+    att = up(client, owner, png()).json()
+    hub = app.state.hub
+    written = nightly_backup(hub)
+    copies = [p for p in (tmp_path / "backups").glob("*-files") if p.is_dir()]
+    assert len(copies) == 1 and copies[0].name in written
+    assert any(f.suffix == ".png" for f in copies[0].rglob("*"))
+    z = client.get("/api/backup/proofs", headers=owner)
+    assert z.status_code == 200 and z.headers["content-type"] == "application/zip"
+    import io
+    import zipfile
+    names = zipfile.ZipFile(io.BytesIO(z.content)).namelist()
+    assert any(n.endswith(".png") for n in names) and att["att_id"]
+    assert client.get("/api/backup/proofs", headers=login(client, CLERK)).status_code == 403
+    hub.reset_demo()
+    assert not (tmp_path / "files" / "demo").exists()                  # the public demo forgets its uploads too

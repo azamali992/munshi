@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import os
 import secrets
+import shutil
 import threading
 import time
 import uuid
@@ -87,9 +88,16 @@ def nightly_backup(hub: TenantHub, keep_days: int = 14) -> list[str]:
         with repo._lock:
             repo._conn.execute("VACUUM INTO ?", (str(target),))
         written.append(target.name)
+        proofs = Path(hub.data_dir) / "files" / b["business_id"]      # payment proofs live beside the database, not in it
+        if proofs.is_dir():
+            dest = out / f"{b['business_id']}-{today}-files"
+            shutil.copytree(proofs, dest, dirs_exist_ok=True)         # proofs are never edited or deleted, so this only adds
+            written.append(dest.name)
     cutoff = time.time() - keep_days * 86400
     for f in out.glob("*.db"):
         if f.stat().st_mtime < cutoff: f.unlink()
+    for d in out.glob("*-files"):
+        if d.is_dir() and d.stat().st_mtime < cutoff: shutil.rmtree(d, ignore_errors=True)
     return written
 
 
@@ -177,7 +185,8 @@ def build_app(data_dir: str | None = None, model=None, enable_tracing: bool | No
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Permissions-Policy"] = "camera=(), geolocation=(), microphone=(self)"
-        response.headers["Content-Security-Policy"] = CSP
+        if "content-security-policy" not in response.headers:     # a payment proof sets its own, stricter one
+            response.headers["Content-Security-Policy"] = CSP
         if request.url.path.startswith("/api/"):
             response.headers["Cache-Control"] = "no-store"
         if request.headers.get("x-forwarded-proto") == "https" or prod:
