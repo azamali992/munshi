@@ -40,7 +40,7 @@ def sales(start: str = "", end: str = "", c: Ctx = Depends(context("reports:read
 
 @router.get("/api/reports/profit")
 def profit(start: str = "", end: str = "", c: Ctx = Depends(context("reports:read"))):
-    return c.repo.profit_summary(*_range(start, end))
+    return c.repo.profit_summary(*_range(start, end), redact_payroll=not c.principal.can("payroll:read"))
 
 
 @router.get("/api/reports/collections")
@@ -50,7 +50,7 @@ def collections(start: str = "", end: str = "", c: Ctx = Depends(context("report
 
 @router.get("/api/reports/cashbook")
 def cashbook(date: str = "", c: Ctx = Depends(context("reports:read"))):
-    return c.repo.cashbook(date or None)
+    return c.repo.cashbook(date or None, redact_payroll=not c.principal.can("payroll:read"))
 
 
 @router.get("/api/reports/stock-valuation")
