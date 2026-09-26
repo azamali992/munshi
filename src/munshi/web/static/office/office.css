@@ -127,3 +127,140 @@ table.o-t{width:100%;border-collapse:separate;border-spacing:0;font-size:13.5px}
   .o-grid3{grid-template-columns:1fr 1fr}
 }
 @media (max-width:600px){.o-grid2,.o-grid3{grid-template-columns:1fr}.o-line{grid-template-columns:1fr 70px 90px 32px}}
+
+/* ==== payroll, finance and proofs (Stream C) ============================================================================
+   Still no colour of its own: every rule below consumes the semantic tokens from ../styles.css, so dark mode is the
+   same switch. Measured 2026-09-26 (WCAG 2.x relative luminance, light / dark): table text ink/surface 17.15 / 14.63;
+   em-row rule ink-2/surface 12.78 / 11.08; a negative total crit/surface 7.75 / 7.08 (plus the minus sign, never colour
+   alone); boundary line ink-2/surface-2 10.95 / 9.67; PIN digits ink/surface 17.15 / 14.63 in a 2px dashed accent frame
+   (accent/surface 9.88 / 8.53, above 3:1 for a UI boundary); step rail done good/good-soft 5.49 / 6.53, current
+   accent-ink/accent 9.88 / 9.28, upcoming muted/surface 7.70 / 7.69; difference meter crit/crit-soft 6.34 / 6.24,
+   good/good-soft 5.49 / 6.53; warning list warn/warn-soft 6.28 / 7.60; selected account card ink/accent-soft
+   14.01 / 11.39. */
+
+/* statements: the shared table shape (lib.renderTable) */
+.o-stack{display:grid;gap:12px;align-content:start;min-width:0}
+/* a row header in a body row is a cell, not a column header: undo the sticky header look (.o-t th) */
+.o-t tbody th{position:static;top:auto;z-index:auto;background:transparent;font-size:inherit;color:inherit;font-weight:600;padding:6px 10px;
+  border-bottom:1px solid color-mix(in srgb,var(--line) 25%,transparent);white-space:nowrap;user-select:auto;text-align:start;vertical-align:middle}
+.o-t tbody tr:last-child th{border-bottom:0}
+.o-t select.input{width:auto;min-width:118px}
+.o-t select.input[name=account]{min-width:180px}
+.o-st{margin:0;display:grid;gap:6px;min-width:0}
+.o-st-h{display:flex;align-items:baseline;gap:10px;justify-content:space-between}
+.o-st-t{font-family:var(--display);font-weight:700;font-size:15px;color:var(--ink)}
+.o-st-u{font-size:11.5px;color:var(--muted);font-weight:700;letter-spacing:.05em;text-transform:uppercase}
+.o-st-note{margin:0;font-size:12.5px;color:var(--muted)}
+.o-stt th.o-first{position:sticky;inset-inline-start:0;z-index:1;background:var(--surface);font-weight:600;text-align:start;white-space:nowrap;max-width:320px;overflow:hidden;text-overflow:ellipsis;border-inline-end:1px solid color-mix(in srgb,var(--line) 25%,transparent)}
+.o-stt thead th.o-first{z-index:2;background:var(--surface-2);font-weight:700}
+.o-stt tbody tr.em>*{font-weight:800;color:var(--ink);border-top:1px solid var(--ink-2)}
+.o-stt tbody tr:first-child.em>*{border-top:0}
+/* a negative figure always carries its minus sign; on a subtotal / total line it is also red (a loss, an overdraft) */
+.o-stt tr.em td.neg,.o-stt tfoot td.neg{color:var(--crit)}
+.o-stt tfoot th.o-first{background:var(--surface-2)}
+.o-st.compact .o-t td,.o-st.compact .o-t th{padding:4px 8px}
+.o-badge{display:inline-flex;gap:4px;align-items:center;border:1px solid currentColor}
+
+/* loading skeleton: the table's frame, so the page never jumps when figures arrive */
+.o-skel{background:var(--surface);border:1px solid color-mix(in srgb,var(--line) 55%,transparent);border-radius:12px;padding:10px 12px;display:grid;gap:10px}
+.o-skel-r{display:flex;gap:14px}
+.o-skel i{display:block;height:12px;border-radius:6px;background:var(--surface-2);animation:o-pulse 1.2s var(--ease-out) infinite alternate}
+@keyframes o-pulse{from{opacity:.55}to{opacity:1}}
+
+/* the payroll month rail: 1 attendance -> 7 statutory, each a numbered stop (signature element of these screens) */
+.o-rail{display:flex;gap:0;counter-reset:step;overflow-x:auto;padding:2px 0 4px;margin:0;list-style:none}
+.o-rail li{flex:1 0 auto;display:flex;align-items:center;gap:8px;min-width:0}
+.o-rail li:not(:last-child)::after{content:'';flex:1;min-width:14px;height:2px;background:var(--line);margin:0 8px}
+.o-rail li.done:not(:last-child)::after{background:var(--good)}
+.o-rail a{display:inline-flex;align-items:center;gap:8px;padding:6px 10px 6px 6px;border-radius:999px;color:var(--muted);font-weight:700;font-size:13px;min-height:40px;white-space:nowrap;border:1px solid transparent}
+.o-rail a::before{counter-increment:step;content:counter(step);display:grid;place-items:center;width:26px;height:26px;border-radius:50%;border:2px solid var(--line);font-variant-numeric:tabular-nums;font-size:12.5px;background:var(--surface);color:var(--ink-2)}
+.o-rail li.done a::before{content:'✓';border-color:var(--good);background:var(--good-soft);color:var(--good)}
+.o-rail a[aria-current=step]{color:var(--ink);border-color:var(--accent);background:var(--accent-soft)}
+.o-rail a[aria-current=step]::before{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+@media (hover:hover){.o-rail a:not([aria-current]):hover{border-color:var(--line);color:var(--ink-2)}}
+.o-rail a.off{pointer-events:none;opacity:.55}
+
+/* period picker and toolbars */
+.o-period{display:inline-flex;align-items:center;gap:4px}
+.o-period .btn{min-width:36px;padding-inline:8px}
+.o-period input{width:178px;font-variant-numeric:tabular-nums}
+.o-lock{display:inline-flex;gap:6px;align-items:center}
+
+/* attendance grid: number cells a clerk can tab through like a register */
+.o-att input.input{width:74px;text-align:end;font-family:var(--mono);min-height:32px;padding:3px 8px}
+.o-att input.input:disabled{background:var(--surface-2);color:var(--muted);border-style:dashed}
+.o-att input.input.changed{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
+.o-att input.input.bad{border-color:var(--crit);box-shadow:inset 0 0 0 1px var(--crit)}
+.o-att td.sum{font-variant-numeric:tabular-nums;color:var(--muted)}
+
+/* confirm dialog + the one-time PIN */
+.o-modal-root{z-index:25;align-items:center;justify-content:center}
+.o-modal{position:relative;width:min(520px,calc(100vw - 32px));max-height:calc(100vh - 48px);overflow:auto;background:var(--surface);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow-sheet);padding:20px 22px;display:grid;gap:12px}
+.o-modal.danger{border:2px solid var(--crit)}
+.o-modal h2{margin:0;font-size:19px}
+.o-modal-b{display:grid;gap:10px;font-size:14px}
+.o-modal-b p{margin:0}
+.o-modal-f{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap}
+.btn.danger.solid{background:var(--crit);border-color:var(--crit);color:var(--on-crit)}
+.o-big{font-family:var(--display);font-size:26px;font-weight:800;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+.o-pinbox{border:2px solid var(--accent)}
+.o-pin{display:flex;justify-content:center;gap:18px;padding:16px;border:2px dashed var(--accent);border-radius:14px;background:var(--surface);font-family:var(--mono);font-size:40px;font-weight:800;letter-spacing:.18em;color:var(--ink);user-select:all}
+
+/* the statutory boundary line (every statutory surface) */
+.o-boundary{margin:0;font-size:12.5px;color:var(--ink-2);background:var(--surface-2);border-inline-start:3px solid var(--ink-2);border-radius:0 8px 8px 0;padding:8px 12px}
+[dir=rtl] .o-boundary{border-radius:8px 0 0 8px}
+
+/* a refusal from the rules (PLC 2026): plain words, the section, what the owner can do */
+.o-refuse{display:grid;gap:4px;margin:0;padding:10px 12px;border-radius:10px;background:var(--crit-soft);color:var(--crit);border:1px solid var(--crit);font-weight:600}
+.o-refuse b{font-weight:800}
+.o-warnlist{margin:0;padding:0;list-style:none;display:grid;gap:6px}
+.o-warnlist li{display:flex;gap:8px;align-items:flex-start;padding:8px 11px;border-radius:10px;background:var(--warn-soft);color:var(--warn);border:1px solid var(--warn);font-weight:600;font-size:13.5px}
+.o-fp{font-family:var(--mono);font-size:12px;color:var(--muted);word-break:break-all}
+
+/* money accounts: one card per account */
+.o-accs{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px}
+.o-acc{display:grid;gap:4px;text-align:start;background:var(--surface);border:1px solid color-mix(in srgb,var(--line) 55%,transparent);border-radius:12px;padding:12px 14px;cursor:pointer;font:inherit;color:inherit;min-height:44px}
+.o-acc[aria-pressed=true]{border:2px solid var(--accent);padding:11px 13px;background:var(--accent-soft)}
+@media (hover:hover){.o-acc:not([aria-pressed=true]):hover{border-color:var(--ink-2)}}
+.o-acc .k{font-size:11.5px;color:var(--muted);font-weight:700;letter-spacing:.05em;text-transform:uppercase}
+.o-acc .v{font-family:var(--display);font-size:21px;font-weight:700;font-variant-numeric:tabular-nums}
+.o-acc .v.neg{color:var(--crit)}
+.o-acc .s{font-size:12px;color:var(--muted)}
+
+/* bank reconciliation: the difference must reach 0.00 */
+.o-recon{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:14px;align-items:start}
+.o-diff{position:sticky;top:76px;display:grid;gap:8px;background:var(--surface);border:1px solid color-mix(in srgb,var(--line) 55%,transparent);border-radius:12px;padding:14px}
+.o-diff .row{display:flex;justify-content:space-between;gap:10px;font-variant-numeric:tabular-nums}
+.o-diff .row.em{font-weight:800;border-top:1px solid var(--ink-2);padding-top:6px}
+.o-diff .meter{border-radius:10px;padding:10px 12px;font-weight:800;display:flex;justify-content:space-between;gap:8px;border:1px solid currentColor}
+.o-diff .meter.off{background:var(--crit-soft);color:var(--crit)}
+.o-diff .meter.zero{background:var(--good-soft);color:var(--good)}
+.o-t tr.cleared td{color:var(--muted)}
+@media (max-width:1023px){.o-recon{grid-template-columns:minmax(0,1fr)}.o-diff{position:static}}
+
+/* close checklist */
+.o-check{list-style:none;margin:0;padding:0;display:grid;gap:6px}
+.o-check li{display:grid;grid-template-columns:28px minmax(0,1fr) auto;gap:8px;align-items:center;background:var(--surface);border:1px solid color-mix(in srgb,var(--line) 55%,transparent);border-radius:10px;padding:8px 12px}
+.o-check .ic{width:24px;height:24px;border-radius:50%;display:grid;place-items:center;font-weight:800;border:2px solid currentColor}
+.o-check li.ok .ic{color:var(--good);background:var(--good-soft)}
+.o-check li.no .ic{color:var(--warn);background:var(--warn-soft)}
+.o-check .d{font-size:12.5px;color:var(--muted)}
+
+/* two figures side by side on wide screens */
+.o-cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px;align-items:start}
+@media (max-width:1180px){.o-cols{grid-template-columns:minmax(0,1fr)}}
+.o-journal{display:grid;gap:6px}
+.o-jline{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(0,1fr) 120px 120px 36px;gap:6px;align-items:center}
+.o-jline .x{background:none;border:0;color:var(--muted);cursor:pointer;font-size:16px;min-height:36px;border-radius:8px}
+
+/* the payslip, on screen and on paper */
+.o-slip{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:18px 20px;display:grid;gap:12px}
+.o-slip-h{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;border-bottom:2px solid var(--ink-2);padding-bottom:8px}
+.o-slip-h h3{margin:0;font-family:var(--display);font-size:18px;color:var(--ink)}
+.o-slip .o-kv{grid-template-columns:auto 1fr auto 1fr}
+@media print{
+  body.office{background:#fff}
+  .o-nav,.o-top,.o-tabs,.o-rail,.o-bar,.scrim,.o-panel-h .x,.o-panel-f,.no-print,#toast{display:none!important}
+  .o-drawer{position:static;display:block}.o-panel{width:100%;height:auto;box-shadow:none;border:0}.o-panel-b{overflow:visible}
+  .o-shell{display:block}.o-tw{max-height:none;overflow:visible;border:0}.o-slip{border:0;padding:0}
+}
