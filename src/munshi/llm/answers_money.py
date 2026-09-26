@@ -249,7 +249,14 @@ def _accounts(d, c: _Ctx) -> str:
     total = _pick(d, "total") or sum(_num(a.get("balance")) or 0 for a in rows)
     head = c.t("Money now: ", "Paisa abhi: ", "رقم ابھی: ")
     _attach(d, c, head + rs(total))
-    return head + parts + c.t(" -- {t} in all.", " -- kul {t}.", " -- کل {t}۔", t=rs(total))
+    # bank/wallet receipts and payments with no account of their kind sit in "unassigned": say so, or the total
+    # (accounts + unassigned) looks wrong next to the accounts listed
+    un = _num(d.get("unassigned")) or 0
+    note = c.t(" Rs {u} is bank/wallet money with no account yet: add the bank or wallet account in the office (Accounts & banks).",
+               " Rs {u} bank/wallet ka paisa kisi account mein nahi: office mein (Accounts & banks) bank ya wallet account bana dein.",
+               " {u} روپے بینک/والٹ کی رقم کسی اکاؤنٹ میں نہیں: آفس میں (Accounts & banks) بینک یا والٹ اکاؤنٹ بنا دیں۔",
+               u=f"{un:,.0f}") if un else ""
+    return head + parts + c.t(" -- {t} in all.", " -- kul {t}.", " -- کل {t}۔", t=rs(total)) + note
 
 
 def _book(d, c: _Ctx) -> str:
