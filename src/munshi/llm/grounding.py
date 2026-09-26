@@ -107,8 +107,15 @@ def render_results(results: list[tuple[str, dict, ToolMessage]], repo, text: str
     """The sentences code says for this turn's tool results (and the raw result of the last one shown), in the
     language of `text`. Lookups only when nothing else rendered; a failed write says why it failed; a rejected call
     says nothing was done."""
+    said, raw, _ = render_turn(results, repo, text, is_write)
+    return said, raw
+
+
+def render_turn(results: list[tuple[str, dict, ToolMessage]], repo, text: str, is_write) -> tuple[list[str], str, list[dict]]:
+    """render_results plus the TABLES that ride along with the sentences shown (answers.render_full: the same formatter
+    run builds a list answer's sentence and its table), in the order said."""
     lang = answers.lang_of(text)
-    said: list[tuple[str, str, str]] = []           # (tool, sentence, raw)
+    said: list[tuple[str, str, str, dict | None]] = []           # (tool, sentence, raw, table)
     seen: set[str] = set()
     for tool, args, tm in results:
         content = str(tm.content)
@@ -120,15 +127,16 @@ def render_results(results: list[tuple[str, dict, ToolMessage]], repo, text: str
         if err is not None or tm.status == "error":
             if is_write(tool):
                 why = err or content[:160]
-                said.append((tool, {"ur": "یہ نہیں ہو سکا: {w}", "ru": "Ye nahi ho saka: {w}"}.get(lang, "Couldn't do that: {w}").format(w=why.rstrip(".")) + ".", content))
+                said.append((tool, {"ur": "یہ نہیں ہو سکا: {w}", "ru": "Ye nahi ho saka: {w}"}.get(lang, "Couldn't do that: {w}").format(w=why.rstrip(".")) + ".", content, None))
             continue
-        s = answers.render(tool, content, repo, text, args)
+        s, table = answers.render_full(tool, content, repo, text, args)
         if s:
-            said.append((tool, s, content))
+            said.append((tool, s, content, table))
     main = [x for x in said if x[0] not in LOOKUPS] or said
     main = main[-3:]
-    out = list(dict.fromkeys(s for _, s, _ in main))
-    return out, (main[-1][2] if main else "")
+    out = list(dict.fromkeys(s for _, s, _, _ in main))
+    tables = list({t["text"]: t for _, _, _, t in main if t}.values())
+    return out, (main[-1][2] if main else ""), tables
 
 
 def human_index(msgs: list) -> int:

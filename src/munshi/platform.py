@@ -209,6 +209,14 @@ class Reply:
     call: dict | None = None                    # that call ({"name", "args"}) -- also when it ran on a graph lane
     listed: list | None = None                  # the order ids a list reply showed (what 'sab confirm kar do' then means)
     extra: dict = field(default_factory=dict)   # chat-log meta the turn adds: the graph lane of each card, a chain of cards to come
+    # the structured tables of a list-shaped answer (llm/answers.make_table), built by the SAME formatter run as the
+    # sentence in `text`; stored in the chat row's meta ("tables") so a reloaded thread shows them again
+    tables: list = field(default_factory=list)
+
+    @property
+    def table(self) -> dict | None:
+        """The (first) table of this reply, or None."""
+        return self.tables[0] if self.tables else None
 
 
 # ====================================================================== approval cards
@@ -923,24 +931,32 @@ class MunshiPlatform:
     def _readable(self, msgs: list, i: int) -> str | None:
         """The readable sentence for the tool result at msgs[i] (a ToolMessage), in the language of the message it
         answers; None if there is no formatter for it."""
+        return self._readable_full(msgs, i)[0]
+
+    def _readable_full(self, msgs: list, i: int) -> tuple[str | None, dict | None]:
+        """(sentence, table) for the tool result at msgs[i] -- one formatter run (answers.render_full)."""
         tm = msgs[i]
         args = next((tc.get("args") or {} for m in reversed(msgs[:i]) if isinstance(m, AIMessage) for tc in (m.tool_calls or [])
                      if tc.get("id") == tm.tool_call_id), {})
         human = next((str(m.content) for m in reversed(msgs[:i]) if isinstance(m, HumanMessage)), "")
-        return answers.render(str(tm.name or ""), str(tm.content), self.repo, human, args)
+        return answers.render_full(str(tm.name or ""), str(tm.content), self.repo, human, args)
 
     def _final_text(self, result: dict) -> str:
+        return self._final(result)[0]
+
+    def _final(self, result: dict) -> tuple[str, list]:
+        """The reply text of a finished run, and the tables that go with it."""
         msgs = result["messages"]
         msg = msgs[-1]
         # Gemini (and other providers) return a list of content parts; .text joins the text parts in order
         content = msg.content if isinstance(msg.content, str) else str(msg.text)
         # the offline model's one-line summary of a tool result ("Done -- {json}"): a sentence, with the raw result folded after it
         if isinstance(msg, AIMessage) and content.startswith("Done -- ") and len(msgs) >= 2 and isinstance(msgs[-2], ToolMessage):
-            nice = self._readable(msgs, len(msgs) - 2)
+            nice, table = self._readable_full(msgs, len(msgs) - 2)
             if nice:
                 raw = content[len("Done -- "):]
-                return nice + (DETAILS + raw if raw.lstrip()[:1] in ("{", "[") else "")
-        return content or "Done."
+                return nice + (DETAILS + raw if raw.lstrip()[:1] in ("{", "[") else ""), ([table] if table else [])
+        return content or "Done.", []
 
     # ------------------------------------------------------------------ conversation memory (llm/followup.py)
     _MEMO_ROWS = 16
@@ -968,8 +984,9 @@ class MunshiPlatform:
                 log.exception("memory command failed on %r", text[:80])
                 said = None
             if said is not None:                # 'Bhatti sahab matlab Bhatti Traders hai', 'forget X', 'kya kya yaad hai'
-                reply = Reply(said[0], None, None, thread_id)
-                self.repo.add_chat(thread_id, "munshi", reply.text, {"specialist": None, "memory": said[1]})
+                tables = said[1].pop("tables", [])
+                reply = Reply(said[0], None, None, thread_id, tables=tables)
+                self.repo.add_chat(thread_id, "munshi", reply.text, {"specialist": None, "memory": said[1]} | ({"tables": tables} if tables else {}))
                 return reply
             try:
                 ask, topic = self._memory(thread_id, role)
@@ -1009,6 +1026,8 @@ class MunshiPlatform:
                                 meta["learned"] = learned
                         except Exception:
                             log.exception("couldn't learn from the answer on %s", thread_id)
+                    if reply.tables:
+                        meta["tables"] = reply.tables
                     self.repo.add_chat(thread_id, "munshi", reply.text, meta)
                     return reply
             finally:
@@ -1117,7 +1136,10 @@ class MunshiPlatform:
         lang, who = lang_of(text), (user or role)
         no = (MEM.say("not_allowed", lang), {"cmd": cmd.kind, "refused": "role"})
         if cmd.kind == "list":
-            return (self._memory_list(lang), {"cmd": "list"}) if role in MEM.TEACHERS else no
+            if role not in MEM.TEACHERS:
+                return no
+            txt, table = self._memory_list(lang)
+            return txt, {"cmd": "list"} | ({"tables": [table]} if table else {})
         if cmd.kind == "forget":
             key = MEM.phrase_key(cmd.phrase)
             if not any(a["phrase_norm"] == key for a in self.repo.learned_aliases()):
@@ -1147,17 +1169,27 @@ class MunshiPlatform:
                       previous=(self._entity_name(prev["entity_kind"], prev["entity_id"]) or prev["entity_id"]) if prev else "")
         return txt, {"cmd": "teach", "status": r["status"], "kind": tgt.kind, "id": tgt.id}
 
-    def _memory_list(self, lang: str) -> str:
+    def _memory_list(self, lang: str) -> tuple[str, dict | None]:
+        """The learned names, as lines -- and, from the same rows, as a table (name said, means, kind, taught by, date, uses)."""
         rows = [a for a in self.repo.alias_history(500) if a["active"]]
         if not rows:
-            return MEM.say("list_empty", lang)
+            return MEM.say("list_empty", lang), None
         out = [MEM.say("list_head", lang, n=len(rows))]
+        trows = []
         for a in sorted(rows, key=lambda a: (a["entity_kind"], a["phrase"].lower())):
             prev = MEM.say("list_prev", lang, previous=self._entity_name(a["entity_kind"], a["previous_entity_id"]) or a["previous_entity_id"]) \
                 if a["previous_entity_id"] else ""
-            out.append(MEM.say("list_row", lang, phrase=a["phrase"], name=self._entity_name(a["entity_kind"], a["entity_id"]) or a["entity_id"],
+            name = self._entity_name(a["entity_kind"], a["entity_id"]) or a["entity_id"]
+            out.append(MEM.say("list_row", lang, phrase=a["phrase"], name=name,
                                kind=a["entity_kind"], who=a["taught_by"] or "?", day=str(a["taught_at"])[:10], uses=a["uses"], prev=prev))
-        return "\n".join(out)
+            trows.append({"phrase": a["phrase"], "name": name, "kind": a["entity_kind"], "who": a["taught_by"] or "?", "day": answers.bdate(a["taught_at"]),
+                          "uses": int(a["uses"] or 0)})
+        L = lambda k: answers.label(lang, k)  # noqa: E731
+        table = answers.make_table(lang, {"en": "Names I remember", "ru": "Yaad kiye hue naam", "ur": "یاد کیے ہوئے نام"}.get(lang, "Names I remember"),
+                                   out[0], [("phrase", L("name_said"), "text"), ("name", L("means"), "text"), ("kind", L("type"), "text"),
+                                            ("who", L("taught_by"), "text"), ("day", L("date"), "date"), ("uses", L("uses"), "qty")], trows)
+        table["text"] = "\n".join(out)
+        return "\n".join(out), (table if len(trows) >= 2 else None)
 
     def _ran(self, bundle, cfg: dict, tool: str) -> bool:
         """Did the approved call actually do its work (its tool result is not an error)?"""
@@ -1269,7 +1301,24 @@ class MunshiPlatform:
             parts.append(f"Your own request(s) waiting for someone else: {rows(own)}")
         txt = " ".join(parts) if parts else ("Nothing is waiting for your approval." if role in ("owner", "clerk") else "None of your requests is waiting for approval.")
         tr.specialist, tr.response_text = "report", txt
-        return Reply(txt, "report", None, thread_id), {"specialist": "report", "approvals_listed": [p.approval_id for p in can + own]}, True
+        tables = []
+        if len(can) + len(own) >= 2:
+            # the same cards as the sentence (all of them, not only the first 10), one row each
+            lang = lang_of(text)
+            L = lambda k: answers.label(lang, k)  # noqa: E731
+            you = {"en": "You", "ru": "Aap", "ur": "آپ"}.get(lang, "You")
+            trows = [{"request": self._headline(self.card(p)), "asked_by": p.requested_by or p.requested_by_role,
+                      "waiting": you if p in can else p.needs_role, "date": answers.bdate(p.created_at)} for p in can + own]
+            lead = {"en": "{n} card(s) waiting for approval:", "ru": "{n} cards manzoori ke intezar mein:", "ur": "{n} کارڈ منظوری کے منتظر:"}.get(lang, "{n}")
+            t = answers.make_table(lang, {"en": "Waiting for approval", "ru": "Manzoori ka intezar", "ur": "منظوری کے منتظر"}.get(lang, "Waiting for approval"),
+                                   lead.format(n=len(trows)),
+                                   [("request", L("request"), "text"), ("asked_by", L("asked_by"), "text"),
+                                    ("waiting", {"en": "Approves", "ru": "Kaun manzoor kare", "ur": "کون منظور کرے"}.get(lang, "Approves"), "text"),
+                                    ("date", L("date"), "date")], trows,
+                                   note={"en": "Open Approvals to decide them.", "ru": "Faisla Approvals mein karein.", "ur": "فیصلہ منظوریوں میں کریں۔"}.get(lang) if can else None)
+            t["text"] = txt
+            tables = [t]
+        return Reply(txt, "report", None, thread_id, tables=tables), {"specialist": "report", "approvals_listed": [p.approval_id for p in can + own]}, True
 
     # -- which of this person's waiting cards a message is about ('malik agro wale card pe galti', 'malik wala card wapis le lo')
     def _my_cards(self, thread_id: str, role: str, user: str) -> list[PendingApproval]:
@@ -1634,6 +1683,7 @@ class MunshiPlatform:
             return None
         first, meta, _ = outs[0]
         first.text = "\n".join(visible(r.text) for r, _, _ in outs)
+        first.tables = [t for r, _, _ in outs for t in r.tables]
         return first, meta, True
 
     def _split_reads(self, thread_id, role, text, run, user, tr):
@@ -1648,6 +1698,7 @@ class MunshiPlatform:
             return None
         first, meta, _ = outs[0]
         first.text = "\n".join(visible(r.text) for r, _, _ in outs)
+        first.tables = [t for r, _, _ in outs for t in r.tables]
         return first, meta, True
 
     # -- what a tool result means for the next message
@@ -1740,7 +1791,8 @@ class MunshiPlatform:
             if kept is not None:
                 return kept
         if engine == RULES and self.hybrid and not result.get("__interrupt__") and not_understood(result["messages"][-1]):
-            return Reply(self._final_text(result), specialist, None, thread_id, engine=engine), {"specialist": specialist}, False
+            txt, tables = self._final(result)
+            return Reply(txt, specialist, None, thread_id, engine=engine, tables=tables), {"specialist": specialist}, False
         msgs = result.get("messages") or []
         h = max((i for i, m in enumerate(msgs) if isinstance(m, HumanMessage)), default=-1)
         calls = [{"name": tc["name"], "args": tc.get("args") or {}} for m in msgs[h + 1:] if isinstance(m, AIMessage) for tc in (m.tool_calls or [])]
@@ -1973,7 +2025,8 @@ class MunshiPlatform:
             msgs = []
         h = GR.human_index(msgs)
         results = GR.turn_results(msgs, h) if h >= 0 else []
-        said, raw = GR.render_results(results, self.repo, text, self._is_write)
+        said, raw, tables = GR.render_turn(results, self.repo, text, self._is_write)
+        reply.tables = tables if said else []
         if said:
             q = GR.last_question(model_text)
             body = "\n".join(said) + (f"\n{GR.strip_ids(q, self.repo)}" if q and not self._claims_done(model_text) else "")
@@ -2069,6 +2122,7 @@ class MunshiPlatform:
         `lead` is set when settling a resumed turn ("Approved. "): whatever
         follows is a follow-up to an action that has already been decided."""
         problems: list[str] = []
+        tables: list = []
         for _ in range(self._MAX_DECLINES + 1):
             interrupts = result.get("__interrupt__")
             if not interrupts:
@@ -2091,9 +2145,9 @@ class MunshiPlatform:
         elif problems:
             txt = f"Couldn't ask for approval — {problems[0]}. Nothing was done."
         else:
-            txt = self._final_text(result)
+            txt, tables = self._final(result)
         tr.response_text = txt
-        return Reply(txt, specialist, None, thread_id)
+        return Reply(txt, specialist, None, thread_id, tables=tables)
 
     def _open_card(self, bundle, specialist: str, thread_id: str, role: str, user: str, req: dict, deferred: list[dict], problems: list[str], tr,
                    lead: str = "", engine: str = RULES, aid: str | None = None) -> Reply:
@@ -2419,6 +2473,8 @@ class MunshiPlatform:
                                     reply.text = f"{head}\n\n{more}{sep}{tail}"
                         except Exception:
                             log.exception("couldn't raise the next card of the chain after %s", approval_id)
+                    if reply.tables:
+                        meta["tables"] = reply.tables
                     self.repo.add_chat(pa.thread_id, "munshi", reply.text, meta)
                     if approve: self.deliver_messages()
                     return reply

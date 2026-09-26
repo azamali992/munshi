@@ -151,7 +151,14 @@ def _confirm_needs(c: Ctx, o: Order) -> tuple[str, str]:
 @router.post("/chat")
 def chat(body: ChatIn, c: Ctx = Depends(context("chat"))):
     r = c.platform.handle_message(body.thread_id, c.role, body.text.strip(), user=c.who)
-    return {"text": r.text, "specialist": r.specialist, "pending": _reply_card(c, r)}
+    return {"text": r.text, "specialist": r.specialist, "pending": _reply_card(c, r)} | _tables(r)
+
+
+def _tables(r) -> dict:
+    """A list-shaped reply's structured table(s) (llm/answers.make_table): `table` is the first (or null), `tables` all of
+    them in the order said. `text` stays the complete sentence, so a client that ignores tables loses nothing."""
+    ts = list(getattr(r, "tables", None) or [])
+    return {"table": ts[0] if ts else None, "tables": ts}
 
 
 def _reply_card(c: Ctx, r) -> dict | None:
@@ -182,7 +189,7 @@ def approvals_history(c: Ctx = Depends(context("approvals:read"))):
 @router.post("/approvals/{approval_id}")
 def decide(approval_id: str, body: Decision, c: Ctx = Depends(context("approvals:decide"))):
     r = c.platform.resolve(approval_id, body.approve, c.role, body.note, user=c.who)
-    return {"text": r.text, "specialist": r.specialist}
+    return {"text": r.text, "specialist": r.specialist} | _tables(r)
 
 
 @router.get("/notifications")
@@ -364,4 +371,4 @@ async def voice(thread_id: str = "main", audio: UploadFile = File(...), c: Ctx =
                                                         language="ur" if os.environ.get("VOICE_LANG", "auto") == "ur" else None)
     text = tr.text.strip()
     r = c.platform.handle_message(thread_id, c.role, text, user=c.who)
-    return {"transcript": text, "text": r.text, "specialist": r.specialist, "pending": _reply_card(c, r)}
+    return {"transcript": text, "text": r.text, "specialist": r.specialist, "pending": _reply_card(c, r)} | _tables(r)

@@ -245,14 +245,106 @@
 
   // ================================================================ chat + approvals
   const DETAILS = '\n\nDone -- ';   // platform.DETAILS: a readable reply, then its raw result (folded under "details")
-  function renderMsg(m) {
+
+  // ---------------------------------------------------------------- tables in a chat reply
+  // A list-shaped answer carries tables (llm/answers.make_table): {title, lead, columns:[{key,label,align,kind,badge?}], rows,
+  // totals, note, count, text}. `text` is the run-on sentence the table stands for: the bubble shows `lead` + the table in its
+  // place, and the rest of the reply around it. The server sends raw numbers; they are formatted here by column kind.
+  const TABLE_FIRST = 15;                                             // rows shown before "show all N"
+  const URDU = /[؀-ۿݐ-ݿ]/;
+  // Urdu text with Latin runs in it ('1 Sep سے 26 Sep: خالص منافع Rs 49,400'): each run of names / figures / dates in its own LTR
+  // isolate with the UI font, so the sentence reads right to left and the figures never reorder. Brackets stay outside the runs (mirrored).
+  const LATIN_RUN = /[A-Za-z0-9](?:[A-Za-z0-9 ,.\/\-+%&'–]*[A-Za-z0-9%+])?/g;
+  const bidi = s => { const str = String(s ?? ''); if (!URDU.test(str)) return esc(str); let out = '', at = 0;
+    for (const m of str.matchAll(LATIN_RUN)) { out += esc(str.slice(at, m.index)) + `<bdi class="ltr" dir="ltr">${esc(m[0])}</bdi>`; at = m.index + m[0].length; }
+    return out + esc(str.slice(at)); };
+  const para = (tag, cls, s) => `<${tag} class="${cls}" dir="${URDU.test(String(s ?? '')) ? 'rtl' : 'auto'}">${bidi(s)}</${tag}>`;
+  const cellText = (v, kind) => {                                     // plain text (for the copy / WhatsApp version too)
+    if (v === null || v === undefined || v === '') return '—';
+    const n = Number(v);
+    if (kind === 'money') { const s = 'Rs ' + Math.abs(n).toLocaleString('en-US', Number.isInteger(n) ? { maximumFractionDigits: 0 } : { minimumFractionDigits: 2, maximumFractionDigits: 2 }); return (n < 0 ? '-' : '') + s; }
+    if (kind === 'qty' || kind === 'days') return n.toLocaleString('en-US', { maximumFractionDigits: 2 });
+    if (kind === 'pct') return n.toLocaleString('en-US', { maximumFractionDigits: 1 }) + '%';
+    if (kind === 'date') { const m = String(v).match(/^(\d{4})-(\d{2})-(\d{2})/); return m ? `${+m[3]} ${'Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split(' ')[+m[2] - 1]}` : String(v); }
+    return String(v);
+  };
+  // names and figures are Latin: an LTR isolate with the UI font (never Nastaliq, never reordered inside Urdu); Urdu words keep their own direction
+  const cellHtml = (v, col) => {
+    const s = cellText(v, col.kind);
+    if (s === '—') return `<span class="dt-nil" aria-label="${esc(t('tbl_none'))}">—</span>`;
+    const inner = URDU.test(s) ? `<bdi dir="rtl">${bidi(s)}</bdi>` : `<bdi class="ltr" dir="ltr">${esc(col.kind === 'money' ? s.replace(' ', ' ') : s)}</bdi>`;
+    return col.badge ? `<span class="dt-flag"><span aria-hidden="true">▼</span> ${inner}</span>` : inner;
+  };
+  let tableSeq = 0;
+  const TABLES = new Map();                                           // figure id -> table payload (for copy / share)
+  function tableBlock(tb, withLead) {
+    const id = 'dt' + (++tableSeq); TABLES.set(id, tb);
+    const cols = tb.columns || [], rows = tb.rows || [];
+    const cut = rows.length > TABLE_FIRST + 3 ? TABLE_FIRST : rows.length;     // a table of 17 is shown whole: "show all 17" would hide just two
+    const cls = c => (c.align === 'right' ? 'n' : 't') + (c.kind === 'text' && c.key === 'items' ? ' wide' : '');
+    const head = cols.map((c, i) => `<th scope="col" class="${cls(c)}${i === 0 ? ' dt-name' : ''}">${URDU.test(c.label) ? bidi(c.label) : `<bdi dir="ltr">${esc(c.label)}</bdi>`}</th>`).join('');
+    const body = rows.map((r, k) => `<tr${k >= cut ? ' hidden data-more' : ''}${r._em ? ' class="em"' : ''}>${cols.map((c, i) => i === 0
+      ? `<th scope="row" class="${cls(c)} dt-name">${cellHtml(r[c.key], c)}</th>` : `<td class="${cls(c)}">${cellHtml(r[c.key], c)}</td>`).join('')}</tr>`).join('');
+    const tot = tb.totals ? `<tfoot><tr>${cols.map((c, i) => i === 0 ? `<th scope="row" class="${cls(c)} dt-name">${cellHtml(tb.totals[c.key], { kind: 'text' })}</th>`
+      : `<td class="${cls(c)}">${c.key in tb.totals && tb.totals[c.key] !== null ? cellHtml(tb.totals[c.key], c) : ''}</td>`).join('')}</tr></tfoot>` : '';
+    const more = rows.length > cut ? `<button type="button" class="btn sm" data-dt-more aria-expanded="false" aria-controls="${id}-tb">${esc(t('tbl_show_all').replace('{n}', rows.length))}</button>` : '';
+    return `${withLead && tb.lead ? para('p', 'dt-lead', tb.lead) : ''}<figure class="dt" id="${id}">
+      <div class="dt-head" aria-hidden="true">${para('span', 'dt-title', tb.title)}<span class="dt-count">${esc(t('tbl_rows').replace('{n}', tb.count ?? rows.length))}</span></div>
+      <div class="dt-wrap"><div class="dt-scroll" role="region" aria-labelledby="${id}-c" tabindex="0"><table><caption id="${id}-c" class="sr">${esc(tb.title)}</caption><thead><tr>${head}</tr></thead><tbody id="${id}-tb">${body}</tbody>${tot}</table></div></div>
+      ${tb.note ? para('p', 'dt-note', tb.note) : ''}
+      <div class="dt-actions">${more}<button type="button" class="btn sm ghost" data-dt-copy>${esc(t('tbl_copy'))}</button><button type="button" class="btn sm ghost" data-dt-wa>${esc(t('tbl_whatsapp'))}</button></div></figure>`;
+  }
+  // the table as plain aligned text (monospace in WhatsApp between ``` fences): name column left, figures right
+  function tableAsText(tb) {
+    const cols = tb.columns || [], all = [...(tb.rows || []), ...(tb.totals ? [tb.totals] : [])];
+    const grid = [cols.map(c => c.label), ...all.map((r, k) => cols.map((c, i) => (k === all.length - 1 && tb.totals && i === 0) ? String(r[c.key] ?? '') : (c.key in r ? cellText(r[c.key], c.kind) : '')))];
+    const w = cols.map((_, i) => Math.max(...grid.map(g => String(g[i]).length)));
+    const line = g => g.map((v, i) => cols[i].align === 'right' ? String(v).padStart(w[i]) : String(v).padEnd(w[i])).join('  ').trimEnd();
+    const rule = w.map(n => '-'.repeat(n)).join('  ');
+    const lines = [line(grid[0]), rule, ...grid.slice(1, tb.totals ? -1 : undefined).map(line), ...(tb.totals ? [rule, line(grid[grid.length - 1])] : [])];
+    return `${tb.title}\n\`\`\`\n${lines.join('\n')}\n\`\`\`` + (tb.note ? `\n${tb.note}` : '');
+  }
+  async function onTableClick(e) {
+    const b = e.target.closest('[data-dt-more],[data-dt-copy],[data-dt-wa]'); if (!b) return;
+    const fig = b.closest('figure.dt'); const tb = TABLES.get(fig.id); if (!tb) return;
+    if (b.hasAttribute('data-dt-more')) {
+      const open = b.getAttribute('aria-expanded') !== 'true';
+      $$('tr[data-more]', fig).forEach(r => { r.hidden = !open; });
+      b.setAttribute('aria-expanded', String(open)); b.textContent = open ? t('tbl_show_less') : t('tbl_show_all').replace('{n}', (tb.rows || []).length);
+      if (!open) fig.scrollIntoView({ block: 'nearest' });
+      return;
+    }
+    const txt = tableAsText(tb);
+    if (b.hasAttribute('data-dt-wa')) { window.open('https://wa.me/?text=' + encodeURIComponent(txt), '_blank', 'noopener'); return; }
+    try { await navigator.clipboard.writeText(txt); toast(t('tbl_copied')); }
+    catch { toast(t('tbl_copy_failed'), 4000); }
+  }
+  // a table wider than its bubble shows a soft edge on the side it continues to, updated as it scrolls (RTL scrollLeft is <= 0)
+  const edge = el => { const max = el.scrollWidth - el.clientWidth; el.parentElement.toggleAttribute('data-more-x', max > 2 && Math.abs(el.scrollLeft) < max - 2); };
+  const markEdges = root => $$('.dt-scroll', root).forEach(edge);
+  const onTableScroll = e => { if (e.target.classList && e.target.classList.contains('dt-scroll')) edge(e.target); };
+  let edgesWired = false;
+  // the reply's text with each table in place of the sentence it stands for (a table whose sentence isn't found goes after)
+  function withTables(text, tables) {
+    let html = '', rest = text; const loose = [];
+    for (const tb of tables) {
+      const i = tb && tb.text ? rest.indexOf(tb.text) : -1;
+      if (i < 0) { if (tb) loose.push(tb); continue; }
+      const before = rest.slice(0, i).replace(/\s+$/, '');
+      html += (before ? `<span class="msg-t" dir="auto">${esc(before)}</span>` : '') + tableBlock(tb, true); rest = rest.slice(i + tb.text.length).replace(/^\s+/, '');
+    }
+    return html + (rest ? `<span class="msg-t" dir="auto">${esc(rest)}</span>` : '') + loose.map(tb => tableBlock(tb, false)).join('');
+  }
+  function renderMsg(m, status = '') {
     if (m.role === 'munshi' || m.role === 'bot') {
       const who = m.meta?.specialist ? m.meta.specialist + ' munshi' : 'munshi';
       let text = m.text, extra = '';
       const cut = text.indexOf(DETAILS);   // a readable reply with the raw result folded after it
       if (cut > 0) { const raw = text.slice(cut + DETAILS.length); text = text.slice(0, cut); let o = raw; try { o = JSON.stringify(JSON.parse(raw), null, 1); } catch { /* keep raw */ } extra = `<details><summary class="hint">details</summary><pre class="json">${esc(o)}</pre></details>`; }
       else if (text.startsWith('Done -- ')) { const raw = text.slice(8); try { const o = JSON.parse(raw); text = summarize(o); extra = `<details><summary class="hint">details</summary><pre class="json">${esc(JSON.stringify(o, null, 1))}</pre></details>`; } catch { text = raw; } }
-      return `<div class="msg bot"><span class="who">${esc(who)}${m.meta?.resolved ? ' · ' + (m.meta.approved ? t('approved') : t('reject')) : ''}</span>${esc(text)}${extra}</div>`;
+      const tables = (m.tables || m.meta?.tables || []).filter(x => x && Array.isArray(x.columns) && Array.isArray(x.rows));
+      const said = status || (m.meta?.resolved ? (m.meta.approved ? t('approved') : t('reject')) : '');
+      return `<div class="msg bot${tables.length ? ' has-table' : ''}"><span class="who">${esc(who)}${said ? ' · ' + esc(said) : ''}</span>${tables.length ? withTables(text, tables) : esc(text)}${extra}</div>`;
     }
     return `<div class="msg me">${esc(m.text)}${m.meta?.user && m.meta.user !== state.me?.name ? `<span class="who">${esc(m.meta.user)}</span>` : ''}</div>`;
   }
@@ -373,6 +465,9 @@
     $$('[data-q]').forEach(b => b.onclick = () => { $('#txt').value = b.dataset.q; $('#composer').requestSubmit(); });
     const pre = sessionStorage.getItem('munshi.prefill'); if (pre) { sessionStorage.removeItem('munshi.prefill'); $('#txt').value = pre; $('#composer').requestSubmit(); }
     msgs.addEventListener('click', onApprovalClick);
+    msgs.addEventListener('click', onTableClick);
+    msgs.addEventListener('scroll', onTableScroll, true); markEdges(msgs);
+    if (!edgesWired) { edgesWired = true; window.addEventListener('resize', () => markEdges(document)); }
     const scrollEnd = () => window.scrollTo({ top: document.body.scrollHeight });
     scrollEnd();
     $('#composer').onsubmit = async e => {
@@ -383,7 +478,8 @@
         const r = await post('/api/chat', { thread_id: state.thread, text: txt }); thinking.remove();
         // a message held behind an earlier card brings that card down to here, so it can be decided without scrolling
         if (r.pending) $$(`[data-aid="${CSS.escape(r.pending.approval_id)}"]`, msgs).forEach(x => x.remove());
-        msgs.insertAdjacentHTML('beforeend', r.pending ? renderApproval(r.pending) : renderMsg({ role: 'munshi', text: r.text, meta: { specialist: r.specialist } }));
+        msgs.insertAdjacentHTML('beforeend', r.pending ? renderApproval(r.pending) : renderMsg({ role: 'munshi', text: r.text, meta: { specialist: r.specialist }, tables: r.tables || (r.table ? [r.table] : []) }));
+        markEdges(msgs);
         if (r.pending?.still_waiting) toast(t('ap_still_toast'));
       }
       catch (err) { thinking.remove(); msgs.insertAdjacentHTML('beforeend', renderMsg({ role: 'munshi', text: '⚠ ' + err.message })); }
@@ -400,8 +496,9 @@
       try {
         const r = await post('/api/approvals/' + aid, { approve, note });
         const label = approve ? t('approved') : act === 'withdraw' ? t('withdrawn') : t('rejected');
-        box.outerHTML = `<div class="msg bot"><span class="who">${esc(r.specialist)} munshi · ${esc(label)}</span>${esc(r.text.indexOf(DETAILS) > 0 ? r.text.slice(0, r.text.indexOf(DETAILS)) : r.text.startsWith('Done -- ') ? (() => { try { return summarize(JSON.parse(r.text.slice(8))); } catch { return r.text.slice(8); } })() : r.text)}</div>`;
-        APPROVALS.delete(aid); toast(label);
+        box.outerHTML = (r.tables || []).length ? renderMsg({ role: 'munshi', text: r.text.indexOf(DETAILS) > 0 ? r.text.slice(0, r.text.indexOf(DETAILS)) : r.text, meta: { specialist: r.specialist }, tables: r.tables }, label)
+          : `<div class="msg bot"><span class="who">${esc(r.specialist)} munshi · ${esc(label)}</span>${esc(r.text.indexOf(DETAILS) > 0 ? r.text.slice(0, r.text.indexOf(DETAILS)) : r.text.startsWith('Done -- ') ? (() => { try { return summarize(JSON.parse(r.text.slice(8))); } catch { return r.text.slice(8); } })() : r.text)}</div>`;
+        APPROVALS.delete(aid); markEdges(document); toast(label);
       }
       catch (err) { toast(err.message, 4000); box.querySelectorAll('button').forEach(x => x.disabled = false); }
       refreshBadge();
