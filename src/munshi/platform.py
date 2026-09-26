@@ -104,7 +104,7 @@ from munshi.llm.text import fold, is_urdu
 from munshi.observability.tracing import TurnTrace, configure_tracking, trace_turn
 from munshi.safety.middleware import DEFERRED_KEY
 from munshi.safety.risk import RiskTier, approval_refusal, approver_for, risk_of, same_person, stricter_role
-from munshi.tools.core import MunshiTools, acting_user_id, current_user_id
+from munshi.tools.core import MunshiTools, acting_user_id, approved_proofs, current_user_id
 
 log = logging.getLogger("munshi.platform")
 
@@ -135,7 +135,12 @@ PROOF_ASK = {"en": "Got the proof. Is this a payment? From whom (or to whom), an
 PROOF_OFF = {"en": "Payment proofs aren't switched on here yet, so the photo can't go on a card. Send the message without it. Nothing was done.",
              "ru": "Payment proof abhi yahan chalu nahi, is liye photo card par nahi lag sakti. Photo ke baghair message bhejein. Kuch nahi kiya gaya.",
              "ur": "ادائیگی کا ثبوت (proof) ابھی یہاں چالو نہیں، اس لیے تصویر کارڈ پر نہیں لگ سکتی۔ تصویر کے بغیر پیغام بھیجیں۔ کچھ نہیں کیا گیا۔"}
-PROOF_NOT_YOURS = {"en": "That proof isn't one you uploaded, so it can't go on a card. Send the photo again from your own phone. Nothing was done.",
+PROOF_USED = {"en": "That proof is already on another payment or on a card waiting for approval: one proof can't prove two payments. Nothing was done.",
+              "ru": "Ye proof pehle se kisi aur payment ya card par laga hai: ek proof do payments sabit nahi kar sakta. Kuch nahi kiya gaya.",
+              "ur": "یہ ثبوت (proof) پہلے سے کسی اور ادائیگی یا کارڈ پر لگا ہے: ایک ثبوت دو ادائیگیاں ثابت نہیں کر سکتا۔ کچھ نہیں کیا گیا۔"}
+PROOF_TOO_MANY = {"en": "At most 5 proofs go on one payment. Nothing was done.", "ru": "Ek payment par zyada se zyada 5 proof lag sakte hain. Kuch nahi kiya gaya.",
+                  "ur": "ایک ادائیگی پر زیادہ سے زیادہ 5 ثبوت (proof) لگ سکتے ہیں۔ کچھ نہیں کیا گیا۔"}
+PROOF_NOT_YOURS = {"en": "I can't find that proof -- or it isn't one you uploaded -- so it can't go on a card. Send the photo again from your own phone. Nothing was done.",
                    "ru": "Ye proof aap ka upload kiya hua nahi, is liye card par nahi lag sakta. Apne phone se photo dobara bhejein. Kuch nahi kiya gaya.",
                    "ur": "یہ ثبوت آپ کا اپ لوڈ کیا ہوا نہیں، اس لیے کارڈ پر نہیں لگ سکتا۔ اپنے فون سے تصویر دوبارہ بھیجیں۔ کچھ نہیں کیا گیا۔ (proof)"}
 
@@ -566,15 +571,18 @@ class CardBuilder:
     def _proofs(self, pa, total) -> tuple[list[dict], list[dict], list[dict]]:
         """(the card's proofs for the app to show as thumbnails, facts, warnings). An amount Stream E read off the image is only
         ever shown as 'read from the image -- check': the card's amount is what the person typed."""
+        on_card = self._get(lambda x: self.repo.attachments_for("approval", x), str(pa.approval_id or "")) or []
         ids = [str(x) for x in ((pa.args or {}).get(PROOFS_KEY) or []) if isinstance(x, str)][:5]
+        atts = on_card or [a for a in (self._get(self.repo.get_attachment, i) for i in ids) if a]
         out, facts, warns = [], [], []
-        for aid in ids:
-            a = self._get(self.repo.get_attachment, aid)
-            if a is None:
-                continue
+        for a in atts[:5]:
+            aid = str(a.get("att_id") or "")
             ctype = str(a.get("content_type") or "")
-            out.append({"id": aid, "kind": "pdf" if ctype == "application/pdf" else "image", "content_type": ctype,
-                        "filename": str(a.get("filename") or ""), "thumb": f"/api/attachments/{aid}/file"})
+            # the session-authenticated file routes (web/routes/attachments.py) apply the read rule on every fetch; the card
+            # itself is filtered per viewer too (MunshiPlatform.viewer_decision)
+            out.append({"id": aid, "kind": a.get("kind") or ("pdf" if ctype == "application/pdf" else "image"), "content_type": ctype,
+                        "filename": str(a.get("filename") or ""), "owner_only": bool(a.get("owner_only")), "uploaded_by": str(a.get("uploaded_by") or ""),
+                        "thumb": f"/api/attachments/{aid}/thumb" if a.get("has_thumb") else None, "file": f"/api/attachments/{aid}/file"})
             read = a.get("read_amount") if a.get("read_amount") is not None else (a.get("read") or {}).get("amount") if isinstance(a.get("read"), dict) else None
             try:
                 read = float(read) if read is not None else None
@@ -584,7 +592,8 @@ class CardBuilder:
                 facts.append({"key": "proof", "value": f"read from the image: {_en({'rs': read})} -- check"})
                 if total is not None and abs(float(total) - read) > 0.5:
                     warns.append(_t("w_proof_amount", read={"rs": read}, amount={"rs": float(total)}))
-            if any(str(ln.get("entity")) != "approval" for ln in a.get("links") or [] if isinstance(ln, dict)):
+            if any(str(ln.get("entity")) != "approval" or str(ln.get("entity_id")) != str(pa.approval_id) for ln in a.get("links") or []
+                   if isinstance(ln, dict)):
                 warns.append(_t("w_proof_linked", proof=aid))
         return out, facts, warns
 
@@ -1000,8 +1009,8 @@ class CardBuilder:
         rows = [r for r in a.get("rows") or [] if isinstance(r, dict)]
         lines = []
         for r in rows:
-            days = next((r[k] for k in ("days_worked", "leave_days", "absent_days", "ot_minutes") if r.get(k) is not None), 0)
-            unit = {"leave_days": "leave", "absent_days": "absent", "ot_minutes": "OT minutes"}.get(next((k for k in r if k != "employee_id"), ""), "days")
+            days = next((r[k] for k in ("days_worked", "casual_leave", "annual_leave", "sick_leave", "unpaid_absent", "ot_minutes") if r.get(k) is not None), 0)
+            unit = {"casual_leave": "leave", "annual_leave": "leave", "sick_leave": "sick", "unpaid_absent": "absent", "ot_minutes": "OT minutes"}.get(next((k for k in r if k != "employee_id"), ""), "days")
             lines.append({"sku": str(r.get("employee_id") or ""), "name": self._emp_name(r.get("employee_id")), "qty": days, "unit": unit if unit != "days" else "days",
                           "unit_price": None, "line_total": None})
         warns = [_t("w_not_found", what=_word("employee"), id=str(r.get("employee_id") or "?")) for r in rows if self._emp(r.get("employee_id")) is None]
@@ -1026,8 +1035,9 @@ class CardBuilder:
     def _c_set_pay_structure(self, a: dict, pa) -> dict:
         name, warns = self._emp_card("t_set_pay_structure", a)
         e = self._emp(a.get("employee_id")) or {}
+        s = e.get("pay_structure") or e
         new_p = self._amt(a.get("basic") or a.get("daily_rate"))
-        old_p = self._amt(e.get("basic") or e.get("daily_rate"))
+        old_p = self._amt(s.get("basic") or s.get("daily_rate"))
         return {"title": _t("t_set_pay_structure", name=name), "total": to_rupees(new_p), "warnings": warns,
                 "effect": _t("e_plain", what=f"{name}'s {a.get('pay_basis') or 'monthly'} pay goes {_en(_rs(old_p))} → {_en(_rs(new_p))}.")}
 
@@ -1056,12 +1066,13 @@ class CardBuilder:
     def _c_approve_payroll_run(self, a: dict, pa) -> dict:
         period = str(a.get("period") or "")
         prev = self._get(lambda p: self.repo.preview_payroll(p, None), period) or {}
-        lines = [x for x in prev.get("lines") or [] if isinstance(x, dict)]
-        net_p = sum(self._amt(x.get("net_pay", x.get("net"))) for x in lines)
+        lines = [x for x in prev.get("employees") or prev.get("lines") or [] if isinstance(x, dict)]
+        net_p = sum(self._amt(x.get("net", x.get("net_pay"))) for x in lines)
         rows = [{"sku": str(x.get("employee_id") or ""), "name": str(x.get("name") or ""), "qty": 1, "unit": "", "unit_price": None,
-                 "line_total": to_rupees(self._amt(x.get("net_pay", x.get("net"))))} for x in lines]
+                 "line_total": to_rupees(self._amt(x.get("net", x.get("net_pay"))))} for x in lines]
         warns = [] if prev and str(prev.get("fingerprint") or "") == str(a.get("fingerprint") or "") else [_t("w_payroll_changed")]
-        warns += [_t("w_payroll_note", what=str(w)) for w in (prev.get("warnings") or [])[:3]]
+        warns += [_t("w_payroll_note", what=str(w)) for w in (prev.get("errors") or [])[:3]]
+        warns += [_t("w_payroll_note", what=str(w)) for w in (prev.get("warnings") or [])[:5]]
         return {"title": _t("t_approve_payroll_run", period=period), "lines": rows, "total": to_rupees(net_p), "warnings": warns,
                 "effect": _t("e_payroll_approve", count=len(lines), period=period, net=_rs(net_p))}
 
@@ -1071,7 +1082,8 @@ class CardBuilder:
 
     def _c_pay_salaries(self, a: dict, pa) -> dict:
         reg = self._get(lambda r: self.repo.payroll_register(r, None), str(a.get("run_id") or "")) or {}
-        net = {str(x.get("employee_id")): self._amt(x.get("net_pay", x.get("net"))) for x in reg.get("lines") or [] if isinstance(x, dict)}
+        net = {str(x.get("employee_id")): self._amt(x.get("balance_due", x.get("net", x.get("net_pay"))))
+               for x in reg.get("payslips") or reg.get("lines") or [] if isinstance(x, dict)}
         pays = [p for p in a.get("payments") or [] if isinstance(p, dict)]
         rows, warns, total_p = [], [], 0
         for p in pays:
@@ -1096,7 +1108,8 @@ class CardBuilder:
         before = self._open_advances_p(str(a.get("employee_id") or ""))
         return {"title": _t("t_give_staff_advance", name=name, amount=_rs(amt)), "total": to_rupees(amt), "warnings": warns + self._plc(a.get("method")),
                 "effect": _t("e_advance", amount=_rs(amt), method=_word(a.get("method") or "cash"), name=name, before=_rs(before), after=_rs(before + amt)),
-                "facts": [{"key": "method", "value": _word(a.get("method") or "cash")}]}
+                "facts": [{"key": "method", "value": _word(a.get("method") or "cash")}]
+                + ([{"key": "note", "value": f"recovered {_en(_rs(self._amt(a.get('installment'))))} a month from pay"}] if a.get("installment") else [])}
 
     def _c_repay_staff_advance(self, a: dict, pa) -> dict:
         name, warns = self._emp_card("t_repay_staff_advance", a)
@@ -1308,7 +1321,6 @@ class MunshiPlatform:
         self._answered: dict | None = None      # the open question this turn's message answered, if it did (llm/followup.py)
         self._said: str = ""                    # the text the engine now answering is reading (a card's wording, for memory)
         self._proofs: list[str] = []            # this turn's payment proofs (checked as the asker's own uploads): they ride on its card
-        self._proofs_off = False                # Stream E's attachments aren't live in this build (a proof can't be checked)
 
     def close(self) -> None:
         if self._ckpt_conn is not None:
@@ -1424,38 +1436,31 @@ class MunshiPlatform:
         with self._lock, self.repo.acting_as(user), GRD.viewing_as(role), acting_user_id(user_id):
             self.repo.add_chat(thread_id, role, text, {"user": user} | ({"attachments": ids} if ids else {}))
             if ids:
-                self._proofs_off = False
-                bad = self._foreign_proofs(ids, user_id)
-                if bad:                         # never someone else's upload (or another business's id) on a card: nothing runs
-                    lang = "ur" if is_urdu(text) else lang_of(text)
-                    try:
+                why = self._proof_refusal(ids, role, user_id, text)
+                if why:                         # never an unknown id, another business's, someone else's (for a role that can't
+                    try:                        # read theirs) or one already proving something: nothing runs
                         spec = classify(self.manager, text, role)
                     except Exception:
                         spec = None
-                    said = PROOF_OFF if self._proofs_off else PROOF_NOT_YOURS
-                    reply = Reply(said.get(lang, said["en"]), spec, None, thread_id)
-                    self.repo.add_chat(thread_id, "munshi", reply.text, {"specialist": spec, "proofs_refused": bad})
+                    reply = Reply(why, spec, None, thread_id)
+                    self.repo.add_chat(thread_id, "munshi", reply.text, {"specialist": spec, "proofs_refused": ids})
                     return reply
             return self._handle(thread_id, role, text, user, user_id, ids)
 
-    def _foreign_proofs(self, ids: list[str], user_id: str) -> list[str]:
-        """The attachment ids that may NOT ride on this person's card: unknown in this business (so another business's, or made
-        up), or uploaded by someone else. Checked against Stream E's record, never trusted from the client."""
-        bad = []
-        for aid in ids:
-            try:
-                a = self.repo.get_attachment(aid)
-            except NotImplementedError:
-                self._proofs_off = True             # Stream E not live in this build: nothing can be checked, so nothing rides
-                bad.append(aid)
-                continue
-            except Exception:
-                bad.append(aid)
-                continue
-            owner = str((a or {}).get("uploaded_by") or "")
-            if not user_id or not owner or owner != str(user_id):
-                bad.append(aid)
-        return bad
+    def _proof_refusal(self, ids: list[str], role: str, user_id: str, text: str) -> str | None:
+        """Why these proof ids can't ride on this person's card, in the message's language -- or None. Stream E's own check
+        (validate_proofs_for_card): each id must exist in THIS business, be the asker's own upload unless their role reads every
+        proof (attachments:read: owner, clerk), and still be free. Never trusted from the client."""
+        from munshi.auth.principal import PERMISSIONS
+        lang = "ur" if is_urdu(text) else lang_of(text)
+        try:
+            self.repo.validate_proofs_for_card(ids, user_id or "", read_all=role in PERMISSIONS["attachments:read"])
+            return None
+        except NotImplementedError:
+            said = PROOF_OFF                                    # Stream E not live in this build: nothing can be checked
+        except Exception as e:
+            said = {"already_linked": PROOF_USED, "too_many": PROOF_TOO_MANY}.get(getattr(e, "code", ""), PROOF_NOT_YOURS)
+        return said.get(lang, said["en"])
 
     def _waiting_proofs(self, thread_id: str, role: str, user_id: str) -> list[str]:
         """Proofs this person sent with a message that raised no card ('ye dekho' + a photo), still waiting for the words that
@@ -1474,7 +1479,10 @@ class MunshiPlatform:
         return []
 
     def _handle(self, thread_id: str, role: str, text: str, user: str, user_id: str, ids: list[str]) -> Reply:
-        self._proofs = ids or self._waiting_proofs(thread_id, role, user_id)
+        waiting = [] if ids else self._waiting_proofs(thread_id, role, user_id)
+        if waiting and self._proof_refusal(waiting, role, user_id, text):
+            waiting = []                    # used or gone since it was sent: it no longer rides on anything
+        self._proofs = ids or waiting
         try:
             reply = self._handle_turn(thread_id, role, text, user, ids)
         finally:
@@ -1778,6 +1786,15 @@ class MunshiPlatform:
             reply.text += " Once it is approved, the card to send it comes next."
         if pa is not None and pa.tool == "reverse_ledger_entry":
             self._chain_right_amount(reply, run, role, user)
+        if pa is not None and pa.tool == "add_employee" and float(pa.args.get("basic") or 0) > 0:
+            # the employee now; their pay terms are the next card (a second approval: one gated write, one audit row, each).
+            # The chained step points at this card; the pay is read from its stored args when the step runs (_chain_step), so
+            # no pay figure sits in the shared chat log.
+            step = f"{self._PAY_STEP}{pa.approval_id}"
+            reply.extra = dict(reply.extra or {}) | {"chain": {"after": pa.approval_id, "rest": [step], "total": 0, "done": 0, "specialist": "tankhwa",
+                                                                "role": role, "user": user, "on": "approve"}}
+            reply.text += (f" Once it is approved, the card to set the pay ({_en({'rs': float(pa.args['basic'])})} a month) comes next."
+                           if role == "owner" else " Once it is approved, the card to set the pay comes next.")
         if pa is not None and pa.tool == "draft_reminder":
             self._chain_other_customers(reply, run, role, user)
         return reply, meta, ok
@@ -2102,6 +2119,16 @@ class MunshiPlatform:
         reply.extra = extra
         return reply, meta, True
 
+    _PAY_STEP = "@pay-terms-of:"
+
+    def _pay_step(self, approval_id: str) -> str:
+        """'Sajid ki tankhwa 40000 mahana set karo' for the add_employee card `approval_id` (from the approvals table, not the chat log)."""
+        try:
+            a = self.repo.get_approval(approval_id)["args"]
+            return f"{a.get('name')} ki tankhwa {float(a.get('basic') or 0):g} mahana set karo"
+        except Exception:
+            return "tankhwa set karo"
+
     def _chain_step(self, thread_id: str, chain: dict, tr) -> tuple[Reply, dict, dict, list[str]]:
         """Raise the next card of a chain: (reply, meta, chat meta for the chain, notes on steps that raised no card)."""
         rest, k, n = list(chain["rest"]), int(chain["done"]), int(chain["total"])
@@ -2109,6 +2136,8 @@ class MunshiPlatform:
         reply, meta = Reply("", chain["specialist"], None, thread_id), {"specialist": chain["specialist"]}
         while rest:
             step = rest.pop(0)
+            if step.startswith(self._PAY_STEP):         # a new employee's pay terms, read from the approved card's own args
+                step = self._pay_step(step[len(self._PAY_STEP):])
             k += 1
             reply, meta, _ = self._turn(RULES, thread_id, chain["role"], step, chain["user"], tr, force=chain["specialist"])
             label = f"{k} of {n}: " if n else ""
@@ -2744,6 +2773,11 @@ class MunshiPlatform:
         pa = PendingApproval(aid, thread_id, specialist, tool, args,
                              risk_of(tool).value, self._needs_role(tool, req["args"]), role, user)
         self.repo.save_approval(asdict(pa))
+        for att in args.get(PROOFS_KEY) or []:          # Stream E: the proof sits on the card until the approved write links it to its entry
+            try:
+                self.repo.link_attachment(att, "approval", aid, f"{specialist}_munshi")
+            except Exception:
+                log.exception("couldn't put proof %s on card %s", att, aid)
         mem_notes: list[str] = []
         if not lead:                                    # (a follow-up card after an approval has no wording of its own)
             try:
@@ -2821,6 +2855,12 @@ class MunshiPlatform:
             # merge (web/routes/ops._pending_out), so the approvals list, the chat card and the history never carry a pay figure
             card = redacted_card(self.card(pa))
             view |= {"card": card, "args": {}, "summary": card["title"]}
+        elif role != "owner":
+            # Stream E's read rule for a card's proofs: a proof of pay is the owner's only, whoever uploaded it
+            card = self.card(pa)
+            keep = [p for p in card.get("proofs") or [] if not p.get("owner_only")]
+            if len(keep) != len(card.get("proofs") or []):
+                view |= {"card": card | {"proofs": keep}}
         return view
 
     def _viewer_decision(self, pa: PendingApproval, role: str, user: str = "") -> dict:
@@ -2904,7 +2944,8 @@ class MunshiPlatform:
             return self._ADVERSARIAL
         return None
 
-    _MONEY_NUMS = ("amount", "counted", "basic", "daily_rate", "cost", "principal", "interest", "proceeds", "installment", "statement_balance",
+    # (an advance's instalment is not here: under the Punjab Labour Code code works it out from the pay cap and shows it on the card)
+    _MONEY_NUMS = ("amount", "counted", "basic", "daily_rate", "cost", "principal", "interest", "proceeds", "statement_balance",
                    "opening_balance")
 
     def _said_numbers(self) -> set[float]:
@@ -2972,6 +3013,16 @@ class MunshiPlatform:
         if "cash" in methods and SM.cashless_only(self.repo):
             return ("under the Punjab Labour Code 2026 a salary or an advance is paid by bank, JazzCash, Easypaisa or cheque, never cash "
                     "(the owner can switch payroll to the old law in Settings)")
+        if tool == "approve_payroll_run":                # the month as previewed must be approvable (Stream A's own check, read now)
+            pv = g(lambda p: self.repo.preview_payroll(p, None), str(args.get("period") or ""))
+            if pv is None:
+                return f"there is no payroll to approve for {args.get('period') or 'that month'}"
+            if pv.get("errors"):
+                return str(pv["errors"][0])
+            if not pv.get("can_approve", True):
+                return "nobody is on this month's payroll yet"
+        if tool == "pay_salaries" and not [p for p in args.get("payments") or [] if isinstance(p, dict)]:
+            return "nothing is owed on the latest approved payroll"
         if tool == "update_order":
             o = g(self.repo.get_order, str(args.get("order_id") or ""))
             if o is None:
@@ -3107,7 +3158,9 @@ class MunshiPlatform:
                                                       lead="Approved. " if approve else "Rejected. ", engine=engine, config=run_cfg)
                     reply = None
                     try:
-                        with self.repo.acting_as(pa.requested_by, approved_by=signature):
+                        # the card's proofs are linked by the approved write itself, inside its transaction (tools/core._proved)
+                        with self.repo.acting_as(pa.requested_by, approved_by=signature), \
+                                approved_proofs(pa.approval_id, (pa.args or {}).get(PROOFS_KEY) if approve and pa.tool in PROOF_ENTITY else None):
                             result = bundle.agent.invoke(Command(resume={"decisions": [decision]}), config=run_cfg)
                         if engine == MODEL:              # a model's follow-up can fail too: covered by the same fallback
                             with self.repo.acting_as(pa.requested_by):
@@ -3137,7 +3190,7 @@ class MunshiPlatform:
                     ran = approve and self._ran(bundle, cfg, pa.tool)
                     self._settle_memory(pa, approve, ran and not warned, "warnings" if warned else "action failed", user or role)
                     if ran and (pa.args or {}).get(PROOFS_KEY):
-                        meta["proofs_linked"] = self._link_proofs(bundle, cfg, pa)
+                        meta["proofs_linked"] = list((pa.args or {}).get(PROOFS_KEY) or [])
                     if reply.pending:
                         meta["approval_id"] = reply.pending.approval_id
                         main = self._cfg(pa.thread_id, pa.requested_by_role, pa.specialist, engine)["configurable"]["thread_id"]
@@ -3172,38 +3225,6 @@ class MunshiPlatform:
             finally:
                 if token is not None:
                     guard.reset_history(token)
-
-    def _link_proofs(self, bundle, cfg: dict, pa: PendingApproval) -> list[dict]:
-        """After an approved card's action ran: its proofs linked to the entry (or entries) that action created. Stream E's
-        link_attachment writes the secondary 'attachment_linked' audit row -- never an approval-consuming action. A proof that
-        can't be linked (Stream E not live, the entry id not in the result) is logged, never a crash: the money write stands."""
-        entity, keys = PROOF_ENTITY.get(pa.tool, ("", ()))
-        try:
-            msgs = GRD.restore(bundle.agent.get_state(cfg).values.get("messages", []))
-            tm = next(m for m in reversed(msgs) if isinstance(m, ToolMessage) and m.name == pa.tool)
-            result = json.loads(str(tm.content))
-        except Exception:
-            log.warning("no result to link the proofs of %s to", pa.approval_id)
-            return []
-        found: list[str] = []
-        stack = [result]
-        while stack:                                   # the id(s) the result names -- one entry, or each payment of a batch
-            x = stack.pop()
-            if isinstance(x, dict):
-                found += [str(x[k]) for k in keys if x.get(k)]
-                stack += [v for v in x.values() if isinstance(v, (dict, list))]
-            elif isinstance(x, list):
-                stack += x
-        out = []
-        actor = f"{pa.specialist}_munshi"             # the munshi whose approved action the proof backs (hisaab_munshi, tankhwa_munshi, ...)
-        for att in (pa.args or {}).get(PROOFS_KEY) or []:
-            for eid in dict.fromkeys(found):
-                try:
-                    self.repo.link_attachment(str(att), entity, eid, actor)
-                    out.append({"att_id": str(att), "entity": entity, "entity_id": eid})
-                except Exception:
-                    log.exception("couldn't link proof %s to %s %s", att, entity, eid)
-        return out
 
     def _resume_failed(self, pa: PendingApproval, approve: bool, bundle, cfg: dict, engine: str, e: Exception) -> Reply | None:
         """A model-engine resume that failed AFTER the decision was applied -- typically the provider timing out on

@@ -341,7 +341,7 @@ def build_tools(ops: MunshiTools) -> dict[str, BaseTool]:
 
     @tool
     def record_attendance(period: str, rows: list[dict]) -> dict:
-        """Record attendance for a month: rows [{"employee_id", "days_worked"? , "leave_days"?, "absent_days"?, "ot_minutes"?}].
+        """Record attendance for a month: rows [{"employee_id", "days_worked"?, "casual_leave"?, "annual_leave"?, "sick_leave"?, "unpaid_absent"?, "ot_minutes"?}].
         Days and minutes only -- never a rupee figure."""
         return ops.record_attendance(period, rows)
 
@@ -376,9 +376,10 @@ def build_tools(ops: MunshiTools) -> dict[str, BaseTool]:
         return ops.end_employment(employee_id, reason, left_on)
 
     @tool
-    def add_payroll_adjustment(employee_id: str, code: str, amount: float, note: str = "", period: str = "") -> dict:
-        """Add to or take from this month's pay: code bonus, fine, loss_recovery or other; amount as the user wrote it."""
-        return ops.add_payroll_adjustment(employee_id, code, amount, note, period)
+    def add_payroll_adjustment(employee_id: str, code: str, amount: float, note: str = "", period: str = "", ref: str = "") -> dict:
+        """Add to or take from this month's pay: code bonus, fine, loss_recovery, other_earning or other_deduction; amount as the user
+        wrote it. A loss_recovery names the cash-shortage entry it recovers (ref, EXP-...)."""
+        return ops.add_payroll_adjustment(employee_id, code, amount, note, period, ref)
 
     @tool
     def void_payroll_adjustment(adj_id: str) -> dict:

@@ -23,6 +23,34 @@ PAY_FIELDS = frozenset({"basic", "daily_rate", "pay_basis", "components", "gross
                         "commission", "advance", "advances", "ytd_taxable", "ytd_tax", "cnic"})
 
 
+# The proofs of the card whose approved action is running now (set by platform.resolve around the resumed call): the money
+# write links them to the entry it creates INSIDE its own transaction (Stream E's contract), so the entry and its proof
+# commit -- or roll back -- together. (approval id, attachment ids); None outside an approved resume.
+_APPROVED_PROOFS: ContextVar[tuple[str, tuple[str, ...]] | None] = ContextVar("munshi_approved_proofs", default=None)
+
+
+@contextmanager
+def approved_proofs(approval_id: str, att_ids):
+    token = _APPROVED_PROOFS.set((str(approval_id), tuple(str(a) for a in att_ids or ())) if att_ids else None)
+    try:
+        yield
+    finally:
+        _APPROVED_PROOFS.reset(token)
+
+
+def _ids_in(out, keys: tuple[str, ...]) -> list[str]:
+    """The ids (under these keys) a write's result names -- one entry, or each payment of a batch."""
+    found, stack = [], [asdict(out) if hasattr(out, "__dataclass_fields__") else out]
+    while stack:
+        x = stack.pop(0)
+        if isinstance(x, dict):
+            found += [str(x[k]) for k in keys if x.get(k)]
+            stack += [v for v in x.values() if isinstance(v, (dict, list))]
+        elif isinstance(x, list):
+            stack += x
+    return list(dict.fromkeys(found))
+
+
 @contextmanager
 def acting_user_id(user_id: str):
     token = _USER_ID.set(str(user_id or ""))
@@ -80,6 +108,21 @@ REMINDER_TEMPLATES = {
 class MunshiTools:
     def __init__(self, repo: MunshiRepository) -> None:
         self.repo = repo
+
+    def _proved(self, entity: str, actor: str, write, *keys: str):
+        """Run a money write; when it is an approved card's and the card carries proofs, link each proof to the entry the write
+        created, in the SAME transaction (a proof that can't be linked -- Stream E's AttachmentError, a ValueError -- rolls the
+        write back and is reported like any refusal)."""
+        p = _APPROVED_PROOFS.get()
+        if not p:
+            return write()
+        approval_id, att_ids = p
+        with self.repo._tx():
+            out = write()
+            for eid in _ids_in(out, keys):
+                for att in att_ids:
+                    self.repo.link_attachment(att, entity, eid, actor, approval_id=approval_id)
+            return out
 
     # ---------- lookups ----------
     # A lookup never picks one of several matches: 'Malik' with Malik Agro and Malik Seeds on the books comes back
@@ -293,13 +336,15 @@ class MunshiTools:
         return r
 
     def record_payment(self, customer_id: str, amount: float, method: str = "cash", ref: str = "", approved_by: str = "clerk") -> dict:
-        e = self.repo.record_payment(customer_id, amount, method or "cash", ref, "hisaab_munshi", approved_by)
+        e = self._proved("ledger", "hisaab_munshi", lambda: self.repo.record_payment(customer_id, amount, method or "cash", ref, "hisaab_munshi", approved_by),
+                         "entry_id")
         c = self.repo.get_customer(customer_id)
         self.repo.queue_message("whatsapp", c.phone, f"{self.repo.business_name}: Rs {abs(e.amount):,.0f} received ({e.method}). Receipt {e.entry_id}. Balance now Rs {self.repo.outstanding(customer_id):,.0f}. Shukriya.", e.entry_id)
         return asdict(e) | {"customer_name": c.name, "outstanding": self.repo.outstanding(customer_id)}
 
     def record_expense(self, category: str, amount: float, note: str = "", method: str = "cash", approved_by: str = "clerk") -> dict:
-        return asdict(self.repo.record_expense(category, amount, note, method, "", "hisaab_munshi", approved_by))
+        return asdict(self._proved("expense", "hisaab_munshi", lambda: self.repo.record_expense(category, amount, note, method, "", "hisaab_munshi", approved_by),
+                                   "expense_id"))
 
     def credit_note(self, customer_id: str, amount: float, reason: str, approved_by: str = "owner") -> dict:
         e = self.repo.add_ledger(customer_id, "credit_note", -abs(float(amount)), reason, None, "hisaab_munshi", approved_by, "adjustment")
@@ -316,7 +361,7 @@ class MunshiTools:
         return asdict(self.repo.reverse_expense(expense_id, reason, "hisaab_munshi", approved_by))
 
     def cashbook(self, day: str = "") -> dict:
-        return self.repo.cashbook(day or None)
+        return self.repo.cashbook(day or None, redact_payroll=not _owner_view())
 
     # ---------- khareed (purchases) ----------
     def find_supplier(self, text: str) -> dict:
@@ -341,11 +386,13 @@ class MunshiTools:
         return self.repo.payables()
 
     def record_purchase(self, supplier_id: str, items: list[dict], warehouse_id: str = "", invoice_ref: str = "", paid_amount: float = 0, approved_by: str = "clerk") -> dict:
-        p = self.repo.record_purchase(supplier_id, warehouse_id or self.repo.default_warehouse_id(), items, invoice_ref, paid_amount, "khareed_munshi", approved_by)
+        p = self._proved("purchase", "khareed_munshi", lambda: self.repo.record_purchase(supplier_id, warehouse_id or self.repo.default_warehouse_id(), items, invoice_ref,
+                                                                                          paid_amount, "khareed_munshi", approved_by), "purchase_id")
         return asdict(p) | {"supplier_name": self.repo.get_supplier(supplier_id).name, "balance": self.repo.supplier_balance(supplier_id)}
 
     def pay_supplier(self, supplier_id: str, amount: float, method: str = "cash", ref: str = "", approved_by: str = "owner") -> dict:
-        e = self.repo.pay_supplier(supplier_id, amount, method or "cash", ref, "khareed_munshi", approved_by)
+        e = self._proved("supplier_ledger", "khareed_munshi", lambda: self.repo.pay_supplier(supplier_id, amount, method or "cash", ref, "khareed_munshi", approved_by),
+                         "entry_id")
         return asdict(e) | {"supplier_name": self.repo.get_supplier(supplier_id).name, "balance": self.repo.supplier_balance(supplier_id)}
 
     def reverse_purchase(self, purchase_id: str, reason: str, approved_by: str = "owner") -> dict:
@@ -398,7 +445,7 @@ class MunshiTools:
 
     def profit_summary(self, start: str = "", end: str = "") -> dict:
         start, end = self._range(start, end)
-        return self.repo.profit_summary(start, end)
+        return self.repo.profit_summary(start, end, redact_payroll=not _owner_view())
 
     def collection_report(self, start: str = "", end: str = "") -> dict:
         """The period's collection figures plus the payments themselves (who paid, how much, how), newest last."""
@@ -435,11 +482,24 @@ class MunshiTools:
     def payroll_preview(self, period: str = "", employee_ids: list[str] | None = None) -> dict:
         return self.repo.preview_payroll(period or this_period(), list(employee_ids or []) or None)
 
+    def latest_run_id(self) -> str:
+        """The latest approved (not reversed) regular payroll run, or ''. A read."""
+        r = self.repo._one("SELECT run_id FROM payroll_runs r WHERE kind='regular' AND NOT EXISTS (SELECT 1 FROM payroll_runs x WHERE x.reversal_of=r.run_id) "
+                           "ORDER BY period DESC, generation DESC LIMIT 1")
+        return r["run_id"] if r else ""
+
     def payroll_register(self, period: str = "", run_id: str = "") -> dict:
+        if not (run_id or period):
+            run_id = self.latest_run_id()
+            if not run_id:
+                raise StateError("no payroll has been approved yet -- say 'is mahine ki tankhwa bana do' to preview this month's")
         return self.repo.payroll_register(run_id or None, period or None)
 
     def payslip(self, employee_id: str, period: str = "") -> dict:
-        return self.repo.payslip(None, employee_id, period or None)
+        if not period:                                  # the latest approved month's slip
+            rid = self.latest_run_id()
+            period = self.repo.payroll_register(rid)["run"]["period"] if rid else this_period()
+        return self.repo.payslip(None, employee_id, period)
 
     def my_payslips(self) -> dict:
         """The signed-in person's OWN slips: the employee is found from the session's user id (never from the message)."""
@@ -452,15 +512,21 @@ class MunshiTools:
         return self.repo.staff_advances_report(employee_id or None, status or "open")
 
     def statutory_summary(self, kind: str = "eobi", period: str = "") -> dict:
-        return self.repo.statutory_summary(period or this_period(), kind or "eobi")
+        if not period:
+            rid = self.latest_run_id()
+            period = self.repo.payroll_register(rid)["run"]["period"] if rid else this_period()
+        return self.repo.statutory_summary(period, kind or "eobi")
 
     def record_attendance(self, period: str, rows: list[dict], approved_by: str = "clerk") -> dict:
         return self.repo.set_attendance(period or this_period(), rows, TANKHWA, approved_by)
 
     def add_employee(self, name: str, designation: str = "", phone: str = "", basic: float = 0.0, pay_basis: str = "monthly",
                      approved_by: str = "owner") -> dict:
-        data = {"name": name, "designation": designation, "phone": phone, "basic": float(basic or 0), "pay_basis": pay_basis or "monthly"}
-        return self.repo.add_employee(data, TANKHWA, approved_by)
+        # `basic` is the pay asked for: it is SET by the set_pay_structure card the platform chains after this one (its own
+        # approval and its own audit row -- one gated write per approval); the employee record carries no pay field
+        from munshi.domain.repository.payroll import ROLE_HINTS
+        data = {"name": name, "designation": designation, "phone": phone} | ({"role_hint": designation} if designation in ROLE_HINTS else {})
+        return self.repo.add_employee({k: v for k, v in data.items() if v}, TANKHWA, approved_by)
 
     def update_employee(self, employee_id: str, changes: dict, approved_by: str = "owner") -> dict:
         return self.repo.update_employee(employee_id, dict(changes or {}), TANKHWA, approved_by)
@@ -481,8 +547,11 @@ class MunshiTools:
     def end_employment(self, employee_id: str, reason: str = "", left_on: str = "", approved_by: str = "owner") -> dict:
         return self.repo.end_employment(employee_id, left_on or today_iso(), reason or "left", TANKHWA, approved_by)
 
-    def add_payroll_adjustment(self, employee_id: str, code: str, amount: float, note: str = "", period: str = "", approved_by: str = "owner") -> dict:
-        return self.repo.add_payroll_adjustment(employee_id, period or this_period(), code, abs(float(amount)), note or code, actor=TANKHWA, approved_by=approved_by)
+    def add_payroll_adjustment(self, employee_id: str, code: str, amount: float, note: str = "", period: str = "", ref: str = "",
+                               approved_by: str = "owner") -> dict:
+        code = {"other": "other_deduction", "deduction": "other_deduction", "loss": "loss_recovery"}.get(code, code)
+        return self.repo.add_payroll_adjustment(employee_id, period or this_period(), code, abs(float(amount)), (note or code)[:200], ref or None,
+                                                actor=TANKHWA, approved_by=approved_by)
 
     def void_payroll_adjustment(self, adj_id: str, approved_by: str = "owner") -> dict:
         return self.repo.void_payroll_adjustment(adj_id, TANKHWA, approved_by)
@@ -495,25 +564,29 @@ class MunshiTools:
         return self.repo.reverse_payroll_run(run_id, reason, TANKHWA, approved_by)
 
     def pay_salaries(self, run_id: str, payments: list[dict], approved_by: str = "owner") -> dict:
-        return self.repo.pay_salaries(run_id, [dict(p) for p in payments or []], TANKHWA, approved_by)
+        return self._proved("salary_payment", TANKHWA, lambda: self.repo.pay_salaries(run_id, [dict(p) for p in payments or []], TANKHWA, approved_by),
+                            "payment_id")
 
     def reverse_salary_payment(self, payment_id: str, reason: str, approved_by: str = "owner") -> dict:
         return self.repo.reverse_salary_payment(payment_id, reason, TANKHWA, approved_by)
 
     def give_staff_advance(self, employee_id: str, amount: float, method: str, installment: float = 0.0, note: str = "", account_id: str = "",
                            approved_by: str = "owner") -> dict:
-        return self.repo.give_staff_advance(employee_id, float(amount), method, account_id or None, "advance", float(installment or 0), None, note,
-                                            actor=TANKHWA, approved_by=approved_by)
+        return self._proved("staff_advance", TANKHWA, lambda: self.repo.give_staff_advance(
+            employee_id, float(amount), method, account_id or None, "advance", float(installment or 0), None, note, actor=TANKHWA, approved_by=approved_by),
+            "advance_id")
 
     def repay_staff_advance(self, employee_id: str, amount: float, method: str, account_id: str = "", approved_by: str = "owner") -> dict:
-        return self.repo.repay_staff_advance(employee_id, float(amount), method, account_id or None, actor=TANKHWA, approved_by=approved_by)
+        return self._proved("staff_advance", TANKHWA, lambda: self.repo.repay_staff_advance(employee_id, float(amount), method, account_id or None,
+                                                                                            actor=TANKHWA, approved_by=approved_by), "advance_id")
 
     def reverse_staff_advance(self, advance_id: str, reason: str, approved_by: str = "owner") -> dict:
         return self.repo.reverse_staff_advance(advance_id, reason, TANKHWA, approved_by)
 
     def record_statutory_payment(self, kind: str, period: str, amount: float, method: str, challan_ref: str, paid_on: str = "", account_id: str = "",
                                  approved_by: str = "owner") -> dict:
-        return self.repo.record_statutory_payment(kind, period, float(amount), method, account_id or None, challan_ref, paid_on or today_iso(), TANKHWA, approved_by)
+        return self._proved("statutory_payment", TANKHWA, lambda: self.repo.record_statutory_payment(
+            kind, period, float(amount), method, account_id or None, challan_ref, paid_on or today_iso(), TANKHWA, approved_by), "payment_id", "statutory_id")
 
     def add_statutory_rate(self, key: str, value: str, effective_from: str, source: str, verified_on: str, source_url: str = "", grade: str = "C",
                            note: str = "", jurisdiction: str = "pk", approved_by: str = "owner") -> dict:
@@ -532,7 +605,7 @@ class MunshiTools:
         return self.repo.account_book(account_id, start, end, redact_payroll=not _owner_view())
 
     def reconciliation_status(self, account_id: str, statement_date: str = "") -> dict:
-        return self.repo.reconciliation(account_id, statement_date or today_iso())
+        return self.repo.reconciliation(account_id, statement_date or today_iso(), redact_payroll=not _owner_view())
 
     def trial_balance(self, as_of: str = "") -> dict:
         return self.repo.trial_balance(as_of or None)
@@ -568,7 +641,8 @@ class MunshiTools:
         return self.repo.attachments_for(entity, entity_id)
 
     def transfer_between_accounts(self, from_account: str, to_account: str, amount: float, ref: str = "", note: str = "", approved_by: str = "clerk") -> dict:
-        return self.repo.transfer(from_account, to_account, float(amount), None, ref, note, actor=ACCOUNTS, approved_by=approved_by)
+        return self._proved("account_transfer", ACCOUNTS, lambda: self.repo.transfer(from_account, to_account, float(amount), None, ref, note, actor=ACCOUNTS,
+                                                                                     approved_by=approved_by), "transfer_id")
 
     def count_cash(self, account_id: str, counted: float, note: str = "") -> dict:
         return self.repo.count_cash(account_id or "CASH", float(counted), note, ACCOUNTS)
@@ -577,7 +651,7 @@ class MunshiTools:
         return self.repo.mark_cleared(account_id, [dict(i) for i in items or []], cleared_on or today_iso(), bool(cleared), ACCOUNTS)
 
     def save_reconciliation(self, account_id: str, statement_date: str, statement_balance: float) -> dict:
-        return self.repo.save_reconciliation(account_id, statement_date, float(statement_balance), ACCOUNTS)
+        return self.repo.save_reconciliation(account_id, statement_date, float(statement_balance), ACCOUNTS, redact_payroll=not _owner_view())
 
     def add_money_account(self, kind: str, name: str, provider: str = "", number_last4: str = "", opening_balance: float = 0.0,
                           approved_by: str = "owner") -> dict:

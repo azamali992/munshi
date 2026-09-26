@@ -333,7 +333,7 @@ def build_tankhwa_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCh
         return memo(("mamt", t), lambda: amount_in(_PHONE.sub(" ", t)).amount)
 
     def attendance(t: str) -> list[dict] | None:
-        """[{employee_id, days_worked | leave_days | absent_days}] -- every segment with a number names one employee; else None."""
+        """[{employee_id, days_worked | casual_leave | unpaid_absent}] -- every segment with a number names one employee; else None."""
         def calc():
             if not _ATTEND(t):
                 return None
@@ -345,7 +345,7 @@ def build_tankhwa_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCh
                 r = employee_res(seg, repo)
                 if not r.ok or len(nums) != 1 or nums[0] > 31:
                     return None
-                key = "leave_days" if _LEAVE(seg) or (_LEAVE(t) and not rows and len(_segments(t)) == 1) else "absent_days" if _ABSENT(seg) else "days_worked"
+                key = "casual_leave" if _LEAVE(seg) or (_LEAVE(t) and not rows and len(_segments(t)) == 1) else "unpaid_absent" if _ABSENT(seg) else "days_worked"
                 rows.append({"employee_id": r.id, key: int(nums[0])})
             return rows or None
         return memo(("att", t), calc)
@@ -355,21 +355,39 @@ def build_tankhwa_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCh
 
     def advance_ok(t: str) -> bool:
         m = method_said(t)
-        return bool(emp(t)) and amount(t) is not None and bool(m) and not (m == "cash" and cashless_only(repo))
+        return bool(emp(t)) and amount(t) is not None and bool(m) and not (m == "cash" and cashless_only(repo)) and instalment(t) is not None
+
+    def monthly_pay(eid: str) -> float:
+        e = _safe(lambda: repo.get_employee(eid, include_pay=True), {}) or {}
+        s = e.get("pay_structure") or {}
+        return float(s.get("basic") or 0) or float(s.get("daily_rate") or 0) * 26 or float(e.get("basic") or 0)
+
+    def instalment(t: str) -> float | None:
+        """The monthly recovery of an advance: what the message says ('qist 1000'), else -- under the Punjab Labour Code, which
+        caps it at 20% of pay -- that cap (worked out in code from the pay terms, shown on the card for the owner to check),
+        else the whole advance next month. None: the pay terms aren't set, so it can't be worked out (the owner sets them first)."""
+        m = re.search(r"\b(qist|kist|installment|instalment|mahana|har mahine)\s*(?:rs\.?\s*)?([\d,]+)", fold(t))
+        if m:
+            return float(m.group(2).replace(",", ""))
+        a = amount(t) or 0
+        cap_bp = ACC.PROFILE_LIMITS.get(_safe(repo.payroll_profile, ACC.DEFAULT_PAYROLL_PROFILE), {}).get("advance_instalment_cap_bp")
+        if not cap_bp:
+            return a
+        pay = monthly_pay(emp(t))
+        if not pay:
+            return None
+        return float(min(a, (pay * cap_bp / 10000) // 100 * 100))
 
     def pay_args(t: str) -> dict:
-        reg = _safe(lambda: repo.payroll_register(None, None), {}) or {}
-        rid = str(reg.get("run_id") or "")
+        rid = _safe(ops.latest_run_id, "") or ""
+        reg = _safe(lambda: repo.payroll_register(rid), {}) if rid else {}
         named = emp(t)
         said = method_said(t)
+        method_of = lambda e: said or str((_safe(lambda: repo.get_employee(e, include_pay=True), {}) or {}).get("pay_method") or "")  # noqa: E731
         if named:
-            return {"run_id": rid, "payments": [{"employee_id": named, "method": said}]}
-        lines = [x for x in reg.get("lines") or [] if isinstance(x, dict) and x.get("employee_id")]
-        payments = []
-        for x in lines:
-            m = said or str(x.get("method") or x.get("pay_method") or "")
-            payments.append({"employee_id": str(x["employee_id"]), "method": m})
-        return {"run_id": rid, "payments": payments}
+            return {"run_id": rid, "payments": [{"employee_id": named, "method": method_of(named)}]}
+        due = [x for x in (reg or {}).get("payslips") or [] if isinstance(x, dict) and x.get("employee_id") and float(x.get("balance_due") or 0) > 0]
+        return {"run_id": rid, "payments": [{"employee_id": str(x["employee_id"]), "method": method_of(str(x["employee_id"]))} for x in due]}
 
     def pay_ok(t: str) -> bool:
         if not (_PAYWORD(t) and _PAY(t)) or _MAKE(t) or _BONUS(t) or _CUT(t) or _ADVANCE(t):
@@ -403,20 +421,39 @@ def build_tankhwa_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCh
         return {"name": " ".join(names[:2]).title() if len(names) > 1 and names[1][0].isupper() else names[0].title(), "designation": des,
                 "phone": phone.group(0) if phone else "", "basic": basic}
 
+    def open_shortage() -> str:
+        """The cash shortage a loss recovery recovers: the ONE open cash-shortage entry of the last two months ('' when there
+        is none, or several -- then the munshi asks which)."""
+        def calc():
+            from munshi.domain.models import business_today
+            end = business_today()
+            rows = _safe(lambda: repo.expenses_between((end - timedelta(days=62)).isoformat(), end.isoformat()), []) or []
+            gone = {x.reversal_of for x in rows if getattr(x, "reversal_of", None)}
+            open_ = [x for x in rows if x.category == "cash_shortage" and float(x.amount) > 0 and not x.reversal_of and x.expense_id not in gone
+                     and not str(x.note or "").startswith(ACC.RECOVERY_NOTE_PREFIX)]
+            return open_[0].expense_id if len(open_) == 1 else ""
+        return memo(("shortage",), calc)
+
     def adj(t: str) -> dict | None:
         e, a = emp(t), amount(t)
         if e and a is None and _BONUS(t) and fraction_of(t) is not None:       # 'aadhi tankhwa bonus': a share of the pay, read from the books
-            basic = _safe(lambda: float((repo.get_employee(e, include_pay=True) or {}).get("basic") or 0), 0.0)
-            a = round(basic * fraction_of(t)) or None
+            a = round(monthly_pay(e) * fraction_of(t)) or None
         if not e or a is None:
             return None
+        ref = ""
         if _BONUS(t):
             code = "bonus"
         elif _CUT(t):
-            code = "loss_recovery" if _LOSS(t) and not _FINE(t) else "fine" if _FINE(t) else "other"
+            code = "loss_recovery" if _LOSS(t) and not _FINE(t) else "fine" if _FINE(t) else "other_deduction"
+            if code == "loss_recovery":
+                ref = open_shortage()
+                if not ref:
+                    return None                     # which shortage? (the fallback asks)
         else:
             return None
-        return {"employee_id": e, "code": code, "amount": a, "note": t[:80], "period": period_of(t)}
+        return {"employee_id": e, "code": code, "amount": a, "note": t[:80], "period": period_of(t)} | ({"ref": ref} if ref else {})
+
+    set_pay = contains("set karo", "set kar do", "set", "rakho", "rakh do", "fix karo", "fix kar do", "tay karo", "mahana", "monthly", "per month")
 
     def statutory_kind(t: str) -> str:
         for k in ("eobi", "ss", "income_tax"):
@@ -434,13 +471,17 @@ def build_tankhwa_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCh
         Rule(lambda t: attendance(t) is not None and not _PAYWORD(t) and not _ADVANCE(t), "record_attendance",
              lambda t: {"period": period_of(t), "rows": attendance(t)}),
         Rule(lambda t: _ADVANCE(t) and advance_ok(t), "give_staff_advance",
-             lambda t: {"employee_id": emp(t), "amount": amount(t), "method": method_said(t)}),
+             lambda t: {"employee_id": emp(t), "amount": amount(t), "method": method_said(t), "installment": instalment(t)}),
+        # 'Sajid ki tankhwa 40000 mahana set karo' (and the card chained after a new employee): the pay terms
+        Rule(lambda t: _PAYWORD(t) and set_pay(t) and bool(emp(t)) and amount(t) is not None and not (_ADVANCE(t) or _BONUS(t) or _CUT(t)),
+             "set_pay_structure", lambda t: {"employee_id": emp(t), "pay_basis": "monthly", "basic": amount(t)}),
         Rule(lambda t: _ADVANCE(t) and not _GIVE(t) and (_ASKQ(t) or amount(t) is None), "staff_advances_report",
              lambda t: {"employee_id": emp(t)} if emp(t) else {}),
         Rule(lambda t: adj(t) is not None, "add_payroll_adjustment", lambda t: adj(t)),
         Rule(pay_ok, "pay_salaries", pay_args),
         Rule(lambda t: _PAYWORD(t) and _MAKE(t) and not emp(t) and not _SHEET(t), "approve_payroll_run", approve_args),
-        Rule(lambda t: bool(statutory_kind(t)), "statutory_summary", lambda t: {"kind": statutory_kind(t), "period": period_of(t)}),
+        Rule(lambda t: bool(statutory_kind(t)), "statutory_summary",
+             lambda t: {"kind": statutory_kind(t)} | ({"period": period_of(t)} if month_named(t) or _LAST_MONTH.search(fold(t)) else {})),
         Rule(lambda t: _PAYWORD(t) and _SHEET(t) and not emp(t), "payroll_register", lambda t: {"period": period_of(t)} if month_named(t) else {}),
         Rule(payslip_ok, "payslip", lambda t: {"employee_id": emp(t)} | ({"period": period_of(t)} if month_named(t) else {})),
         Rule(lambda t: _COMMISSION(t) and bool(emp(t)), "payroll_preview", lambda t: {"period": period_of(t), "employee_ids": [emp(t)]}),
@@ -478,6 +519,11 @@ def build_tankhwa_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCh
             if not reg:
                 return "There is no approved payroll to pay yet -- say 'is mahine ki tankhwa bana do' first. Nothing was done."
             return "Whose salary, and how -- e.g. 'sab ko tankhwa de do' or 'Bilal ko bank se salary do'? Nothing was done."
+        if _CUT(t) and _LOSS(t) and r.ok and amount(t) is not None:
+            return ("Which cash shortage is this recovering? I can't tell one open shortage from the books -- the recovery has to name "
+                    "it. Nothing was done.")
+        if _ADVANCE(t) and r.ok and amount(t) is not None and instalment(t) is None:
+            return f"{_name(repo, emp(t))}'s pay terms aren't set, so the monthly recovery can't be worked out -- set the pay first. Nothing was done."
         if (_CUT(t) or _BONUS(t)) and not r.ok:
             return "Whose pay, and how much? e.g. 'Rafiq ki 1000 kaat lo, cash short tha'. Nothing was done."
         if _LEFT(t) and not r.ok:

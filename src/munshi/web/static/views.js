@@ -346,7 +346,7 @@
       const said = status || (m.meta?.resolved ? (m.meta.approved ? t('approved') : t('reject')) : '');
       return `<div class="msg bot${tables.length ? ' has-table' : ''}"><span class="who">${esc(who)}${said ? ' · ' + esc(said) : ''}</span>${tables.length ? withTables(text, tables) : esc(text)}${extra}</div>`;
     }
-    return `<div class="msg me">${esc(m.text)}${m.meta?.user && m.meta.user !== state.me?.name ? `<span class="who">${esc(m.meta.user)}</span>` : ''}</div>`;
+    return `<div class="msg me">${esc(m.text)}${sentProofs(m.meta?.attachments)}${m.meta?.user && m.meta.user !== state.me?.name ? `<span class="who">${esc(m.meta.user)}</span>` : ''}</div>`;
   }
   function summarize(o) {
     if (o && o.error) return '⚠ ' + o.error;
@@ -448,9 +448,14 @@
     const a = e.target.closest && e.target.closest('[data-proof]'); if (!a) return;
     e.preventDefault(); proofURL(a.dataset.proof).then(u => window.open(u, '_blank', 'noopener')).catch(() => {});
   });
-  const proofsHTML = c => (c.proofs || []).length ? `<div class="ap-proofs">${c.proofs.map(pr => pr.kind === 'image'
-    ? `<a class="ap-proof" href="#" data-proof="${esc(pr.thumb)}"><img alt="${esc(pr.filename || 'proof')}" data-proof-src="${esc(pr.thumb)}" style="max-height:72px;max-width:96px;border-radius:6px"></a>`
-    : `<a class="ap-proof pdf" href="#" data-proof="${esc(pr.thumb)}">📄 <bdi>${esc(pr.filename || 'PDF')}</bdi></a>`).join(' ')}</div>` : '';
+  const proofLink = pr => pr.kind === 'image'
+    ? `<a class="ap-proof" href="#" data-proof="${esc(pr.file)}"><img alt="${esc(pr.filename || 'proof')}" data-proof-src="${esc(pr.thumb || pr.file)}" style="max-height:72px;max-width:96px;border-radius:6px"></a>`
+    : `<a class="ap-proof pdf" href="#" data-proof="${esc(pr.file)}">📄 <bdi>${esc(pr.filename || 'PDF')}</bdi></a>`;
+  const proofsHTML = c => (c.proofs || []).length ? `<div class="ap-proofs">${c.proofs.map(proofLink).join(' ')}</div>` : '';
+  // a sent message's proofs in chat history (the ids the chat POST carried; each fetch is checked by the server's read rule,
+  // and a proof this viewer may not see simply drops out)
+  const sentProofs = ids => (ids || []).length ? `<span class="ap-proofs">${ids.map(id => proofLink({ kind: 'image', file: '/api/attachments/' + encodeURIComponent(id) + '/file',
+    thumb: '/api/attachments/' + encodeURIComponent(id) + '/thumb', filename: 'proof' })).join(' ')}</span>` : '';
   function renderApproval(p) {
     APPROVALS.set(p.approval_id, p);
     const c = p.card || { title: p.summary, lines: [], warnings: [], facts: [] };

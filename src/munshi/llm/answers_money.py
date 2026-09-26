@@ -99,30 +99,45 @@ def _preview(d, c: _Ctx) -> str:
 
 
 def _register(d, c: _Ctx, booked: bool = True) -> str:
+    """A preview ({period, employees, totals, warnings, errors}) or an approved register ({run: {...}, payslips})."""
     d = d or {}
-    lines = [x for x in d.get("lines") or _rows(d) if isinstance(x, dict) and not x.get("_em")]
-    net = _pick(d, "total_net") or sum(_num(x.get("net_pay", x.get("net"))) or 0 for x in lines)
-    period = d.get("period") or ""
+    run = d.get("run") if isinstance(d.get("run"), dict) else {}
+    people = [x for x in d.get("employees") or d.get("payslips") or d.get("lines") or [] if isinstance(x, dict)]
+    net = _pick(run, "net") if run else None
+    if net is None:
+        net = _pick(d.get("totals") or {}, "net")
+    if net is None:
+        net = _pick(d, "total_net") or sum(_num(x.get("net", x.get("net_pay"))) or 0 for x in people)
+    period = run.get("period") or d.get("period") or ""
     ids = [x for x in (c.args.get("employee_ids") or []) if x]
-    if ids and len(lines) == 1:
-        x = lines[0]
-        extra = f", commission {rs(x.get('commission'))}" if _num(x.get("commission")) else ""
+    if ids and len(people) == 1:
+        x = people[0]
+        comm = x.get("commission")
+        if comm is None:
+            comm = sum(_num(ln.get("amount")) or 0 for ln in x.get("lines") or [] if isinstance(ln, dict) and ln.get("code") == "COMM")
+        extra = f", commission {rs(comm)}" if _num(comm) else ""
         return c.t("{who} for {p}: gross {g}{extra}, net pay {n} (not booked yet).", "{who} {p}: gross {g}{extra}, net {n} (abhi book nahi hui).",
-                   who=x.get("name") or "", p=period, g=rs(x.get("gross")), extra=extra, n=rs(x.get("net_pay", x.get("net"))))
-    head =(c.t("Salary register {p}: {k} staff, net pay {n} in all.", "Tankhwa register {p}: {k} staff, kul net {n}.", "تنخواہ رجسٹر {p}: {k} ملازم، کل {n}۔",
-                p=period, k=len(lines), n=rs(net)) if booked else
+                   who=x.get("name") or "", p=period, g=rs(x.get("gross")), extra=extra, n=rs(x.get("net", x.get("net_pay"))))
+    k = int(run.get("headcount") or 0) or len(people)
+    head = (c.t("Salary register {p}: {k} staff, net pay {n} in all.", "Tankhwa register {p}: {k} staff, kul net {n}.", "تنخواہ رجسٹر {p}: {k} ملازم، کل {n}۔",
+                p=period, k=k, n=rs(net)) if booked else
             c.t("Payroll for {p} (not booked yet): {k} staff, net pay {n} in all.", "{p} ki tankhwa (abhi book nahi hui): {k} staff, kul net {n}.",
-                "{p} کی تنخواہ (ابھی درج نہیں): {k} ملازم، کل {n}۔", p=period, k=len(lines), n=rs(net)))
-    warns = [str(w) for w in d.get("warnings") or []][:3]
+                "{p} کی تنخواہ (ابھی درج نہیں): {k} ملازم، کل {n}۔", p=period, k=k, n=rs(net)))
+    if booked and run:
+        paid = sum(_num(x.get("paid")) or 0 for x in people)
+        head += c.t(" Paid {a}, still due {b}.", " {a} de diye, {b} baqi.", " {a} ادا، {b} باقی۔", a=rs(paid), b=rs(max((net or 0) - paid, 0)))
+    notes = [str(w) for w in (d.get("errors") or [])][:2] + [str(w) for w in (d.get("warnings") or [])][:3]
     _attach(d, c, head)
-    return head + (" " + "; ".join(warns) + "." if warns else "")
+    return head + (" " + "; ".join(notes) + "." if notes else "")
 
 
 def _payslip(d, c: _Ctx) -> str:
     d = d or {}
+    meta = d.get("meta") if isinstance(d.get("meta"), dict) else {}
     _attach(d, c, c.t("Payslip", "Salary slip", "سیلری سلپ"))
-    return c.t("{who}'s payslip for {p}: net pay {n}.", "{who} ki salary slip {p}: net {n}.", "{who} کی سیلری سلپ {p}: خالص {n}۔",
-               who=_who(d, c), p=d.get("period") or "", n=rs(_pick(d, "net", "net_pay", "total_payment")))
+    return c.t("{who}'s payslip for {p}: net pay {n} ({st}).", "{who} ki salary slip {p}: net {n} ({st}).", "{who} کی سیلری سلپ {p}: خالص {n} ({st})۔",
+               who=meta.get("name") or _who(d, c), p=meta.get("month") or meta.get("period") or d.get("period") or "",
+               n=rs(_pick(d, "net", "net_pay", "total_payment")), st=d.get("status") or meta.get("paid_status") or "")
 
 
 def _my_slips(d, c: _Ctx) -> str:
@@ -130,13 +145,13 @@ def _my_slips(d, c: _Ctx) -> str:
     if d.get("signed_out"):
         return c.t("Sign in as yourself to see your own payslips.", "Apni salary slip dekhne ke liye apne naam se sign in karein.",
                    "اپنی سیلری سلپ دیکھنے کے لیے اپنے نام سے سائن ان کریں۔")
-    slips = [s for s in d.get("slips") or [] if isinstance(s, dict)]
+    slips = [s for s in d.get("payslips") or d.get("slips") or [] if isinstance(s, dict)]
     if not slips:
         return c.t("There is no payslip linked to your login yet -- ask the owner.", "Aap ke login se abhi koi salary slip judi nahi -- owner se poochein.",
                    "آپ کے لاگ ان سے ابھی کوئی سیلری سلپ منسلک نہیں -- مالک سے پوچھیں۔")
     s0 = slips[0]
     head = c.t("Your payslip for {p}: net pay {n}.", "Aap ki salary slip {p}: net {n}.", "آپ کی سیلری سلپ {p}: خالص {n}۔",
-               p=s0.get("period") or "", n=rs(_pick(s0, "net", "net_pay", "total_payment")))
+               p=s0.get("month") or s0.get("period") or "", n=rs(_pick(s0, "net", "net_pay", "total_payment")))
     _attach(d, c, head)
     return head + (c.t(" {k} earlier slips below.", " {k} pichli slips neeche.", " {k} پچھلی سلپیں نیچے۔", k=len(slips) - 1) if len(slips) > 1 else "")
 
@@ -144,7 +159,9 @@ def _my_slips(d, c: _Ctx) -> str:
 def _advances(d, c: _Ctx) -> str:
     d = d or {}
     rows = [r for r in d.get("advances") or _rows(d) if isinstance(r, dict) and not r.get("_em")]
-    total = _pick(d, "total_outstanding") or sum(_num(r.get("outstanding")) or 0 for r in rows)
+    total = _pick(d, "outstanding", "total_outstanding")
+    if total is None:
+        total = sum(_num(r.get("outstanding")) or 0 for r in rows)
     if not rows:
         return c.t("No open staff advance.", "Koi advance baqi nahi.", "کوئی ایڈوانس باقی نہیں۔")
     parts = "; ".join(f"{r.get('name')} {rs(r.get('outstanding'))}" for r in rows[:8])
@@ -156,9 +173,15 @@ def _advances(d, c: _Ctx) -> str:
 def _statutory(d, c: _Ctx) -> str:
     d = d or {}
     kind = {"eobi": "EOBI", "ss": "Social security", "income_tax": "Salary tax withheld"}.get(str(d.get("kind") or c.args.get("kind")), "Statutory")
-    head = c.t("{k} for {p}: {t}.", "{k} {p}: {t}.", "{k} {p}: {t}۔", k=kind, p=d.get("period") or "", t=rs(_pick(d, "total", "amount")))
+    due = _pick(d, "due", "total", "amount")
+    head = c.t("{k} for {p}: {t} due", "{k} {p}: {t} jama karwane hain", "{k} {p}: {t} جمع کروانے ہیں", k=kind, p=d.get("period") or "", t=rs(due))
+    if _pick(d, "paid"):
+        head += c.t(", {a} paid, {b} still to pay", ", {a} jama ho chuke, {b} baqi", "، {a} جمع، {b} باقی", a=rs(d.get("paid")), b=rs(d.get("balance")))
+    head += "."
+    if not d.get("run_id") and "run_id" in d:
+        head += c.t(" That month's payroll isn't approved yet.", " Is mahine ki tankhwa abhi approve nahi hui.", " اس مہینے کی تنخواہ ابھی منظور نہیں ہوئی۔")
     _attach(d, c, head)
-    return head + _boundary(d, c)
+    return head + (" " + str(d["boundary"]) if d.get("boundary") else _boundary(d, c))
 
 
 # ------------------------------------------------------------------ payroll writes (after approval)
@@ -170,8 +193,9 @@ def _attendance(d, c: _Ctx) -> str:
 
 def _run_approved(d, c: _Ctx) -> str:
     d = d or {}
+    run = d.get("run") if isinstance(d.get("run"), dict) else d
     return c.t("Payroll for {p} approved ({r}): net pay {n} is now owed to staff.", "{p} ki tankhwa approve ({r}): staff ko {n} dene hain.",
-               p=d.get("period") or c.args.get("period") or "", r=d.get("run_id") or "", n=rs(_pick(d, "total_net", "net")))
+               p=run.get("period") or c.args.get("period") or "", r=run.get("run_id") or "", n=rs(_pick(run, "net", "total_net")))
 
 
 def _paid(d, c: _Ctx) -> str:
@@ -196,6 +220,17 @@ def _employee_added(d, c: _Ctx) -> str:
 def _employment_ended(d, c: _Ctx) -> str:
     d = d or {}
     return c.t("{w}'s employment ended on {day}.", "{w} ki mulazmat {day} ko khatam.", w=d.get("name") or "", day=_day(d.get("left_on")))
+
+
+def _pay_set(d, c: _Ctx) -> str:
+    d = d or {}
+    try:
+        who = c.repo.get_employee(str(c.args.get("employee_id") or ""))["name"]
+    except Exception:
+        who = ""
+    return c.t("Pay set{w}: {a} {b} from {day}.", "Tankhwa set{w}: {a} {b}, {day} se.", w=f" for {who}" if who else "",
+               a=rs(d.get("basic") or d.get("daily_rate")), b="a month" if (d.get("pay_basis") or "monthly") == "monthly" else "a day",
+               day=_day(d.get("effective_from")))
 
 
 def _adjusted_pay(d, c: _Ctx) -> str:
@@ -317,7 +352,7 @@ FORMATTERS = {
     "payroll_preview": _preview, "payroll_register": _register, "payslip": _payslip, "my_payslips": _my_slips,
     "staff_advances_report": _advances, "statutory_summary": _statutory,
     "record_attendance": _attendance, "approve_payroll_run": _run_approved, "pay_salaries": _paid, "give_staff_advance": _advance_given,
-    "add_employee": _employee_added, "end_employment": _employment_ended, "add_payroll_adjustment": _adjusted_pay,
+    "add_employee": _employee_added, "end_employment": _employment_ended, "add_payroll_adjustment": _adjusted_pay, "set_pay_structure": _pay_set,
     "money_accounts": _accounts, "account_book": _book, "income_statement": _income, "balance_sheet": _balance, "cash_flow": _cashflow,
     "trial_balance": _trial, "owner_kpis": _generic_report("Your numbers", "Aap ke numbers"), "margins_report": _generic_report("Margin", "Margin"),
     "fixed_assets_register": _generic_report("Fixed assets", "Assets"), "loans_report": _generic_report("Loans", "Qarz"),
