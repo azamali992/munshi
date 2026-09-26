@@ -102,6 +102,30 @@ _METHODS = {"cash": "cash", "bank": "bank", "banktransfer": "bank", "transfer": 
             "easypaisa": "easypaisa", "cheque": "cheque", "check": "cheque"}
 
 
+def _echo(v: Any) -> str:
+    """A model-supplied value quoted back in a guard question (a SKU, a tier, a tool name): letters, digits, spaces and
+    dashes only, short, and nothing the output filter would stop -- a refusal must not become the model's mouthpiece."""
+    from munshi.llm.guardrails import model_text_ok
+    s = str(v or "").strip()
+    return s if re.fullmatch(r"[\w -]{1,24}", s) and model_text_ok(s, "owner") is None else "that"
+
+
+# Free-text arguments a model writes itself (a credit note's reason, an expense note, a reference): they are shown on the
+# card and stored with the record, so they are kept short and plain -- no link, secret, instruction or off-topic text.
+_FREE_TEXT_ARGS = ("reason", "note", "ref", "source_text", "invoice_ref")
+
+
+def _plain_args(args: dict) -> dict:
+    from munshi.llm.guardrails import instruction_like, model_text_ok, normalise
+    out = dict(args)
+    for k in _FREE_TEXT_ARGS:
+        v = out.get(k)
+        if isinstance(v, str) and v:
+            s = normalise(v)[:120]
+            out[k] = "" if (instruction_like(s) or model_text_ok(s, "owner") in ("url", "secret", "prompt", "abuse", "politics/religion", "drafting")) else s
+    return out
+
+
 def _money(v: float) -> str:
     return f"Rs {v:,.0f}" if float(v).is_integer() else f"Rs {v:,.2f}"
 
@@ -253,7 +277,7 @@ def _check_items(name: str, args: dict, ctx: _Ctx) -> str | None:
         try:
             ctx.repo.get_product(sku)
         except Exception:
-            return RP.t("unknown_item", ctx.urdu, what=sku)
+            return RP.t("unknown_item", ctx.urdu, what=_echo(sku))
     return None
 
 
@@ -438,8 +462,15 @@ def _check_verb(name: str, args: dict, ctx: _Ctx) -> str | None:
     if question_only(ctx.text) and not yes:
         return RP.t("not_backed", ctx.urdu, why="it reads as a question, and a question never raises a card")
     if name == "draft_reminder" and str(args.get("tier") or "").lower() not in _TIERS:
-        return RP.t("not_backed", ctx.urdu, why=f"there is no '{args.get('tier')}' reminder -- only gentle, firm or final")
+        return RP.t("not_backed", ctx.urdu, why=f"there is no '{_echo(args.get('tier'))}' reminder -- only gentle, firm or final")
+    if name == "draft_due_reminders" and (not _BULK(ctx.text) or ctx.customer().status != "none"):
+        # a reminder for EVERY overdue customer is a bulk write: only on a bulk instruction ('sab ko reminder bhejo'), never
+        # for a message about one customer ('Haji Sons ko reminder bhej do' -- the rules' own condition, specialists.py)
+        return RP.t("not_backed", ctx.urdu, why="your message doesn't ask for reminders to everyone")
     return None
+
+
+_BULK = contains("everyone", "everybody", "all", "sab", "sabko", "sab ko", "sabhi", "saare", "sare", "har", "tamam", "overdue", "سب", "تمام")
 
 
 def check_call(name: str, args: dict, text: str, repo, prior: list[BaseMessage] | None = None, history: list[str] | None = None) -> str | None:
@@ -449,7 +480,7 @@ def check_call(name: str, args: dict, text: str, repo, prior: list[BaseMessage] 
     try:
         write = risk_of(name) != RiskTier.READ_ONLY
     except ValueError:
-        return RP.t("not_backed", ctx.urdu, why=f"unknown action {name}")
+        return RP.t("not_backed", ctx.urdu, why=f"unknown action {_echo(name)}")
     if name in CUSTOMER_TOOLS or "customer_id" in args:
         if write or ctx.customer().status != "none":
             q = _check_entity("customer", args.get("customer_id"), ctx, write)
@@ -545,21 +576,97 @@ def guard_refusal(msg: Any) -> dict | None:
     return (getattr(msg, "response_metadata", None) or {}).get(GUARD_KEY) if isinstance(msg, AIMessage) else None
 
 
+_NOT_YOURS = {False: "That isn't something your role can do here, so nothing was done. Ask the office if it needs doing.",
+              True: "یہ کام آپ کے عہدے کے لیے نہیں، اس لیے کچھ نہیں کیا گیا۔ ضرورت ہو تو دفتر سے کہیں۔"}
+_TOO_MANY = {False: "That was too many steps at once, so nothing was done. Please ask one thing at a time.",
+             True: "ایک ساتھ بہت زیادہ کام تھے، اس لیے کچھ نہیں کیا گیا۔ ایک وقت میں ایک بات پوچھیں۔"}
+
+
+def _refused(ai: AIMessage, q: str, name: str, args: dict) -> AIMessage:
+    kw = {k: v for k, v in (ai.additional_kwargs or {}).items() if k not in ("tool_calls", "function_call")}
+    meta = dict(ai.response_metadata or {}) | {GUARD_KEY: {"tool": name, "args": args, "question": q}}
+    return ai.model_copy(update={"content": q, "tool_calls": [], "invalid_tool_calls": [], "additional_kwargs": kw, "response_metadata": meta})
+
+
 class EntityGuard(AgentMiddleware):
-    """Checks each tool call a real model proposes (check_call) before the approval gate sees it."""
+    """Checks each tool call a real model proposes (check_call) before the approval gate sees it.
+
+    Guardrail hooks (llm/guardrails.py), all on the real-model path only:
+      wrap_model_call  a model may call only the tools bound for the asking role. The role gate (safety/middleware.py)
+                       decides what is OFFERED to the model, but the graph's tool node holds every role's tools, so a
+                       call to a tool the role wasn't offered (a salesman's profit_summary, a clerk's pay_supplier) would
+                       run -- or raise a card the role can't ask for. It is refused here, as is a step with more tool
+                       calls than MUNSHI_LLM_MAX_TOOL_CALLS (a fan-out).
+      after_model      free-text arguments the model wrote (reason, note, ref) are kept short and plain before the checks.
+      wrap_tool_call   a tool result goes back to the model as DATA: the viewer's visibility policy applied, secrets
+                       blanked, instruction-like strings withheld (guardrails.for_model). The original stays in the
+                       message's artifact so code renders the real record (guardrails.restore)."""
 
     def __init__(self, repo) -> None:
         super().__init__()
         self.repo = repo
+
+    def wrap_model_call(self, request: Any, handler: Any) -> Any:
+        from langchain.agents.middleware.types import ModelResponse
+
+        from munshi.llm.guardrails import limits
+        response = handler(request)
+        msgs = getattr(response, "result", None)
+        ai = next((m for m in msgs or [] if isinstance(m, AIMessage)), None) if isinstance(msgs, list) else None
+        if ai is None or not ai.tool_calls:
+            return response
+        allowed = {getattr(t, "name", t.get("name") if isinstance(t, dict) else str(t)) for t in (request.tools or [])}
+        urdu = is_urdu(next((str(m.content) for m in reversed(request.messages or []) if isinstance(m, HumanMessage)), ""))
+        from munshi.safety.risk import RISK_REGISTRY
+        q = None
+        # a registered tool the role wasn't offered (a name that isn't a tool at all is check_call's "unknown action")
+        stray = next((tc for tc in ai.tool_calls if tc["name"] not in allowed and tc["name"] in RISK_REGISTRY), None)
+        if stray is not None:
+            q, tc = _NOT_YOURS[urdu], stray
+            log.warning("guard refused %s: not bound for role %s", stray["name"], (request.state or {}).get("role") if isinstance(request.state, dict) else "?")
+        elif len(ai.tool_calls) > limits().max_tool_calls:
+            q, tc = _TOO_MANY[urdu], ai.tool_calls[0]
+            log.warning("guard refused a step with %d tool calls", len(ai.tool_calls))
+        if q is None:
+            return response
+        blocked = _refused(ai, q, tc["name"], tc.get("args") or {})
+        return ModelResponse(result=[blocked if m is ai else m for m in msgs], structured_response=getattr(response, "structured_response", None))
+
+    def wrap_tool_call(self, request: Any, handler: Any) -> Any:
+        from munshi.llm import guardrails as GRD
+        out = handler(request)
+        if not isinstance(out, ToolMessage):
+            return out
+        state = request.state if isinstance(request.state, dict) else {}
+        try:
+            safe, changed = GRD.for_model(out.content, str(state.get("role") or "driver"), self.repo)
+        except Exception:                                   # a result that can't be checked is not handed to the model
+            log.exception("couldn't prepare the %s result for the model", out.name)
+            safe, changed = '{"error": "result withheld"}', True
+        if not changed:
+            return out
+        art = out.artifact if isinstance(out.artifact, dict) else {}
+        return out.model_copy(update={"content": safe, "artifact": art | {GRD.ORIGINAL: out.content}})
 
     def after_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
         messages = state["messages"]
         ai = messages[-1] if messages and isinstance(messages[-1], AIMessage) else None
         if ai is None or not ai.tool_calls:
             return None
+        if guard_refusal(ai) is not None:
+            return None
         h = _last_human(messages)
         text = str(messages[h].content) if h >= 0 else ""
         prior = messages[:h] if h >= 0 else []
+        plain = [tc | {"args": _plain_args(tc.get("args") or {})} for tc in ai.tool_calls]
+        if plain != list(ai.tool_calls):
+            ai = ai.model_copy(update={"tool_calls": plain})
+            q0 = self._check(ai, text, prior)
+            return {"messages": [q0 if q0 is not None else ai]}
+        q0 = self._check(ai, text, prior)
+        return {"messages": [q0]} if q0 is not None else None
+
+    def _check(self, ai: AIMessage, text: str, prior: list) -> AIMessage | None:
         for tc in ai.tool_calls:
             try:
                 q = check_call(tc["name"], tc.get("args") or {}, text, self.repo, prior)
@@ -568,11 +675,9 @@ class EntityGuard(AgentMiddleware):
                 q = RP.t("not_backed", is_urdu(text), why="it couldn't be checked")
             if q:
                 log.warning("guard refused %s(%s) for %r: %s", tc["name"], json.dumps(tc.get("args"), default=str)[:200], text[:80], q)
-                kw = {k: v for k, v in (ai.additional_kwargs or {}).items() if k not in ("tool_calls", "function_call")}
-                meta = dict(ai.response_metadata or {}) | {GUARD_KEY: {"tool": tc["name"], "args": tc.get("args") or {}, "question": q}}
+                blocked = _refused(ai, q, tc["name"], tc.get("args") or {})
                 am = ask_meta(q)
                 if am:                                          # one missing piece: the next message may simply answer it
-                    meta[ASK_KEY] = am
-                blocked = ai.model_copy(update={"content": q, "tool_calls": [], "invalid_tool_calls": [], "additional_kwargs": kw, "response_metadata": meta})
-                return {"messages": [blocked]}
+                    blocked.response_metadata[ASK_KEY] = am
+                return blocked
         return None

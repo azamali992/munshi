@@ -8,6 +8,7 @@ from datetime import date, timedelta
 
 from munshi.domain.models import to_business_date, today_iso
 from munshi.domain.repository import MunshiRepository, StateError
+from munshi.llm.guardrails import check_scope  # the chatting role's read scope (a no-op outside a chat turn)
 
 REMINDER_TEMPLATES = {
     "gentle": {
@@ -103,6 +104,7 @@ class MunshiTools:
         return out[:40]
 
     def get_order(self, order_id: str) -> dict:
+        check_scope(self.repo, "get_order", order_id=order_id)          # a driver: only orders on today's runs
         return self._order(self.repo.get_order(order_id))
 
     def list_routes(self) -> list[dict]:
@@ -119,12 +121,14 @@ class MunshiTools:
         return asdict(s) | {"otp": None}
 
     def get_plan(self, plan_id: str) -> dict:
+        check_scope(self.repo, "get_plan", plan_id=plan_id)             # a driver: only today's active runs
         p = self.repo.get_plan(plan_id)
         return asdict(p) | {"stops": [self._stop_view(s) for s in self.repo.list_stops(plan_id)]}
 
     def list_stops(self, plan_id: str) -> list[dict]:
         """The stops with what a driver needs at the door: the customer's name and address, what was loaded for them and the
         bill for it (the amount to collect, at most). Read-only; the delivery code is never included."""
+        check_scope(self.repo, "list_stops", plan_id=plan_id)
         out = []
         for s in self.repo.list_stops(plan_id):
             c = self.repo.get_customer(s.customer_id)
