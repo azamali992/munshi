@@ -60,6 +60,9 @@ css.textContent = `
 document.head.appendChild(css);
 
 // ================================================================ My payslips (every role: payroll:self)
+// GET /api/me/payslips returns a light list (slip_id, period, month, gross, deductions, net, paid, status): the
+// full payslip (meta + table) is a second call, GET /api/payslips/{slip_id} -- resolved to the caller's own
+// employee by payroll:self, same as the owner's per-slip lookup.
 let slipCache = null;
 async function loadSlips() { const r = await api('/api/me/payslips'); slipCache = r.payslips || []; return slipCache; }
 V.payslips = async () => {
@@ -68,16 +71,16 @@ V.payslips = async () => {
   try { slips = await loadSlips(); }
   catch (e) { if (e.status === 404 || e.status === 403) { view.innerHTML = h1(t('mv.my_payslips'), '', 'more') + `<div class="empty">${esc(t('mv.no_payslips_role'))}</div>`; return; } throw e; }
   view.innerHTML = h1(t('mv.my_payslips'), esc(t('mv.payslips_sub')), 'more') + (slips.length
-    ? `<div class="list">${slips.map(s => { const m = s.meta || {}; return `<a class="item tap mv-slip" href="#payslip/${encodeURIComponent(s.slip_id)}">
-        <div class="row"><span class="t">${esc(monthName(m.period))}</span>${m.paid_status ? `<span class="pill ${m.paid_status === 'paid' ? 'good' : 'warn'}">${esc(t('mv.st_' + m.paid_status))}</span>` : ''}</div>
-        <div class="row"><span class="m">${ltr(s.slip_id)}</span><span class="mv-net">${ltr(rs(m.total_payment ?? m.net))}</span></div></a>`; }).join('')}</div>`
+    ? `<div class="list">${slips.map(s => `<a class="item tap mv-slip" href="#payslip/${encodeURIComponent(s.slip_id)}">
+        <div class="row"><span class="t">${esc(monthName(s.period))}</span>${s.status ? `<span class="pill ${s.status === 'paid' ? 'good' : 'warn'}">${esc(t('mv.st_' + s.status))}</span>` : ''}</div>
+        <div class="row"><span class="m">${ltr(s.slip_id)}</span><span class="mv-net">${ltr(rs(s.net))}</span></div></a>`).join('')}</div>`
     : `<div class="empty">${esc(t('mv.no_payslips'))}</div>`);
 };
 V.payslip = async id => {
   view.innerHTML = h1(t('mv.payslip'), '', 'payslips') + skel(4);
-  const slips = slipCache || await loadSlips();
-  const s = slips.find(x => x.slip_id === id);
-  if (!s) { view.innerHTML = h1(t('mv.payslip'), '', 'payslips') + `<div class="empty">${esc(t('mv.slip_gone'))}</div>`; return; }
+  let s;
+  try { s = await api(`/api/payslips/${encodeURIComponent(id)}`); }
+  catch (e) { if (e.status === 404) { view.innerHTML = h1(t('mv.payslip'), '', 'payslips') + `<div class="empty">${esc(t('mv.slip_gone'))}</div>`; return; } throw e; }
   const m = s.meta || {}, lb = m.leave_balances || {}, tb = s.table || { columns: [], rows: [] };
   const colLabel = c => { const k = 'mv.col_' + c.key; return t(k) === k ? c.label : t(k); };
   // a money column shows two decimals on every line when any line has paisa, so the figures line up
@@ -85,12 +88,12 @@ V.payslip = async id => {
   const cell = (v, c) => v === null || v === undefined || v === '' ? '' : c.kind === 'money'
     ? ltr((Number(v) < 0 ? '\u2212' : '') + Math.abs(Number(v)).toLocaleString('en-PK', { minimumFractionDigits: frac[c.key] ? 2 : 0, maximumFractionDigits: 2 }))
     : c.kind === 'days' || c.kind === 'qty' ? ltr(Number(v).toLocaleString('en-PK')) : txt(v);
-  view.innerHTML = h1(monthName(m.period), `${ltr(s.slip_id)} · ${txt(m.business || '')}`, 'payslips') + `
+  view.innerHTML = h1(monthName(m.period), `${ltr(s.slip_id)} · ${txt(m.business_name || '')}`, 'payslips') + `
     <div class="card stack">
-      <div class="row"><span class="t"><b>${esc(t('mv.net_pay'))}</b></span><span class="mv-slip"><span class="mv-net">${ltr(rs(m.total_payment ?? m.net))}</span></span></div>
+      <div class="row"><span class="t"><b>${esc(t('mv.net_pay'))}</b></span><span class="mv-slip"><span class="mv-net">${ltr(rs(s.net))}</span></span></div>
       <div class="mv-kv"><b>${esc(t('name'))}</b><span>${txt(m.name || '')} ${ltr(m.emp_no || '')}</span><b>${esc(t('mv.designation'))}</b><span>${txt(m.designation || '')}</span>
         <b>${esc(t('mv.days'))}</b><span>${ltr(m.days_worked ?? '—')}${m.unpaid_absent ? ` · ${esc(t('mv.absent'))} ${ltr(m.unpaid_absent)}` : ''}</span>
-        <b>${esc(t('method'))}</b><span>${esc(t('k_' + (m.pay_method || 'cash')))}${m.cash_allowed ? ` <span class="mv-flag"><span aria-hidden="true">⚑</span> ${esc(t('mv.cash_allowed'))}</span>` : ''}</span>
+        <b>${esc(t('method'))}</b><span>${esc(t('k_' + (m.pay_method || 'cash')))}${m.cash_exemption ? ` <span class="mv-flag"><span aria-hidden="true">⚑</span> ${esc(t('mv.cash_allowed'))}</span>` : ''}</span>
         <b>${esc(t('status'))}</b><span>${esc(t('mv.st_' + (m.paid_status || 'unpaid')))}</span></div></div>
     <figure class="dt" style="margin-top:12px"><div class="dt-wrap"><div class="dt-scroll" role="region" aria-label="${esc(t('mv.payslip'))}" tabindex="0"><table>
       <caption class="sr">${esc(t('mv.payslip'))} ${esc(monthName(m.period))}</caption>

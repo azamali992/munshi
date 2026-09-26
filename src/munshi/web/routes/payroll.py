@@ -325,17 +325,39 @@ def _issue_login(request: Request, c: Ctx, name: str, phone: str | None, login: 
     return emp, _login_out(request, user, name, pin if login.generate else None)
 
 
+def _login_view(u: dict) -> dict:
+    """The employees screens' `login` badge: role / active / must_change_pin -- never the PIN, never the hash."""
+    return {"user_id": u["user_id"], "role": u["role"], "phone": u["phone"], "active": u["active"], "must_change_pin": u["must_change_pin"]}
+
+
+def _attach_logins(employees: list[dict], users: list[dict]) -> None:
+    by_id = {u["user_id"]: u for u in users}
+    for e in employees:
+        u = by_id.get(e.get("user_id"))
+        e["login"] = _login_view(u) if u else None
+
+
 @router.get("/employees")
 def list_employees(request: Request, status: str = Query(default="active", pattern="^(active|left|all)$"), c: Ctx = Depends(payroll_context("employees:read"))):
+    users = hub_of(request).registry.list_users(c.principal.business_id)
     if c.principal.can("staff:manage"):       # the owner's screen picks up logins made before payroll existed
-        c.repo.sync_employees_from_users(hub_of(request).registry.list_users(c.principal.business_id), c.role)
-    return c.repo.list_employees(status, include_pay=c.principal.can("payroll:read"))
+        c.repo.sync_employees_from_users(users, c.role)
+        users = hub_of(request).registry.list_users(c.principal.business_id)   # sync may have linked new users
+    out = c.repo.list_employees(status, include_pay=c.principal.can("payroll:read"))
+    _attach_logins(out["employees"], users)
+    return out
 
 
 @router.get("/employees/{employee_id}")
-def get_employee(employee_id: str, c: Ctx = Depends(payroll_context("employees:read"))):
+def get_employee(employee_id: str, request: Request, c: Ctx = Depends(payroll_context("employees:read"))):
     pay = c.principal.can("payroll:read")
     out = c.repo.get_employee(employee_id, include_pay=pay)
+    out["login"] = None
+    if out.get("user_id"):
+        try:
+            out["login"] = _login_view(_user_here(request, c, out["user_id"]))
+        except HTTPException:
+            pass
     if pay:
         out["events"] = c.repo.employee_events(employee_id)
     return out

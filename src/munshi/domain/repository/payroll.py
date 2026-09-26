@@ -92,7 +92,7 @@ _CATEGORY_CODE = {"staff_salaries": SALARIES, "staff_wages": WAGES, "staff_allow
 _CREDIT = {"TAX": INCOME_TAX_WITHHELD, "EOBI_EE": EOBI_PAYABLE, "EOBI_ER": EOBI_PAYABLE, "SS_EE": SOCIAL_SECURITY_PAYABLE,
            "SS_ER": SOCIAL_SECURITY_PAYABLE, "ADV": STAFF_ADVANCES, "FINE": STAFF_WELFARE_FUND,
            "LOSS": expense_code("cash_shortage"), "OTHER_DED": OTHER_INCOME, "IN_LIEU": OTHER_PAYABLES}
-_PUBLIC_FIELDS = ("employee_id", "emp_no", "name", "designation", "role_hint", "status", "joined_on", "left_on", "phone")
+_PUBLIC_FIELDS = ("employee_id", "emp_no", "name", "designation", "role_hint", "status", "joined_on", "left_on", "phone", "user_id")
 _TEXT_FIELDS = {"father_name": 60, "designation": 40, "eobi_no": 20, "ss_no": 20, "payee_ref": 40, "default_vehicle_id": 20}
 _STANDING_SQL = "NOT EXISTS (SELECT 1 FROM payroll_runs x WHERE x.reversal_of = {r}.run_id)"
 
@@ -1154,6 +1154,8 @@ class PayrollMixin(RepositoryBase):
         return {"period": period, "period_start": pv["period_start"], "period_end": pv["period_end"], "profile": pv["profile"],
                 "fingerprint": pv["fingerprint"], "employees": emps, "skipped": pv["skipped"], "warnings": pv["warnings"], "errors": errors,
                 "can_approve": not errors and bool(emps),
+                "run": ({"run_id": existing["run_id"], "period": existing["period"], "approved_by": existing["approved_by"],
+                         "approved_at": existing["created_at"]} if existing else None),
                 "totals": {k: _r(sum(r[x] for r in pv["results"])) for k, x in (("gross", "gross"), ("deductions", "deductions"),
                                                                                  ("net", "net"), ("employer", "employer"))},
                 "commission_basis": pv["commission_basis"], "rules": pv["rules"], "rules_verified_on": pv["rules_verified_on"],
@@ -1312,8 +1314,10 @@ class PayrollMixin(RepositoryBase):
             net = -s["net_paisa"] if run["kind"] == "reversal" else s["net_paisa"]
             rows.append(self._pr_register_row(s["emp_no"], s["name"], s["designation"], s["pay_basis"], s["days_worked_x2"], s["unpaid_absent_x2"],
                                               lines, ", ".join(methods) or s["pay_method"], paid, net))
+            emp_now = self._one("SELECT pay_account_id, cash_allowed FROM employees WHERE employee_id=?", (s["employee_id"],))
             slips.append({"slip_id": s["slip_id"], "employee_id": s["employee_id"], "emp_no": s["emp_no"], "name": s["name"], "net": _r(net),
-                          "paid": _r(paid), "balance_due": _r(net - paid)})
+                          "paid": _r(paid), "balance_due": _r(net - paid), "pay_method": s["pay_method"],
+                          "pay_account_id": (emp_now["pay_account_id"] if emp_now else None), "cash_allowed": bool(emp_now["cash_allowed"]) if emp_now else False})
         reversed_by = self._one("SELECT run_id, created_at FROM payroll_runs WHERE reversal_of=?", (run["run_id"],))
         status = "reversal" if run["kind"] == "reversal" else ("reversed" if reversed_by else "approved")
         rules = json.loads(run["rules"] or "{}")
