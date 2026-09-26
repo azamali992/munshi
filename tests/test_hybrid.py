@@ -124,7 +124,8 @@ def test_rules_answer_without_any_model_call(repo):
     assert card.pending and card.pending.args["customer_id"] == "C-012" and card.engine == "rules"
     assert engine_of(card.pending.approval_id) == "rules"
     ask = p.handle_message("t3", "clerk", "Malik ko 8 makai")              # a clarifying question is an answer too
-    assert ask.pending is None and "C-001" in ask.text and "C-012" in ask.text and ask.engine == "rules"
+    assert ask.pending is None and "Malik Agro Store" in ask.text and "Malik Seeds" in ask.text and ask.engine == "rules"
+    assert "C-0" not in ask.text                                       # names, never record codes
     assert fake.requests == []
 
 
@@ -161,10 +162,11 @@ def test_stub_platform_has_no_model_engine_and_is_unchanged():
 def test_guard_refuses_the_observed_malik_seeds_wrong_id(repo):
     items = _makai(repo)
     q = check_call("create_order", {"customer_id": "C-001", "items": items}, "Malik Seeds ko 8 makai", repo)
-    assert q and "Malik Seeds (C-012)" in q and "C-001" in q
+    assert q and "Malik Seeds" in q and "Malik Agro Store" in q and "C-0" not in q
+    assert {c["id"] for c in q.candidates} == {"C-001", "C-012"}           # the ids stay in the open question, not the text
     assert check_call("create_order", {"customer_id": "C-012", "items": items}, "Malik Seeds ko 8 makai", repo) is None
     amb = check_call("create_order", {"customer_id": "C-001", "items": items}, "Malik ko 8 makai", repo)
-    assert amb and "C-001" in amb and "C-012" in amb                      # ambiguous: ask, never pick
+    assert amb and {c["id"] for c in amb.candidates} == {"C-001", "C-012"}   # ambiguous: ask, never pick
 
 
 def test_guard_checks_quantities_amounts_methods_and_references(repo):
@@ -197,7 +199,7 @@ def test_model_wrong_id_becomes_a_question_not_a_card(repo):
     p.manager = _NoRoute()
     r = p.handle_message("t", "clerk", text, user="Bilal")
     assert r.engine == "model" and r.pending is None and not p.pending
-    assert "Which customer" in r.text and "Malik Seeds (C-012)" in r.text
+    assert "Which customer" in r.text and "Malik Seeds" in r.text and "C-012" not in r.text
     st = p.llm_specialists["order"].agent.get_state(p._cfg("t", "clerk", "order", "model"))
     assert not st.interrupts and st.values["messages"][-1].response_metadata[GUARD_KEY]["tool"] == "create_order"
     # the thread stays healthy: the next model request on it passes the provider's protocol check
@@ -248,7 +250,9 @@ def test_a_correct_model_call_becomes_a_card_and_is_resumed_by_the_model_engine(
         p.resolve(r.pending.approval_id, True, "clerk", user="Bilal")
     before = len(p.repo.list_orders(customer_id="C-012"))
     out = p.resolve(r.pending.approval_id, True, "clerk", user="Sana")
-    assert out.engine == "model" and out.text == "Order ban gaya." and out.model_calls == 1
+    assert out.engine == "model" and out.model_calls == 1
+    # what happened is said by code from the tool result, never by the model's follow-up prose
+    assert visible(out.text).startswith("Approved. Draft order") and "Malik Seeds" in out.text and "Order ban gaya." not in out.text
     assert len(p.repo.list_orders(customer_id="C-012")) == before + 1
     # the rules engine's graph for this thread never saw the call
     assert not p.specialists["order"].agent.get_state(p._cfg("t", "clerk", "order")).values
@@ -288,7 +292,7 @@ def test_cards_resume_on_the_engine_that_raised_them_after_a_restart(tmp_path):
     a = p2.resolve(rules_card.approval_id, True, "clerk", user="Sana")
     assert a.engine == "rules" and a.model_calls == 0 and "ORD-" in visible(a.text) and DETAILS in a.text and fake2.requests == []
     b = p2.resolve(model_card.approval_id, True, "clerk", user="Sana")
-    assert b.engine == "model" and b.text == "Ho gaya." and fake2.requests == [("act", text)]
+    assert b.engine == "model" and visible(b.text).startswith("Approved. Draft order") and "Ho gaya" not in b.text and fake2.requests == [("act", text)]
     assert [o.customer_id for o in p2.repo.list_orders(limit=2)] and not p2.pending
     p2.close()
 
@@ -341,7 +345,7 @@ def test_an_empty_tool_result_goes_back_as_text(repo):
     fake = _fake(routes={text: "order"}, plan={text: [[("list_orders", {"status": "short"})]]}, final={text: "Koi order nahi."})
     p = MunshiPlatform(repo, model=fake)
     r = p.handle_message("t", "clerk", text)
-    assert r.model_error is None and r.text == "Koi order nahi."
+    assert r.model_error is None and "short" in r.text and "Koi order nahi." not in r.text      # code says it, from the []
 
 
 def test_a_claimed_action_that_never_happened_is_not_passed_on(repo):
@@ -352,10 +356,17 @@ def test_a_claimed_action_that_never_happened_is_not_passed_on(repo):
     fake = _fake(routes={text: "hisaab"}, plan={text: [[("find_customer", {"text": "Green Valley"})]]},
                  final={text: "Green Valley ka payment record kar diya gaya: 25,000 PKR."})
     p = MunshiPlatform(repo, model=fake)
+    p.manager = _NoRoute()          # (the rules now read '<customer> ... scene' as a khata question: put it in front of the model)
     r = p.handle_message("t", "clerk", text)
     assert r.engine == "model" and r.pending is None
-    assert r.text.startswith("Nothing was recorded") and "record kar diya" not in r.text
-    assert p.repo.chat_history("t")[-1]["meta"]["claim_blocked"].startswith("Green Valley ka payment")
+    # the turn ran a lookup: the reply is what code read (Green Valley's balance), the claim and its number are gone
+    assert "record kar diya" not in r.text and "25,000" not in r.text and "Green Valley Seeds" in r.text
+    assert p.repo.chat_history("t")[-1]["meta"]["model_text"].startswith("Green Valley ka payment")
+    # with no tool at all, the claim is replaced by "nothing was recorded" and the didn't-understand reply
+    fake.plan[text] = []
+    r = p.handle_message("t2", "clerk", text)
+    assert r.text.startswith("Nothing was recorded") and "record kar diya" not in r.text and "25,000" not in r.text
+    assert p.repo.chat_history("t2")[-1]["meta"]["claim_blocked"].startswith("Green Valley ka payment")
     # a question or a plain answer is not a claim
     assert not MunshiPlatform._claims_done("Kya delivery ho gayi?")
     assert not MunshiPlatform._claims_done("Nothing was recorded yet.")
@@ -385,11 +396,11 @@ def test_an_urdu_script_tail_is_dropped_from_a_reply_to_roman_urdu(repo):
     assert MunshiPlatform._latin_only("Malik Seeds ka khata: outstanding balance 0.00 PKR. کوئی اور مدد؟") == "Malik Seeds ka khata: outstanding balance 0.00 PKR."
     assert MunshiPlatform._latin_only("کھاتہ صاف ہے۔") == "کھاتہ صاف ہے۔"                  # all Urdu: left alone, never emptied
     text = "Bhatti sahab ka account dekhna hai zara"
-    fake = _fake(routes={text: "hisaab"}, final={text: "Bhatti sahab ka khata 58,000 hai. کوئی اور مدد؟"})
+    fake = _fake(routes={text: "hisaab"}, final={text: "Bhatti sahab kis ka naam hai? کوئی اور مدد؟"})
     p = MunshiPlatform(repo, model=fake)
     p.manager = _NoRoute()          # the rules now read 'account' as khata themselves: put this one in front of the model on purpose
     r = p.handle_message("t", "clerk", text)
-    assert r.text == "Bhatti sahab ka khata 58,000 hai."
+    assert r.text == "Bhatti sahab kis ka naam hai?"           # a clarifying question survives grounding; its Urdu-script tail doesn't
 
 
 def test_a_reply_in_content_parts_is_shown_as_plain_text(repo):
@@ -405,11 +416,11 @@ def test_a_reply_in_content_parts_is_shown_as_plain_text(repo):
                 out.generations[0].message = AIMessage(content=[{"type": "text", "text": msg.content}])
             return out
 
-    fake = Parts(routes={text: "hisaab"}, final={text: "Bhai, Bhatti Kisan Store ka khata Rs 58,000 hai."}, requests=[])
+    fake = Parts(routes={text: "hisaab"}, final={text: "Bhai, Bhatti Kisan Store ya koi aur Bhatti?"}, requests=[])
     p = MunshiPlatform(repo, model=fake)
     p.manager = _NoRoute()
     r = p.handle_message("t", "clerk", text)
-    assert r.text == "Bhai, Bhatti Kisan Store ka khata Rs 58,000 hai."
+    assert r.text == "Bhai, Bhatti Kisan Store ya koi aur Bhatti?"
     assert "'type'" not in r.text and not r.text.startswith("[")
 
 

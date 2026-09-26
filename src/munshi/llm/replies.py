@@ -88,8 +88,8 @@ EN = {
     "which_date": "By when? Please give the date, e.g. '2 October' or 'jumma tak'.",
     "which_product": "Which product? Please name it, e.g. 'urea' or 'DAP'.",
     "which_godown": "Which godown? Please name it.",
-    "which_ref": "Which {what}? Please send its ID (e.g. {example}); nothing was done yet.",
-    "which_otp": "I need the customer's OTP code to close the stop, e.g. 'close STP-... delivered all, cash 50000, otp 1234'.",
+    "which_ref": "Which {what}? Say it the way you know it, e.g. {example}; nothing was done yet.",
+    "which_otp": "To close the stop I need the delivery code the customer has, e.g. 'Chaudhry Farms pe sab de diya, cash 50000, code 1234'.",
     "not_backed": "I couldn't match that to what you wrote ({why}), so nothing was done. Please send it again with the details.",
 }
 
@@ -138,7 +138,7 @@ HELP_BY_ROLE = {
     "owner": "I can take orders, check stock and khata, record payments and expenses, receive purchases, pay suppliers, chase collections and give reports.",
     "clerk": "I can take orders, check stock and khata, allocate and plan dispatch, record payments and expenses, receive purchases and chase collections.",
     "salesman": "I can book orders (the office confirms them), show a customer's khata and check stock, and log promises to pay.",
-    "driver": "Ask 'mera agla stop kaun sa hai' for today's stops, and close a stop with 'close STP-... delivered all, cash 50000, otp 1234'.",
+    "driver": "Ask 'aaj kahan kahan jana hai' for today's stops, and close one with the customer's code: 'Chaudhry Farms pe sab de diya, cash 50000, code 1234'.",
 }
 
 
@@ -153,6 +153,32 @@ def t(key: str, urdu: bool, roman: bool = False, candidates: list[dict] | None =
     return Ask(text, SLOT_OF[key], candidates) if key in SLOT_OF else text
 
 
+# What each munshi's "did you mean" names, with one example the user can copy (EN/Roman Urdu share the example).
+_CLOSEST = {
+    "order": ("an order or a customer's khata", "ek order ya kisi customer ka khata", "کوئی آرڈر یا کسی گاہک کا کھاتہ", "Haji Sons ko 10 urea"),
+    "godown": ("stock or a dispatch plan", "stock ya dispatch plan", "اسٹاک یا ڈسپیچ پلان", "urea ka stock kitna hai"),
+    "delivery": ("today's stops or closing a delivery", "aaj ke stops ya delivery band karna", "آج کے اسٹاپ یا ڈیلیوری", "aaj kahan kahan jana hai"),
+    "hisaab": ("a payment, an expense or the cashbook", "payment, kharcha ya cashbook", "ادائیگی، خرچہ یا کیش بک", "Rana Brothers ne 20000 cash diye"),
+    "khareed": ("a supplier: goods received or what we owe", "supplier: maal aaya ya kitna dena hai", "سپلائر: مال آیا یا کتنا دینا ہے", "Fauji ko kitna dena hai"),
+    "wasooli": ("collections: who owes, reminders, promises", "wasooli: kis ke paise baqi, reminder, wada", "وصولی: کس کے پیسے باقی، یاد دہانی، وعدہ", "udhaar list"),
+    "report": ("a report: sales, profit, collections", "report: sale, munafa, wasooli", "رپورٹ: سیل، منافع، وصولی", "is mahine ka munafa"),
+}
+
+
+def didnt(specialists: list, urdu: bool = False, roman: bool = False) -> str:
+    """'Sorry, I didn't understand that -- did you mean X or Y? e.g. ...': the one or two closest things the message
+    could have meant (the munshis the engines routed it to), never a guess at the answer."""
+    picks = [s for s in dict.fromkeys(specialists) if s in _CLOSEST][:2] or ["order", "godown"]
+    col = 2 if urdu else 1 if roman else 0
+    what = (" یا " if urdu else " ya " if roman else " or ").join(_CLOSEST[s][col] for s in picks)
+    eg = " / ".join(f"«{_CLOSEST[s][3]}»" if urdu else f"'{_CLOSEST[s][3]}'" for s in picks)
+    if urdu:
+        return f"معاف کیجیے، بات سمجھ نہیں آئی۔ کیا آپ کا مطلب {what} ہے؟ مثلاً {eg}۔"
+    if roman:
+        return f"Maaf kijiye, baat samajh nahi aayi. Kya aap ka matlab {what} hai? Maslan {eg}."
+    return f"Sorry, I didn't understand that. Did you mean {what}? For example {eg}."
+
+
 def _ordered(res: Resolution) -> list:
     """The options as a question lists them: by ID, or -- when the resolver ranked them for the asking user (the
     customers they order for most, llm.resolve._rank) -- in that order. Ranking only orders; it never picks."""
@@ -160,8 +186,9 @@ def _ordered(res: Resolution) -> list:
 
 
 def options(res: Resolution, urdu: bool = False) -> str:
-    """'Chaudhry Farms (C-002) or Chaudhry Traders (C-011)' -- names as stored in master data, with IDs, at most three."""
-    names = [f"{c.name} ({c.id})" for c in _ordered(res)]
+    """'Chaudhry Farms or Chaudhry Traders' -- names as stored in master data, at most three. No record codes: a person
+    answers with a name or 'pehla' / 'doosra' (the open-question memory keeps the ids)."""
+    names = [c.name for c in _ordered(res)]
     word, comma = (" یا ", "، ") if urdu else (" or ", ", ")
     return word.join(names) if len(names) <= 2 else comma.join(names[:-1]) + word + names[-1]
 

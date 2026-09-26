@@ -26,7 +26,7 @@ class AgentBundle:
 HOUSE_RULES = (
     " House rules: today is {today}. Use the tools for every fact — never invent an ID, a balance or a stock figure. "
     "IDs look like C-001 (customer), S-001 (supplier), UREA-50 (product), ORD-XXXXXXXX (order), DSP-XXXXXXXX (plan), STP-XXXXXXXX (stop), REM-XXXXXXXX (reminder). "
-    "Amounts are in Pakistani rupees. Reply in the user's language (Urdu, English or mixed), in one or two short sentences, and say plainly when something needs another role's approval. "
+    "Amounts are in Pakistani rupees. Reply in the user's language (Urdu, English or mixed), in one or two short sentences. "
     "Never write a message to a customer yourself; only the templated reminders, codes and receipts go out."
 )
 
@@ -38,11 +38,14 @@ MODEL_RULES = (
     "ambiguous, ask which of the candidates it lists. "
     "NEVER ask the user for an ID or a SKU and never guess one.If a lookup says `ambiguous`, ask which one, naming the candidates it returned; if it finds nothing, ask for the name again. "
     "Copy quantities and amounts from the message as the user wrote them ('50 hazar' = 50000, 'dedh sau' = 150); never work out a number the user didn't say. "
-    "Ask one short question when something is missing, instead of guessing. "
-    "Never say that something was recorded, delivered, sent, saved or done unless a tool did it in this turn; anything that changes the books "
-    "goes to a human for approval first, so say it is waiting for approval, not that it is done. "
-    "Language: answer in the SAME script as the user's message. Roman Urdu (Urdu written in English letters, e.g. 'Rana ko 10 urea bhej do') gets a Roman Urdu reply in English letters — never Urdu script. "
-    "Urdu script gets Urdu script. English gets English."
+    "YOUR WORDS ARE NOT SHOWN TO THE USER. The user sees what CODE writes from your tool results: to answer a question, call the read "
+    "tool(s) that hold the answer (khata, stock, orders, stops, aging, collections, cashbook, reports) and stop -- do not summarise them. "
+    "To act, call the action tool: the user then sees the approval card code builds from it. Spend your effort on choosing the right "
+    "tool and arguments. The ONLY text of yours that is shown is a short clarifying question when something is missing: ask it with no "
+    "numbers, amounts, dates or IDs, and never ask the user for an ID, SKU or code (ask for a name). "
+    "Never say anything was recorded, noted, sent or is waiting for approval -- code says that. "
+    "Language of a question: the SAME script as the user's message. Roman Urdu (Urdu written in English letters, e.g. 'Rana ko 10 urea bhej do') "
+    "gets Roman Urdu in English letters -- never Urdu script. Urdu script gets Urdu script. English gets English."
 )
 
 

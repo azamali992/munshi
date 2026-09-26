@@ -64,7 +64,7 @@ def test_all_means_the_whole_list(p):
     rows = p.ops.get_stock("")
     short = answers.render("get_stock", rows, p.repo, "aj ka stock count")
     full = answers.render("get_stock", rows, p.repo, "for all the products?")
-    assert "mazeed" in short or "more" in short
+    assert "Wheat Seed" in short and "Zinc" in short and "mazeed" not in short      # 10 products: the whole list, no 'sab dikhao' needed
     assert "Wheat Seed" in full and "Zinc" in full and "more" not in full
 
 

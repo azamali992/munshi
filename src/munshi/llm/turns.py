@@ -27,6 +27,8 @@ _CUE = contains("galti", "ghalti", "galat", "ghalat", "sorry", "correction", "mi
 _BARE = re.compile(r"^\W*(?:ji\s+|haan\s+|acha\s+)?(\d+(?:\.\d+)?)\s*(?:bori|bags?|katte|kar do|karo|kardo|kr do|kar dein|kar den|kar dijiye|chahiye|hai|he|"
                    r"tha|the|thi|rakho|likho|likh do|hona chahiye)?\W*$")
 _OLD_NEW = re.compile(r"(\d+(?:\.\d+)?)\s*(?:bori|bags?|katte|rs|rupay)?\s*(?:nahi|nahin|nai|na|not)\b[\s,.-]*(?:balkay|balke|but|bulkay)?\s*(\d+(?:\.\d+)?)")
+# the right figure first, the wrong one after with 'nahi': '40 urea chahiye 50 nahi'
+_NEW_OLD = re.compile(r"(\d+(?:\.\d+)?)\s*(?:[a-z]+\s+){0,3}(\d+(?:\.\d+)?)\s*(?:bori|bags?|katte|rs|rupay)?\s*(?:nahi|nahin|nai)\b\s*\W*$")
 
 
 def _plain(text: str) -> str:
@@ -54,10 +56,12 @@ def correction(text: str, tool: str, args: dict, repo) -> dict | None:
         items[0]["unit_cost"] = float(r.group(1) or r.group(2))
         return dict(args) | {"items": items}
     m = _OLD_NEW.search(s)
+    m2 = None if m else _NEW_OLD.search(s)
     bare = _BARE.match(s)
-    if not (m or bare or (_CUE(text) and len(set(nums)) == 1)):
+    if not (m or m2 or bare or (_CUE(text) and len(set(nums)) == 1)):
         return None
-    old, new = (float(m.group(1)), float(m.group(2))) if m else (None, nums[0] if len(set(nums)) == 1 else None)
+    old, new = (float(m.group(1)), float(m.group(2))) if m else (float(m2.group(2)), float(m2.group(1))) if m2 else (
+        None, nums[0] if len(set(nums)) == 1 else None)
     if new is None or new <= 0:
         return None
     c = customer_resolution(text, repo)
@@ -97,6 +101,48 @@ def old_new(text: str) -> tuple[float | None, float | None]:
         return float(m.group(1)), float(m.group(2))
     nums = set(N.numbers_in(s))
     return (None, next(iter(nums))) if len(nums) == 1 else (None, None)
+
+
+_ACTUAL = re.compile(r"\b(?:asal|asli|actual|actually|darasal|sahi|correct|should be|hona chahiye)\w*\s*(?:mei|me|mein|mai|main|to|mein to|is|was|amount|raqam)?\s*"
+                     r"(?:rs\.?\s*)?(\d+(?:\.\d+)?)")
+
+
+def wrong_right(text: str) -> tuple[float | None, float | None]:
+    """(the wrong figure, the right one) of a correction: '20000 nahi 12000 thi', '20000 wali galat thi, asal mei 12000 thi'.
+    (None, None) when the message isn't shaped like one."""
+    old, new = old_new(text)
+    if old is not None:
+        return old, new
+    s = _plain(text)
+    m = _ACTUAL.search(s)
+    if not m:
+        return None, None
+    right = float(m.group(1))
+    others = [n for n in N.numbers_in(s[:m.start()] + " " + s[m.end():]) if n != right and n >= 100]
+    return (others[0], right) if len(set(others)) == 1 else (None, None)
+
+
+# undoing a payment already recorded -- never a new one
+_REV_WORD = contains("reverse", "reversal", "reverse karo", "undo", "cancel", "radd", "mansookh", "galat", "ghalat", "galti", "ghalti", "wrong",
+                     "mistake", "bounce", "bounced", "واپس", "منسوخ", "غلط", "باؤنس")
+_REV_BACK = re.compile(r"\b(wapis|wapas)\s+(karo|kar do|kardo|kar dein|lo|le lo|kar lo|karein)\b")
+_RECEIPT = contains("payment", "payments", "raqam", "receipt", "raseed", "rasid", "entry", "cheque", "check", "chq", "jazzcash", "jazz cash", "easypaisa",
+                    "easy paisa", "bank", "cash", "paise", "wusooli", "wasooli", "ادائیگی", "رسید", "چیک", "رقم")
+
+
+def rev_intent(text: str, repo=None) -> bool:
+    """'X ki 20000 wali payment reverse karo', 'cheque bounce ho gaya', 'galat entry thi, cancel kar do', 'payment 20000 nahi 12000
+    thi': a request to undo a payment already recorded. Not an order ('order cancel karo'), not a promise, and not money paid
+    back to us ('Rana ne 20000 wapis kiye' is a payment)."""
+    from munshi.llm.parse import is_bounce
+    f = fold(text)
+    if re.search(r"\b(order|orders|promise|wada|waada|reminder|supplier|suppliers)\b|\b(spy|bil|pur|exp)-|آرڈر|وعدہ|سپلائر", f):
+        return False                                  # (a supplier's payment or bill is the khareed munshi's reversal)
+    if is_bounce(text):
+        return True
+    if not _RECEIPT(text):
+        return False
+    return bool(_REV_WORD(text) or _REV_BACK.search(f)) or (_OLD_NEW.search(_plain(text)) is not None and _CUE(text))
 
 
 def order_text(customer_id: str, items: list[dict]) -> str:
@@ -181,12 +227,76 @@ def split_customers(text: str, repo) -> list[str] | None:
     return out
 
 
+def split_customers_named(text: str, repo) -> list[str]:
+    """Every customer the message names confidently, in order ('malik agro aur green valley dono ka khata' -> [C-001, C-003]);
+    an ambiguous name adds nobody."""
+    out: list[str] = []
+    for ch in [text] + _chunks(text):
+        c = customer_resolution(ch, repo)
+        for r in ([c, c.other] if c.ok else []):
+            if r is not None and getattr(r, "id", None) and r.id not in out:
+                out.append(r.id)
+    return out
+
+
+_PAYWORD = contains("diye", "diya", "di", "dia", "jama", "paid", "payment", "bheje", "bheja", "transfer", "wusool", "wasool", "received", "mile", "mila",
+                    "دیے", "دیا", "جمع")
+_KHATA_Q = contains("khata", "balance", "baqi", "baaki", "udhaar", "udhar", "outstanding", "hisaab", "hisab", "owe", "owes", "کھاتہ", "حساب", "باقی")
+
+
+def _kind(part: str, repo) -> str | None:
+    """What one piece of a message asks for, if it is complete on its own: 'payment' (a customer paid a stated sum),
+    'order' (a customer's order, every line read), 'khata' (a customer's balance); None otherwise."""
+    from munshi.llm.parse import amount_in
+    c = customer_resolution(part, repo)
+    if not c.ok or c.other is not None:
+        return None
+    op = analyse_order(part, repo)
+    if op.ready:
+        return "order"
+    if _PAYWORD(part) and not op.items and amount_in(part).amount is not None and not rev_intent(part):
+        return "payment"
+    if _KHATA_Q(part) and not op.items and not re.search(r"\d", part):
+        return "khata"
+    return None
+
+
+def split_intents(text: str, repo) -> list[tuple[str, str]] | None:
+    """[(kind, request)] when one message carries two DIFFERENT requests for one customer, each complete on its own
+    ('chaudhry farms ne 20000 diye aur 10 urea bhi chahiye unko' -> a payment and an order). The customer named first is
+    carried into a later part that names nobody. None when it is one request (or anything is unclear)."""
+    parts = [p.strip(" ,.") for p in re.split(r"\s+(?:aur|and|phir|,)\s+|,\s*(?:aur|and)?\s*", text) if p and p.strip(" ,.")]
+    if len(parts) < 2 or len(parts) > 3:
+        return None
+    first = customer_resolution(parts[0], repo)
+    if not first.ok or first.other is not None:
+        return None
+    out: list[tuple[str, str]] = []
+    for p in parts:
+        c = customer_resolution(p, repo)
+        if c.status == "none":
+            p = f"{p} {first.id}"
+        elif not c.ok or c.id != first.id:
+            return None
+        k = _kind(p, repo)
+        if k is None:
+            return None
+        out.append((k, p))
+    kinds = [k for k, _ in out]
+    return out if len(set(kinds)) == len(kinds) else None
+
+
 _BOTH = contains("dono", "donon", "both", "دونوں")
 
 
+_ASKS = re.compile(r"\b(kya|kia|kitna|kitni|kitne|kaun|kon|kaunse|konse|kahan|kab|which|what|how many|how much|who)\b|[?؟]|کیا|کتنا|کتنے|کون")
+
+
 def split_reads(text: str) -> list[str] | None:
-    """Two questions asked together ('X ka khata aur Y ka stock dono batao'): the two parts, each keeping the ask word."""
-    if not _BOTH(text):
+    """Two questions asked together ('X ka khata aur Y ka stock dono batao', 'kaun se orders nahi gaye aur kaun se stop khule
+    hein'): the two parts, each keeping the ask word."""
+    halves = re.split(r"\s+(?:aur|and|اور)\s+", text, maxsplit=1)
+    if not _BOTH(text) and not (len(halves) == 2 and all(_ASKS.search(fold(h)) and len(words(fold(h))) >= 3 for h in halves)):
         return None
     parts = [p for p in re.split(r"\s+(?:aur|and|اور)\s+", text, maxsplit=1)]
     if len(parts) != 2 or min(len(words(fold(p))) for p in parts) < 2:

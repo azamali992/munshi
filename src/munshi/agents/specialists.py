@@ -41,8 +41,9 @@ from munshi.llm.parse import (
     supplier_resolution,
     warehouses_in,
 )
-from munshi.llm.stub_model import NotUnderstood, Rule, StubToolCallingModel, contains, history, memo
+from munshi.llm.stub_model import NeedsRole, NotUnderstood, Rule, StubToolCallingModel, contains, history, memo, question_only
 from munshi.llm.text import fold, is_urdu, words
+from munshi.llm.turns import rev_intent, wrong_right
 from munshi.tools.core import MunshiTools
 from munshi.tools.langchain_tools import build_tools
 
@@ -87,7 +88,7 @@ def _supp(text, repo):
 
 
 def _amount(text):
-    return memo(("amt", text), lambda: amount_in(text))
+    return memo(("amt", text), lambda: amount_in(_without_ref(text)))
 
 
 def _sku(text, repo):
@@ -121,6 +122,8 @@ def _recent(pattern: str, key: str | None = None, lookback: int = 8) -> str:
 
 
 OPEN = ("draft", "confirmed", "allocated")
+# 'party naya he, usman traders khanewal, 0301-...': a customer not on the books yet
+NEW_PARTY = re.compile(r"\b(naya|nayi|naye|new)\b.{0,20}\b(party|customer|gahak|grahak|dukan|client)\b|\b(party|customer|gahak|client)\b.{0,15}\b(naya|nayi|new)\b")
 
 
 def orders_of(repo, cid: str, statuses=OPEN) -> list:
@@ -248,7 +251,8 @@ def build_order_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChat
         "driver": "You are the Order Munshi. Drivers cannot place orders; tell them to pass the request to the office.",
     }
     list_words = contains("orders", "order list", "list", "pending", "draft", "drafts", "dikhao", "dikha", "kaun se", "konse", "latest", "recent",
-                          "naye", "new orders", "aaj ke", "kitne", "bane", "aaye", "aye", "koi order", "koi orders", "order he", "order hai", "آرڈرز")
+                          "naye", "new orders", "aaj ke", "kitne", "bane", "aaye", "aye", "koi order", "koi orders", "order he", "order hai", "آرڈرز",
+                          "کتنے", "آئے", "دکھاؤ", "آج کے", "nahi gaye", "abhi tak")
     order_verb = contains("naya order", "new order", "order likho", "order likh", "order lo", "order le lo", "order dena", "order hai", "bhejna",
                           "bhejna hai", "maal bhejna", "order book", "book karo", "نیا آرڈر")
 
@@ -334,14 +338,19 @@ def build_order_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChat
 
     edit_ok = lambda t: (_edit(t) or {}).get("status") == "ok"  # noqa: E731
 
+    # 'rana brothers ka order pakka hua?' / 'order gaya?': a question about an order -- their orders, never a confirm card
+    order_q = lambda t: (question_only(t) and contains("order", "orders", "آرڈر")(t) and _cust(t, repo).ok and _cust(t, repo).other is None  # noqa: E731
+                         and not _order(t, repo).items)
     rules = [
+        Rule(order_q, "list_orders", lambda t: {"customer_id": _cust(t, repo).id}),
         Rule(lambda t: cancel_w(t) and bool(_order_ref(t, repo)), "cancel_order", lambda t: {"order_id": _order_ref(t, repo), "reason": t[:80]}),
         Rule(lambda t: confirm_w(t) and bool(_order_ref(t, repo, ("draft",))), "confirm_order", lambda t: {"order_id": _order_ref(t, repo, ("draft",))}),
         Rule(edit_ok, "update_order", lambda t: {"order_id": _edit(t)["order_id"], "items": _edit(t)["items"]}),
         Rule(lambda t: bool(ids_in(t, "ORD")) and _edit(t) is None, "get_order", lambda t: {"order_id": ids_in(t, "ORD")[0]}),
         Rule(_is_list, "list_orders", _list_args),
         Rule(lambda t: _KHATA(t) and bool(_customer_or_recent(t, repo)), "get_customer_khata", lambda t: {"customer_id": _customer_or_recent(t, repo)}),
-        Rule(lambda t: contains("rate", "price", "qeemat", "bhao", "قیمت", "ریٹ")(t) and bool(_sku(t, repo)), "search_products", lambda t: {"text": _sku(t, repo)}),
+        Rule(lambda t: contains("rate", "price", "qeemat", "bhao", "sku", "code", "قیمت", "ریٹ")(t) and bool(_sku(t, repo)), "search_products",
+             lambda t: {"text": _sku(t, repo)}),
         Rule(lambda t: _STOCKQ(t) and bool(_sku(t, repo)) and _cust(t, repo).status == "none" and not _order(t, repo).items, "get_stock",
              lambda t: {"sku": _sku(t, repo)}),
         Rule(lambda t: _order(t, repo).ready and _edit(t) is None, "create_order",
@@ -381,6 +390,14 @@ def build_order_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseChat
             return RP.ask_order(op, urdu) if (op.problems or op.unknown) else "Which product, and what should its quantity be? e.g. 'Rana Brothers ke order mei npk 15 kar do'."
         if MEM.asks_repeat(t) and not op.items and not op.problems:
             return _repeat_reply(t, urdu)
+        if NEW_PARTY.search(fold(t)) and op.customer.status == "none":
+            return RP.Ask("New customers are added in Customers -> Add customer (name, phone, route; the owner or a clerk) -- I can't add one from chat. "
+                          "Once they're added, send the order again, e.g. 'Usman Traders ko 100 urea'.", "customer")
+        if op.customer.status == "none" and op.items:
+            m = re.match(r"^\s*([A-Za-z][\w .'-]{2,40}?)\s+(?:ko|kou|for)\s+\d", t)
+            if m and not _sku(m.group(1), repo):
+                return RP.Ask(f"I don't have a customer called '{m.group(1).strip()}', so nothing was made. If they're new, add them in Customers -> "
+                              "Add customer, then send the order again -- or tell me the right name.", "customer")
         if order_verb(t) and op.customer.ok and not op.items and not op.problems:
             return RP.t("no_items", urdu)
         if repeat(t) and not op.items:
@@ -547,6 +564,50 @@ def build_godown_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCha
             return {"ok": {"route_id": rid, "vehicle_id": vid, "order_ids": ids, "plan_date": date_in(t) if re.search(r"\d{4}-\d{2}-\d{2}", t) else ""}}
         return memo(("plan", t), calc)
 
+    def _route_plan(t: str) -> dict | None:
+        """'multan north ka plan bana do (dusri gaari se)': {"ok": create_dispatch_plan args} with EVERY order reserved for that
+        route (at its godown, on no plan yet), in the route's stop order, on a free vehicle that fits -- the order list comes
+        from the books, never from a list someone (or a model) wrote. {"say": why/which} otherwise; None if not such a message."""
+        def calc():
+            if ids_in(t, "ORD") or not contains("plan", "dispatch", "gaari", "gari", "gaadi", "truck")(t) or not (
+                    contains("bana", "banao", "bana do", "bana den", "bana dein", "laga do", "tayyar", "tayar", "ready", "create", "make", "banado")(t)):
+                return None
+            f = fold(t)
+            hits = []
+            for r in repo.list_routes():
+                toks = [w for w in words(fold(r.name)) if w not in ("road", "route")]
+                n = sum(1 for w in toks if re.search(rf"(?<!\w){re.escape(w)}(?!\w)", f))
+                if toks and n == len(toks):
+                    hits.append(r)
+            partial = [r for r in repo.list_routes() if any(re.search(rf"(?<!\w){re.escape(w)}(?!\w)", f) for w in words(fold(r.name)) if w not in ("road", "route"))]
+            if len(hits) != 1:
+                if len(partial) > 1 and not hits:
+                    return {"say": RP.Ask("Which route -- " + " or ".join(r.name for r in partial[:3]) + "? Nothing was done yet.", "route")}
+                return None
+            route = hits[0]
+            on_plan = {s["order_id"] for s in repo._all("SELECT order_id FROM stops WHERE status='pending'")}
+            seq = {cid: k for k, cid in enumerate(route.stop_customer_ids)}
+            orders = [o for o in repo.list_orders("allocated", limit=200) if o.order_id not in on_plan and o.warehouse_id == route.warehouse_id
+                      and _route_of(o.customer_id) == route.route_id]
+            if not orders:
+                return {"say": f"No reserved (allocated) order is waiting for {route.name} -- confirm and allocate the orders first. Nothing was done."}
+            orders.sort(key=lambda o: (seq.get(o.customer_id, 99), o.created_at))
+            load = sum(o.load_units for o in orders)
+            named = [v for v in repo.list_vehicles() if re.search(rf"(?<![\w-]){re.escape(fold(v.plate))}(?![\w-])", f) or v.vehicle_id in ids_in(t, "V")]
+            from munshi.domain.models import business_today
+            busy = {p.vehicle_id for p in repo.list_plans(plan_date=business_today().isoformat()) if p.status in ("planned", "approved", "loaded")}
+            fit = named or sorted((v for v in repo.list_vehicles() if v.capacity_units >= load), key=lambda v: (v.vehicle_id in busy, v.capacity_units))
+            if not fit:
+                return {"say": f"No vehicle holds {load} units -- split the orders over two plans. Nothing was done."}
+            return {"ok": {"route_id": route.route_id, "vehicle_id": fit[0].vehicle_id, "order_ids": [o.order_id for o in orders], "plan_date": ""}}
+        return memo(("rplan", t), calc)
+
+    def _route_of(cid: str) -> str:
+        try:
+            return repo.get_customer(cid).route_id or ""
+        except Exception:
+            return ""
+
     def _load(t: str) -> dict | None:
         """{"ok": plan id} / {"say": which} for 'load / approve the plan': a DSP id, else the ONE plan waiting to load."""
         def calc():
@@ -628,10 +689,17 @@ def build_godown_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCha
              "adjust_stock", lambda t: _adjust(t)),
         Rule(ok_of(_alloc), "allocate_order", lambda t: _alloc(t)["ok"]),
         Rule(ok_of(_plan), "create_dispatch_plan", lambda t: _plan(t)["ok"]),
+        Rule(ok_of(_route_plan), "create_dispatch_plan", lambda t: _route_plan(t)["ok"]),
         Rule(lambda t: contains("dispatch", "suggest", "today", "aaj")(t) and not write_shaped(t) and not _all_stock(t)
-             and _plan(t) is None and _alloc(t) is None, "suggest_dispatch",
+             and _plan(t) is None and _alloc(t) is None and _route_plan(t) is None, "suggest_dispatch",
              lambda t: {"plan_date": (re.findall(r"\d{4}-\d{2}-\d{2}", t) or [""])[0]}),
-        Rule(lambda t: bool(_sku(t, repo)) and (_STOCKQ(t) or contains("godown", "گودام")(t)) and not write_shaped(t), "get_stock", lambda t: {"sku": _sku(t, repo)}),
+        Rule(lambda t: bool(_sku(t, repo)) and (_STOCKQ(t) or contains("godown", "گودام")(t) or bool(warehouses_in(t, repo)) or "?" in t) and not write_shaped(t),
+             "get_stock", lambda t: {"sku": _sku(t, repo)}),
+        # what is running low and needs ordering ('multan godown mei kya kya kam hai jo mangwana chahiye'): every product's stock,
+        # which answers._stock narrows to the low ones at the godown named
+        Rule(lambda t: not _sku(t, repo) and contains("kam", "low", "khatam", "reorder", "mangwana", "mangwa", "mangwani", "short", "کم")(t)
+             and (contains("stock", "maal", "kya kya", "kaun kaun", "kya", "which", "what", "godown", "اسٹاک")(t) or bool(warehouses_in(t, repo)))
+             and not write_shaped(t) and _cust(t, repo).status == "none", "get_stock", lambda t: {"sku": ""}),
         # a stock question about no one product: every product's stock ('stocks kitne baqi hein', 'aj ka stock count', 'for all the products?')
         Rule(lambda t: _all_stock(t) and not write_shaped(t), "get_stock", lambda t: {"sku": ""}),
         Rule(contains("confirmed", "allocated", "orders"), "list_orders", lambda t: {"status": "confirmed" if "confirmed" in t.lower() else "allocated"}),
@@ -639,7 +707,7 @@ def build_godown_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCha
 
     def fallback(t: str, system: str) -> str | None:
         urdu = is_urdu(t)
-        for fn in (_load, _alloc, _plan):
+        for fn in (_load, _alloc, _plan, _route_plan):
             said = (fn(t) or {}).get("say")
             if said and not (fn is _load and ids_in(t, "ORD")):
                 return said
@@ -679,7 +747,8 @@ def build_delivery_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseC
     T = build_tools(ops); B = _biz(repo)
     tools = [T["get_plan"], T["list_stops"], T["get_order"], T["close_stop"]]
     prompts = {r: f"You are the Delivery Munshi for {B}, on the driver's phone. Show the stops in order and close each one with what was delivered, what came back, cash taken, and the customer's OTP. Never close a stop without the OTP." for r in ROLES}
-    close_words = contains("close", "delivered", "deliver", "de diya", "diya", "band", "utar", "utar diya", "pohncha", "ڈیلیور", "دے دیا")
+    close_words = contains("close", "delivered", "deliver", "de diya", "diya", "de di", "di", "band", "utar", "utar diya", "utaar", "utaar di", "utari", "pohncha",
+                           "li", "le li", "liya", "ڈیلیور", "دے دیا")
 
     def _named_stop(t: str):
         """The stop a message means by the customer's name ('chaudhry farms pe maal de diya'): their one open stop today."""
@@ -695,7 +764,7 @@ def build_delivery_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseC
         return memo(("close", t), lambda: analyse_close(f"{t} {st.stop_id}" if st else t, repo))
 
     about_stop = contains("kitne paise", "kitna paisa", "paise lene", "kitne lene", "kitna lena", "raqam", "amount", "collect", "address", "pata", "kahan",
-                          "location", "kya dena", "kitna dena", "bill kitna", "kya maal", "items", "maal kya", "پتہ", "پیسے")
+                          "location", "kya dena", "kitna dena", "bill kitna", "kya maal", "items", "maal kya", "number", "phone", "contact", "پتہ", "پیسے", "فون")
 
     def _close_args(t: str) -> dict:
         c = _close(t)
@@ -715,8 +784,34 @@ def build_delivery_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseC
         from munshi.domain.models import business_today
         return [p for p in repo.list_plans(plan_date=business_today().isoformat()) if p.status in ("approved", "loaded")]
 
-    next_words = contains("agla", "next", "kahan", "stops", "stop", "plan", "aaj", "mera", "اگلا", "اسٹاپ")
+    def _all_runs(plans: list, cash: bool) -> str:
+        """Every run loaded today, by gaari (the app doesn't know which gaari a driver is on): its open stops, or -- for a
+        cash question -- what each run has collected. Read from the books; no codes."""
+        from munshi.llm.answers import rs
+        parts, total = [], 0.0
+        for p in plans:
+            try:
+                plate, route = repo.get_vehicle(p.vehicle_id).plate, repo.get_route(p.route_id).name
+            except Exception:
+                plate, route = p.vehicle_id, p.route_id
+            stops = repo.list_stops(p.plan_id)
+            if cash:
+                got = sum(float(s.cash_collected or 0) for s in stops)
+                total += got
+                parts.append(f"{plate} ({route}): {rs(got)}")
+                continue
+            open_ = [s for s in stops if s.status == "pending"]
+            names = ", ".join(f"{k}. {repo.get_customer(s.customer_id).name}" for k, s in enumerate(open_, 1)) or "no open stop"
+            parts.append(f"{plate} ({route}): {names}")
+        if cash:
+            return f"Cash collected today: {rs(total)} -- " + "; ".join(parts) + ". Hand it in at the office."
+        return f"Today's {len(plans)} runs -- " + "; ".join(parts) + ". Ask about a customer by name for the address and the bill."
+
+    next_words = contains("agla", "next", "kahan", "kidhar", "jana", "stops", "stop", "plan", "aaj", "mera", "اگلا", "اسٹاپ")
+    # the driver's cash on this run ('total kitna cash he mere paas'): the stops, with what each paid (answers._stops totals it)
+    cash_q = lambda t: bool(re.search(r"\b(cash|paise|paisay|raqam)\b", fold(t))) and bool(re.search(r"\b(total|kul|mere paas|mere pas|jama karwana|ab tak)\b", fold(t)))  # noqa: E731
     rules = [
+        Rule(lambda t: cash_q(t) and not ids_in(t, "STP") and len(_todays_plans()) == 1, "list_stops", lambda t: {"plan_id": _todays_plans()[0].plan_id}),
         Rule(lambda t: close_words(t) and bool(ids_in(t, "STP") or _named_stop(t)) and not _close(t).problems, "close_stop", _close_args),
         # the amount to collect / the address at a customer's stop today: that plan's stops (the reply picks out theirs)
         Rule(lambda t: about_stop(t) and _named_stop(t) is not None and not close_words(t), "list_stops", lambda t: {"plan_id": _named_stop(t).plan_id}),
@@ -739,18 +834,18 @@ def build_delivery_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseC
             if probs:
                 txt = f"To close {stop} I need {probs[0]}. e.g. 'close {stop} delivered all, cash 50000, otp 1234'."
                 return RP.Ask(txt, "otp") if probs == ["the customer's OTP code"] else txt
-        if next_words(t) and not stop:
+        if (next_words(t) or cash_q(t)) and not stop:
             plans = _todays_plans()
             if not plans:
                 return "No dispatch plan is loaded for today yet -- ask the office."
             if len(plans) > 1:
-                opts = ", ".join(f"{p.plan_id} ({p.vehicle_id}, {p.route_id})" for p in plans)
-                return f"Which vehicle are you on? Today's plans: {opts}. Send 'stops for DSP-...'."
+                return _all_runs(plans, cash_q(t))
         if contains("close", "band", "otp")(t) and not stop:
-            return "I close one stop at a time, each with its own customer's OTP. Which stop? Send 'close STP-... delivered all, cash 50000, otp 1234'."
+            return "I close one stop at a time, each with its own customer's code. Which customer? e.g. 'Chaudhry Farms pe sab de diya, cash 50000, code 1234'."
         return _urdu_didnt(t)
 
-    m = _model(model, rules, "Tell me the plan ID to see stops, or close a stop: 'close STP-XXXX delivered all, cash 50000, OTP 1234'.", (), fallback)
+    m = _model(model, rules, "Ask 'aaj kahan kahan jana hai' for today's stops, or close one with the customer's code: "
+                             "'Chaudhry Farms pe sab de diya, cash 50000, code 1234'.", (), fallback)
     return build_specialist("delivery", "Delivery Munshi", m, {"owner": tools, "clerk": tools, "salesman": [], "driver": tools}, prompts, checkpointer, repo=repo, guarded=guarded)
 
 
@@ -760,6 +855,76 @@ _EXPENSE_CATS = (("fuel", ("diesel", "petrol", "fuel", "cng")), ("salary", ("sal
                  ("repair", ("repair", "tyre", "tire", "puncture", "mistri", "marammat", "مرمت")),
                  ("loading", ("mazdoor", "mazdoori", "labour", "labor", "loading", "palledar")),
                  ("food", ("khana", "lunch", "food", "chai", "chai pani")))
+
+
+_METHOD_KEY = {"cash": "cash", "bank": "bank", "online": "bank", "transfer": "bank", "jazzcash": "jazzcash", "easypaisa": "easypaisa", "cheque": "cheque", "check": "cheque"}
+_METHOD_WORD = {"cash": "cash", "bank": "bank", "jazzcash": "JazzCash", "easypaisa": "Easypaisa", "cheque": "cheque"}
+
+
+_CHEQUE_NO = re.compile(r"(?i)\b(cheque|check|chq|chek|tid|trx|txn|ref)\s*(no\.?|number|nmbr|#|:)?\s*([A-Za-z]{0,4}\d[A-Za-z0-9-]{2,})")
+
+
+def _ref_match(t: str):
+    """The cheque / transaction number in the message: after 'no' / '#', or -- with no marker -- only when the message
+    still states an amount without it ('5 lakh ka cheque ..., MCB cheque 22871'); 'cheque 50000 ka' is the amount."""
+    for m in _CHEQUE_NO.finditer(t):
+        if m.group(2) or amount_in(t[:m.start()] + " " + t[m.end():]).amount is not None:
+            return m
+    return None
+
+
+def _pay_ref(t: str) -> str:
+    """A payment's reference: the cheque / transaction number when one is given ('HBL cheque no 004512' -> 'cheque 004512
+    (HBL)', so a bounce can later be matched by number), else the message itself."""
+    m = _ref_match(t)
+    bank = re.search(r"\b(HBL|UBL|MCB|ABL|NBP|Meezan|Allied|Faysal|Askari|Alfalah|BOP|JS)\b", t, re.I)
+    if m:
+        return f"{m.group(1).lower()} {m.group(3)}" + (f" ({bank.group(1).upper()})" if bank else "")
+    return t[:60]
+
+
+def _without_ref(t: str) -> str:
+    """The message with its cheque / transaction number taken out, so that number is never read as the amount."""
+    m = _ref_match(t)
+    return (t[:m.start()] + " " + t[m.end():]) if m else t
+
+
+def _method_key(m) -> str:
+    return _METHOD_KEY.get(str(m or "cash").lower(), "cash")
+
+
+def _method_word(m) -> str:
+    return _METHOD_WORD.get(_method_key(m), str(m or "cash"))
+
+
+def _method_said(t: str) -> str:
+    """The payment method the message names explicitly ('' when it names none -- never the 'cash' default)."""
+    from munshi.llm.answers import _method_asked
+    return _method_asked(t)
+
+
+def receipts_meant(t: str, cid: str, repo) -> tuple[list, float | None, str, float | None]:
+    """(the customer's receipts a reversal message can mean, the amount it names, the method it names, the right amount of a
+    correction). Receipts not reversed yet, narrowed by the amount (the WRONG one in '20000 nahi 12000'), the method ('cash',
+    a bounced cheque) and 'aaj'. The rules and the model guard both read a reversal with this -- the same receipt, or a question."""
+    clean = re.sub(r"(?i)\b(cheque|check|chq)\s*(no\.?|number|#)\s*\d+", " ", t)
+    old, new = wrong_right(clean)
+    amt = old if old is not None else amount_in(clean).amount
+    how = "cheque" if is_bounce(t) else _method_said(t)
+    pays = [e for e in repo.ledger_for(cid) if e.kind == "payment" and e.amount < 0 and not e.reversal_of and not repo.reversal_of_ledger(e.entry_id)]
+    if how:
+        pays = [e for e in pays if _method_key(e.method) == how]
+    if amt is not None:
+        pays = [e for e in pays if abs(-e.amount - amt) < 0.01]
+    if contains("aaj", "aj", "today", "آج")(t):
+        from munshi.domain.models import business_today, to_business_date
+        pays = [e for e in pays if to_business_date(e.created_at) == business_today()]
+    return pays, amt, how, new
+
+
+def _day(iso) -> str:
+    from munshi.llm.answers import _day as day
+    return day(iso)
 
 
 def _expense_category(t: str) -> str:
@@ -779,7 +944,8 @@ def build_hisaab_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCha
     }
     pay_words = contains("paid", "payment", "received", "diye", "diya", "di", "jama", "transfer", "jazzcash", "jazz cash", "easypaisa", "easy paisa", "cheque",
                          "check", "bank", "cash", "bheje", "bheja", "dale", "daale", "mile", "mila", "aaya", "aaye", "aayi", "wasool", "vasool",
-                         "wusool", "raqam", "de gaya", "de gya", "de gaye", "de ke gaya", "de kar gaya", "جمع", "ادائیگی", "بینک", "وصول")
+                         "wusool", "raqam", "de gaya", "de gya", "de gaye", "de ke gaya", "de kar gaya", "جمع", "ادائیگی", "بینک", "وصول", "دیے", "دیا", "دی", "نقد",
+                         "کیش", "چیک")
     expense_words = contains("expense", "kharcha", "kharch", "diesel", "petrol", "fuel", "salary", "tankhwah", "rent", "kiraya", "bijli", "repair",
                              "mazdoor", "mazdoori", "labour", "tyre", "puncture", "marammat", "chai", "chai pani", "خرچہ", "مرمت")
     credit_words = contains("credit note", "credit", "refund", "waive", "maaf", "chhoot", "chhot", "choot", "chut", "riayat", "riyayat", "رعایت", "چھوٹ")
@@ -787,33 +953,44 @@ def build_hisaab_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCha
                       "cash short", "short tha", "kitna short", "cash kam", "kharche", "kharchay", "kharchey", "kharcha kitna", "kharche kitne", "expenses today",
                       "aaj ke kharche", "aaj ka kharcha", "kitna kharcha", "kitne kharche", "خرچے")
 
-    def _bounced(t: str) -> dict | None:
-        """The receipt a 'X ka cheque bounce ho gaya' means: the customer's ONE cheque receipt (of that amount, when one is
-        said) that hasn't been reversed. {"ok": entry id} or {"say": why / which}."""
-        def calc():
-            c = _cust(t, repo)
-            if not is_bounce(t) or not c.ok or c.other is not None or _khata_ids(t, repo):
-                return None
-            amt = amount_in(re.sub(r"(?i)\b(cheque|check|chq)\s*(no\.?|number|#)\s*\d+", " ", t)).amount
-            pays = [e for e in repo.ledger_for(c.id or "") if e.kind == "payment" and e.amount < 0 and not e.reversal_of
-                    and (e.method or "") == "cheque" and not repo.reversal_of_ledger(e.entry_id)]
-            if amt is not None:
-                pays = [e for e in pays if abs(-e.amount - amt) < 0.01]
-            if len(pays) == 1:
-                return {"ok": pays[0].entry_id}
-            if not pays:
-                return {"say": f"I can't find a cheque receipt from {c.name}" + (f" for Rs {amt:,.0f}" if amt else "") + " that could be reversed. Nothing was done."}
-            rows = " ".join(f"{k}) {e.entry_id} Rs {-e.amount:,.0f} ({str(e.created_at)[:10]})" for k, e in enumerate(pays[:5], 1))
-            return {"say": f"{c.name} has {len(pays)} cheque receipts -- which one bounced? {rows}. Say e.g. '{pays[0].entry_id} cheque bounce, reverse karo'."}
-        return memo(("bounced", t), calc)
+    def _rev_intent(t: str) -> bool:
+        """Undo a payment already recorded -- 'X ki 20000 wali payment reverse karo', 'cheque bounce ho gaya', 'galat entry thi,
+        cancel kar do', '20000 nahi 12000 thi' -- never a NEW payment. (A receipt named by its number is the plain rule's.)"""
+        return memo(("revint", t), lambda: rev_intent(t, repo))
 
-    def _pay_ref(t: str) -> str:
-        """A payment's reference: the cheque / transaction number when one is given, else the message itself."""
-        m = re.search(r"(?i)\b(cheque|check|chq|chek|tid|trx|txn|ref)\s*(?:no\.?|number|#|:)?\s*([A-Za-z0-9-]{3,})", t)
-        bank = re.search(r"\b(HBL|UBL|MCB|ABL|NBP|Meezan|Allied|Faysal|Askari|Alfalah|BOP|JS)\b", t, re.I)
-        if m:
-            return f"{m.group(1).lower()} {m.group(2)}" + (f" ({bank.group(1).upper()})" if bank else "")
-        return t[:60]
+    def _reversal(t: str) -> dict | None:
+        """The receipt a reversal means: the customer's receipts that haven't been reversed, narrowed by the amount (the
+        WRONG one in a correction), the method and 'aaj' when the message says them. {"ok": entry id, "new": the right
+        amount of a correction, "method"} / {"say": why none} / {"ask": which, as a numbered question}."""
+        def calc():
+            if not _rev_intent(t):
+                return None
+            c = _cust(t, repo)
+            if c.status == "ambiguous" or (c.ok and c.other is not None):
+                return {"say": RP.ask_customer(c) if c.status == "ambiguous" else RP.t("two_customers", False, a=c.name, b=c.other.name)}
+            if not c.ok:
+                return {"say": RP.Ask("Whose payment should be reversed? Name the customer, e.g. 'Chaudhry Farms ki 20000 wali payment reverse karo'.", "customer")}
+            pays, amt, how, new = receipts_meant(t, c.id or "", repo)
+            label = lambda e: f"Rs {-e.amount:,.0f} {_method_word(e.method)}, {_day(e.created_at)}"  # noqa: E731
+            if len(pays) == 1:
+                return {"ok": pays[0].entry_id, "new": new, "method": pays[0].method or "cash", "customer": c.name}
+            what = " ".join(x for x in (f"Rs {amt:,.0f}" if amt is not None else "", how, "receipt" if not how else "receipt") if x)
+            if not pays:
+                return {"say": f"I can't find a {what} from {c.name}" + (" today" if contains("aaj", "aj", "today")(t) else "")
+                               + " that could still be reversed, so nothing was done. Which payment did you mean -- how much, and when?"}
+            pays = sorted(pays, key=lambda e: e.created_at)[-5:]
+            rows = "; ".join(f"{k}) {label(e)}" for k, e in enumerate(pays, 1))
+            return {"ask": RP.Ask(f"{c.name} has {len(pays)} receipts that could be reversed -- which one? {rows}. Reply 'pehla', 'doosra' or the amount "
+                                  f"(e.g. '{-pays[-1].amount:,.0f} wali'). Nothing was done yet.", "entry",
+                                  [{"id": e.entry_id, "name": label(e), "amount": -e.amount} for e in pays])}
+        return memo(("reversal", t), calc)
+
+    def _rev_extra(t: str) -> str:
+        r = _reversal(t) or {}
+        new = r.get("new")
+        if not new:
+            return ""
+        return f"Once the owner has reversed it, send the right amount, e.g. '{r.get('customer')} ne {new:,.0f} {r.get('method') or 'cash'} diye'."
 
     def _one_customer(t):
         r = _cust(t, repo)
@@ -853,8 +1030,10 @@ def build_hisaab_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCha
 
     rules = [
         Rule(lambda t: _REVERSE(t) and bool(ids_in(t, "EXP")), "reverse_expense", lambda t: {"expense_id": ids_in(t, "EXP")[0], "reason": t[:120]}),
-        Rule(lambda t: _REVERSE(t) and bool(_khata_ids(t, repo)), "reverse_ledger_entry", lambda t: {"entry_id": _khata_ids(t, repo)[0], "reason": t[:120]}),
-        Rule(lambda t: "ok" in (_bounced(t) or {}), "reverse_ledger_entry", lambda t: {"entry_id": _bounced(t)["ok"], "reason": t[:120]}),
+        Rule(lambda t: (_REVERSE(t) or _rev_intent(t)) and bool(_khata_ids(t, repo)), "reverse_ledger_entry",
+             lambda t: {"entry_id": _khata_ids(t, repo)[0], "reason": t[:120]}),
+        # 'X ki 20000 wali payment reverse karo' / 'cheque bounce' / 'galat entry thi': the matching receipt, reversed (owner card)
+        Rule(lambda t: "ok" in (_reversal(t) or {}), "reverse_ledger_entry", lambda t: {"entry_id": _reversal(t)["ok"], "reason": t[:120]}),
         Rule(lambda t: credit_words(t) and _one_customer(t) and _amt_ok(t), "credit_note",
              lambda t: {"customer_id": _cust(t, repo).id, "amount": _amount(t).amount, "reason": t[:80]}),
         Rule(lambda t: contains("deposit", "handed", "counted", "jama")(t) and bool(ids_in(t, "DSP")) and _deposit_amount(t).amount is not None, "record_deposit",
@@ -865,7 +1044,7 @@ def build_hisaab_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCha
              lambda t: {"plan_id": _run_of(t), "amount_counted": _amount(t).amount, "counted_by": "cashier"}),
         Rule(lambda t: expense_words(t) and not _cust(t, repo).ok and _amt_ok(t), "record_expense",
              lambda t: {"category": _expense_category(t), "amount": _amount(t).amount, "note": t[:80], "method": method_in(t)}),
-        Rule(lambda t: pay_words(t) and not is_bounce(t) and not credit_words(t) and _one_customer(t) and _amt_ok(t), "record_payment",
+        Rule(lambda t: pay_words(t) and not is_bounce(t) and not _rev_intent(t) and not credit_words(t) and _one_customer(t) and _amt_ok(t), "record_payment",
              lambda t: {"customer_id": _cust(t, repo).id, "amount": _amount(t).amount, "method": method_in(t), "ref": _pay_ref(t)}),
         Rule(lambda t: cash_q(t) and not _cust(t, repo).ok, "cashbook", lambda t: {"day": (re.findall(r"\d{4}-\d{2}-\d{2}", t) or [""])[0]}),
         Rule(lambda t: _KHATA(t) and not credit_words(t) and bool(_customer_or_recent(t, repo)), "get_customer_khata",
@@ -875,8 +1054,16 @@ def build_hisaab_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCha
 
     def fallback(t: str, system: str) -> str | None:
         urdu = is_urdu(t)
-        if (_bounced(t) or {}).get("say"):
-            return _bounced(t)["say"]
+        if _rev_intent(t) and not _khata_ids(t, repo):
+            if "need the owner" in system:          # a clerk: reversals are the owner's -- passed on, with what to do next
+                return NeedsRole("Reversals need the owner's approval.", "reverse_ledger_entry", _rev_extra(t))
+            rv = _reversal(t) or {}
+            if rv.get("ask") or rv.get("say"):
+                return rv.get("ask") or rv.get("say")
+        if (_REVERSE(t) or _rev_intent(t)) and _khata_ids(t, repo) and "need the owner" in system:
+            return NeedsRole("Reversals need the owner's approval.", "reverse_ledger_entry")
+        if credit_words(t) and "need the owner" in system:
+            return NeedsRole("Credit notes need the owner's approval.", "credit_note")
         if is_bounce(t):
             return RP.t("bounce", urdu)
         r = _cust(t, repo)
@@ -918,7 +1105,10 @@ def build_khareed_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCh
         "driver": "You are the Khareed Munshi. Drivers don't handle purchases.",
     }
     default_wh = repo.default_warehouse_id() if repo.list_warehouses() else ""
-    pay = lambda t: contains("pay", "paid", "payment", "de do", "dedo", "de dein", "transfer", "ada", "ادائیگی")(t) and not contains("received", "aaya", "aayi", "aaye")(t)  # noqa: E731
+    pay = lambda t: contains("pay", "paid", "payment", "de do", "dedo", "de dein", "de diya", "de diye", "de di", "diye", "diya", "transfer", "ada",  # noqa: E731
+                             "ادائیگی", "دے دیے", "دیے")(t) and not contains("received", "aaya", "aayi", "aaye")(t)
+    # 'Remind me what we paid Fauji last' / 'fauji ko aakhri payment kab ki': their account, never a new payment
+    asks_last = lambda t: contains("last", "pichli", "pichla", "aakhri", "akhri", "previous", "kab", "when", "remind me", "kitna diya", "kitne diye")(t)  # noqa: E731
     arrived = contains("received", "purchase", "bought", "khareed", "aaya", "aayi", "aaye", "aai", "aya", "ayi", "aye", "ayein", "aayein", "aaein", "arrived", "stock in",
                        "aa gaya", "aa gaye", "aa gayi", "آئی", "آیا", "آئے")
 
@@ -940,8 +1130,9 @@ def build_khareed_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCh
         Rule(lambda t: _REVERSE(t) and bool(ids_in(t, "PUR")), "reverse_purchase", lambda t: {"purchase_id": ids_in(t, "PUR")[0], "reason": t[:120]}),
         Rule(lambda t: _REVERSE(t) and bool(ids_in(t, "SPY") + ids_in(t, "BIL")), "reverse_supplier_entry",
              lambda t: {"entry_id": (ids_in(t, "SPY") + ids_in(t, "BIL"))[0], "reason": t[:120]}),
+        Rule(lambda t: pay(t) and asks_last(t) and _supp(t, repo).ok and _amount(t).amount is None, "supplier_khata", lambda t: {"supplier_id": _supp(t, repo).id}),
         Rule(lambda t: pay(t) and _supp(t, repo).ok and _amount(t).amount is not None, "pay_supplier",
-             lambda t: {"supplier_id": _supp(t, repo).id, "amount": _amount(t).amount, "method": method_in(t), "ref": t[:60]}),
+             lambda t: {"supplier_id": _supp(t, repo).id, "amount": _amount(t).amount, "method": method_in(t), "ref": _pay_ref(t)}),
         Rule(lambda t: arrived(t) and _purchase_ready(t), "record_purchase", _purchase_args),
         Rule(lambda t: _supp(t, repo).ok and contains("hisaab", "hisab", "khata", "balance", "account", "dena", "kitna", "owe", "حساب")(t), "supplier_khata",
              lambda t: {"supplier_id": _supp(t, repo).id}),
@@ -1028,13 +1219,16 @@ def build_wasooli_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCh
         Rule(lambda t: send_w(t) and not draft_w(t) and bool(_drafted_rem(t)), "send_reminder", lambda t: {"reminder_id": _drafted_rem(t)}),
         Rule(lambda t: contains("remind", "reminder", "yaad", "yaad dehani", "یاد دہانی")(t) and _cust(t, repo).ok, "draft_reminder",
              lambda t: {"customer_id": _cust(t, repo).id, "tier": _tier(t)}),
-        Rule(lambda t: contains("remind", "reminders", "collections", "chase", "wasooli")(t) and _cust(t, repo).status == "none"
-             and not contains("list", "لسٹ", "kis kis", "kaun kaun", "kon kon", "who", "report")(t),
+        # a reminder for EVERY overdue customer is a bulk write: only on an explicit bulk instruction ('sab ko reminder bhejo',
+        # 'remind everyone over 30 days') -- 'scene kya he wasooli ka' is a question about collections (the aging list below)
+        Rule(lambda t: contains("remind", "reminder", "reminders", "yaad dehani", "yaad dila", "yaad dilao", "chase", "یاد دہانی")(t)
+             and contains("everyone", "everybody", "all", "sab", "sabko", "sab ko", "sabhi", "saare", "sare", "har", "tamam", "overdue", "سب")(t)
+             and _cust(t, repo).status == "none" and not contains("list", "لسٹ", "kis kis", "kaun kaun", "kon kon", "who", "report")(t),
              "draft_due_reminders", lambda t: {"min_days_overdue": max(1, int_in(t) or 1)}),
         Rule(lambda t: _KHATA(t) and _cust(t, repo).ok, "get_customer_khata", lambda t: {"customer_id": _cust(t, repo).id}),
         Rule(lambda t: bool(re.search(r"sab se (zyada|ziada|zaida)|\b(most|largest|biggest)\b", fold(t))) and _cust(t, repo).status == "none",
              "aging_report", lambda t: {}),
-        Rule(contains("aging", "overdue", "receivable", "receivables", "who owes", "baqi", "owes", "kis kis", "kaun kaun", "kon kon", "udhaar", "udhar",
+        Rule(contains("aging", "overdue", "receivable", "receivables", "who owes", "baqi", "owes", "terms", "credit terms", "exposure", "past due", "kis kis", "kaun kaun", "kon kon", "udhaar", "udhar",
                       "dene", "dena", "lene", "lena", "paise", "kitne paise", "list", "wasooli", "collections", "report", "وصولی", "لسٹ", "ادھار", "پیسے"),
              "aging_report", lambda t: {}),
     ]
@@ -1074,12 +1268,18 @@ def build_report_munshi(ops: MunshiTools, repo: MunshiRepository, model: BaseCha
         return {"start": s, "end": e}
 
     rules = [
+        # margin BY PRODUCT ('which products are making us the most margin?'): the sales report's product lines
+        Rule(lambda t: contains("margin", "munafa", "profit", "منافع")(t) and contains("product", "products", "item", "items", "cheez", "cheezen", "maal",
+                                                                                    "kis cheez", "konsi", "kaunsi")(t), "sales_report", _range),
         Rule(contains("profit", "munafa", "net", "margin", "kamaya", "kamai", "kamaaya", "منافع"), "profit_summary", _range),
         Rule(contains("best seller", "best selling", "bikne wali", "bikne wala", "zyada bika", "zyada biki", "bikta", "bikti"), "sales_report", _range),
         Rule(lambda t: bool(re.search(r"sab se (zyada|ziada|zaida)\b.{0,30}\b(kis|kaun|kon)\b.{0,25}\b(ne|khareed\w*|kharid\w*|liya|lia)\b", fold(t))),
              "top_customers", lambda t: {"days": 30}),
         Rule(contains("collection", "collections", "collected", "recovery", "payment", "payments", "paid", "wasooli", "ادائیگی", "جمع", "وصولی"),
              "collection_report", _range),
+        # 'bank mei kitna aya aaj': what came in, by that method (answers._payments_block reads the method from the question)
+        Rule(lambda t: contains("bank", "online", "jazzcash", "jazz cash", "easypaisa", "easy paisa", "cheque", "cash", "بینک")(t)
+             and contains("aya", "aaya", "aaye", "aye", "aayi", "ayi", "mila", "mile", "kitna", "kitne", "came", "received", "آیا")(t), "collection_report", _range),
         Rule(contains("valuation", "worth", "stock value", "value"), "stock_valuation", lambda t: {}),
         Rule(contains("slow", "dead stock", "not selling", "nahi bik", "bik nahi"), "slow_stock", lambda t: {"days": int_in(t) or 30}),
         Rule(lambda t: contains("top customers", "best customers", "top")(t) or bool(re.search(r"sab se (zyada|ziada|zaida) kaun|sab se (zyada|ziada|zaida)\b.{0,20}\b(kis ne|kisne|kaun|kon)\b", fold(t))), "top_customers",
