@@ -90,7 +90,17 @@ function countTab(body, acc, write, owner) {
 // ---------------------------------------------------------------- bank reconciliation
 async function reconcileTab(body, acc, write) {
   let sd = todayPk();
-  const load = async () => api(`/api/accounts/${encodeURIComponent(acc.account_id)}/reconciliation?statement_date=${sd}`);
+  // GET /api/accounts/{id}/reconciliation answers only what is still uncleared, split by direction (unsigned
+  // amounts, no `doc`: the document reference is `source_id`) -- normalise it to the unified, signed, tickable
+  // list this screen ticks off (an item disappears from the server's lists once /clear marks it cleared; it stays
+  // in the on-screen list, ticked, until the date or account changes and the screen reloads).
+  const load = async () => {
+    const raw = await api(`/api/accounts/${encodeURIComponent(acc.account_id)}/reconciliation?statement_date=${sd}`);
+    const items = [...(raw.uncleared_in || []).map(x => ({ ...x, doc: x.source_id, amount: x.amount, cleared: false })),
+                   ...(raw.uncleared_out || []).map(x => ({ ...x, doc: x.source_id, amount: -x.amount, cleared: false }))]
+      .sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+    return { ...raw, book_balance: raw.book, items };
+  };
   let r = await load();
   sd = r.statement_date || sd;
   body.innerHTML = `<div class="o-recon"><div style="display:grid;gap:10px;min-width:0">

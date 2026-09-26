@@ -215,7 +215,7 @@ async def owner_console(browser, w, h, tag, state, full=True):
     await go(page, "#/accounts/ACC-HBL/reconcile", "#rt tbody tr")
     await page.fill("#sb", "490000"); await page.wait_for_timeout(100)
     check("off" in (await page.get_attribute(".o-diff .meter", "class") or ""), "difference not zero before ticking")
-    for i in range(1, 5):   # tick all but the uncleared salary payment
+    for i in range(0, 4):   # rows are sorted by date; tick all but the uncleared salary payment (last, 09-30)
         await page.locator("#rt [data-i]").nth(i).check(); await page.wait_for_timeout(120)
     await page.wait_for_timeout(300)
     check("zero" in (await page.get_attribute(".o-diff .meter", "class") or ""), "difference reaches 0.00")

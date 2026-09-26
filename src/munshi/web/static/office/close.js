@@ -3,25 +3,29 @@
    trial balance balanced), Close with a confirm that restates what a close means, and Reopen with a reason.
    Closing through D makes the database refuse any expense, journal, transfer, payroll or advance dated on or before D;
    reports for a closed month come from its snapshot. The server decides; this screen explains.
-   REST (plan §9 Stream B): GET /api/finance/periods, POST /api/finance/periods/close, POST /api/finance/periods/{id}/reopen. */
-import { $, $$, api, check, confirmDialog, esc, field, fmtCell, post, refresh, skeleton, t, toast, when } from './lib.js';
+   REST (plan §9 Stream B): GET /api/finance/periods (with the checklist for the suggested date),
+   GET /api/finance/periods/checklist?through=D, POST /api/finance/periods/close, POST /api/finance/periods/{id}/reopen. */
+import { $, $$, api, check, confirmDialog, esc, field, fmtCell, monthEnd, post, refresh, shiftPeriod, skeleton, t, thisPeriod, toast, when } from './lib.js';
 
-export default async function close(view) {
+export default async function close(view, through = null) {
   view.header(t('cl.close'), t('loading'));
   view.page.innerHTML = skeleton(8, 3);
   const p = await api('/api/finance/periods');
+  const chosen = through || p.suggested_through || monthEnd(shiftPeriod(thisPeriod(), -1));
+  // the server computes the checklist for the date being closed; a date the owner picks gets its own
+  if (through && through !== p.suggested_through) p.checklist = (await api(`/api/finance/periods/checklist?through=${encodeURIComponent(through)}`)).checklist;
   const checklist = p.checklist || [], open = checklist.filter(c => !c.ok);
   const closes = p.closes || [];
   const latest = closes.find(c => !c.reopened_at);
-  view.header(t('cl.close'), esc(t('cl.sub', { d: fmtCell(p.through_date, 'date') })));
+  view.header(t('cl.close'), esc(t('cl.sub', { d: fmtCell(p.locked_through, 'date') })));
   view.page.innerHTML = `
-    <div class="o-kpis"><div class="o-kpi"><div class="k">${esc(t('cl.closed_through'))}</div><div class="v">${fmtCell(p.through_date, 'date') || '—'}</div><div class="s">${esc(t('cl.closed_s'))}</div></div>
-      <div class="o-kpi"><div class="k">${esc(t('cl.checklist'))}</div><div class="v">${checklist.length - open.length}<span class="dim">/${checklist.length}</span></div><div class="s">${esc(open.length ? t('cl.open_items', { n: open.length }) : t('cl.all_green'))}</div></div></div>
+    <div class="o-kpis"><div class="o-kpi"><div class="k">${esc(t('cl.closed_through'))}</div><div class="v">${fmtCell(p.locked_through, 'date') || '—'}</div><div class="s">${esc(t('cl.closed_s'))}</div></div>
+      <div class="o-kpi"><div class="k">${esc(t('cl.checklist'))}</div><div class="v">${checklist.length ? `${checklist.length - open.length}<span class="dim">/${checklist.length}</span>` : '—'}</div><div class="s">${esc(!checklist.length ? t('cl.no_checklist') : open.length ? t('cl.open_items', { n: open.length }) : t('cl.all_green'))}</div></div></div>
     <div class="o-cols"><section style="display:grid;gap:8px"><h3 style="margin:0">${esc(t('cl.before'))}</h3>
       <ul class="o-check">${checklist.map(c => `<li class="${c.ok ? 'ok' : 'no'}"><span class="ic" aria-hidden="true">${c.ok ? '✓' : '!'}</span><span><b>${esc(c.label)}</b><br><span class="d">${esc(c.detail || '')}</span></span>
         <span class="pill ${c.ok ? 'good' : 'warn'}">${esc(c.ok ? t('cl.done') : t('cl.not_yet'))}</span></li>`).join('') || `<li><span></span><span class="dim">${esc(t('cl.no_checklist'))}</span><span></span></li>`}</ul></section>
     <form class="o-card" id="cf" style="display:grid;gap:10px" novalidate><b>${esc(t('cl.close_month'))}</b>
-      ${field(t('cl.through'), 'through_date', p.suggested_through || '', 'required', 'date')}
+      ${field(t('cl.through'), 'through_date', chosen, 'required', 'date')}
       ${field(t('cl.note'), 'note', '', 'maxlength="200" placeholder="September books checked"')}
       ${open.length ? `<p class="o-note warn">${esc(t('cl.open_warn', { n: open.length }))}</p>${check(t('cl.force'), 'force', false)}` : ''}
       <p class="formerr" role="alert"></p><div class="o-bar"><div class="grow"></div><button class="btn primary" type="submit">${esc(t('cl.close_btn'))}</button></div></form></div>
@@ -32,6 +36,7 @@ export default async function close(view) {
       <td class="n">${c === latest ? `<button type="button" class="btn sm danger" data-reopen="${esc(c.close_id)}">${esc(t('cl.reopen'))}</button>` : ''}</td></tr>`).join('') || `<tr><td colspan="6" class="o-empty">${esc(t('cl.none'))}</td></tr>`}</tbody></table></div>`;
 
   const f = $('#cf');
+  f.through_date.addEventListener('change', () => { if (f.through_date.value && f.through_date.value !== chosen) close(view, f.through_date.value); });
   f.force?.addEventListener('change', () => { $('.formerr', f).textContent = ''; });
   f.onsubmit = e => {
     e.preventDefault(); if (!f.checkValidity()) { f.reportValidity(); return; }

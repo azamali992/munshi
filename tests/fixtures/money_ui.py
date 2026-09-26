@@ -105,14 +105,16 @@ def register(paid: dict[str, float] | None = None, title: str = "Payroll registe
 
 
 def attendance(locked: bool = False) -> dict:
-    """GET /api/payroll/{period}/attendance -- clerk-safe (attendance:write): no rupee anywhere. ASSUMED edge units:
-    days in half-day steps (the plan stores x2), overtime in HOURS (the plan stores minutes)."""
+    """GET /api/payroll/{period}/attendance -- clerk-safe (attendance:write): no rupee anywhere, and (confirmed
+    against the live route) no `basis` either -- the screen falls back to "monthly" when it is absent. Overtime is
+    `ot_hours` (float hours) plus `restday_ot_minutes` / `holiday_ot_minutes` (int minutes, NOT hours: the PUT body
+    is a pydantic model with extra="forbid", so a wrong key here 422s the whole save)."""
     rows = []
     for r in _REG:
         no, name, desig, basis, days, absent = r[:6]
-        rows.append({"employee_id": _EID[no], "emp_no": no, "name": name, "designation": desig, "basis": basis,
-                     "days_worked": days, "unpaid_absent": absent, "annual_leave": 0, "casual_leave": 0,
-                     "sick_leave": 0, "ot_hours": 0, "holiday_ot_hours": 0, "trips": 3 if no == "E-003" else 0,
+        rows.append({"employee_id": _EID[no], "emp_no": no, "name": name, "designation": desig,
+                     "recorded": True, "days_worked": days, "unpaid_absent": absent, "annual_leave": 0, "casual_leave": 0,
+                     "sick_leave": 0, "ot_hours": 0, "restday_ot_minutes": 0, "holiday_ot_minutes": 0, "trips": 3 if no == "E-003" else 0,
                      "source": "register", "recorded_by": "Bilal Ahmed"})
     return {"period": PERIOD, "days_in_month": 30, "locked": locked, "rows": rows,
             "note": "Days worked and absences in half-day steps. No pay is shown here."}
@@ -126,19 +128,21 @@ def adjustments() -> list[dict]:
 
 
 def preview(approved_run: str | None = None) -> dict:
-    """GET /api/payroll/{period}/preview. ASSUMED: it also says whether a run already stands for the month (`run`),
-    lists the month's adjustments, and separates `refusals` (the engine will not approve: PLC limits, negative net)
-    from `warnings` (the owner may proceed)."""
+    """GET /api/payroll/{period}/preview (confirmed against the live route): `run` (None until approved -- the
+    screen's rail and its Pay/Payslips steps are unreachable without it), `skipped` (employees with no pay terms
+    this month), `can_approve`, and `errors` (blocking: the engine will not approve -- PLC limits, an existing run)
+    separate from `warnings` (the owner may proceed). Both are plain strings here, not {code, text} objects; the
+    screens read `w.text || w` so either shape renders, but the live route sends strings."""
     reg = register()
     return {"period": PERIOD, "profile": "plc_2026", "fingerprint": "9f2c41d0e7ab53c6a8e1f04d2b7c9e35d61a0f8b2c4e7d9013a5b6c8d0e2f4a1",
             "headcount": 6, "totals": {"gross": 308690.80, "deductions": 12256.92, "net": 296433.88, "employer": 7400.00,
                                        "cost": 316090.80, "cash_net": 141683.08, "cashless_net": 154750.80},
             "table": reg,
-            "warnings": [{"employee_id": "EMP-SHAFI005", "code": "eobi_not_covered", "text": "Shafiq Masih is not covered by EOBI although the business has 5 or more staff."},
-                         {"employee_id": None, "code": "min_wage_check", "text": "Punjab minimum wage Rs 40,000 was last checked 2026-09-26; a FY2026-27 notice may be due."}],
-            "refusals": [],
+            "warnings": ["Shafiq Masih is not covered by EOBI although the business has 5 or more staff.",
+                         "Punjab minimum wage Rs 40,000 was last checked 2026-09-26; a FY2026-27 notice may be due."],
+            "errors": [], "skipped": [], "can_approve": approved_run is None,
             "adjustments": adjustments(),
-            "run": {"run_id": approved_run, "approved_by": "Haji Rasheed", "approved_at": "2026-09-30T10:15:00Z"} if approved_run else None,
+            "run": {"run_id": approved_run, "period": PERIOD, "approved_by": "Haji Rasheed", "approved_at": "2026-09-30T10:15:00Z"} if approved_run else None,
             "rules_verified_on": VERIFIED_ON, "boundary": BOUNDARY}
 
 
@@ -164,7 +168,9 @@ def run(run_id: str, paid: dict[str, float] | None = None) -> dict:
 
 
 def payslip(slip_id: str = "PSL-2026-000002") -> dict:
-    """GET /api/payslips/{slip_id} (owner) and each entry of GET /api/me/payslips (self). §7.1 item 1."""
+    """GET /api/payslips/{slip_id} (owner, and self via payroll:self -- confirmed against the live route). meta uses
+    `business_name` (not `business`) and `cash_exemption` (not `cash_allowed`); net/gross/deductions/status live at
+    the TOP level, not inside meta (meta keeps its own, separately-named `paid_status`)."""
     cols = [col("item", "Item"), col("earnings", "Earnings", "money"), col("deductions", "Deductions", "money")]
     rows = [{"item": "Basic (30 days × Rs 1,333.33)", "earnings": 40000.00},
             {"item": "Gross", "earnings": 40000.00, "_em": True},
@@ -176,28 +182,32 @@ def payslip(slip_id: str = "PSL-2026-000002") -> dict:
             {"item": "Commission (1% of Rs 319,080 delivered)", "earnings": 3190.80}]
     t = table("Payslip September 2026", cols, rows, totals={"earnings": 43190.80, "deductions": 5370.00, "net": 37820.80, "total_payment": 37820.80},
               note=BOUNDARY)
-    return {"slip_id": slip_id, "table": t,
+    return {"slip_id": slip_id, "employee_id": "EMP-IMRAN002", "table": t, "gross": 43190.80, "deductions": 5370.00, "net": 37820.80, "status": "paid",
             "meta": {"slip_no": slip_id, "period": PERIOD, "period_label": "September 2026", "emp_no": "E-002", "name": "Imran Khalid",
                      "designation": "Order booker", "cnic_last4": "4417", "joined_on": "2025-03-01", "pay_basis": "monthly",
                      "days_worked": 30, "unpaid_absent": 0, "paid_leave": {"annual": 0, "casual": 0, "sick": 0},
-                     "leave_balances": {"annual": 18, "casual": 10, "sick": 8}, "pay_method": "jazzcash", "cash_allowed": False,
-                     "paid_status": "paid", "net": 37820.80, "total_payment": 37820.80, "ytd_taxable": 123190.80, "ytd_tax": 0,
-                     "employer_eobi": 1850.00, "rules_verified_on": VERIFIED_ON, "business": "Punjab Agro Distributors",
+                     "leave_balances": {"annual": 18, "casual": 10, "sick": 8}, "pay_method": "jazzcash", "cash_exemption": False,
+                     "paid_status": "paid", "ytd_taxable": 123190.80, "ytd_tax": 0,
+                     "employer_eobi": 1850.00, "rules_verified_on": VERIFIED_ON, "business_name": "Punjab Agro Distributors",
                      "boundary": BOUNDARY}}
 
 
 def my_payslips() -> dict:
-    """GET /api/me/payslips. ASSUMED: newest first, each entry is a whole payslip (so the phone opens it with no
-    second request)."""
+    """GET /api/me/payslips (confirmed against the live route): a LIGHT list -- slip_id, period, month, gross,
+    deductions, net, paid, status -- not a whole payslip each; the phone fetches the full payslip (meta + table) on
+    demand from GET /api/payslips/{slip_id} when a slip is opened, the same call an owner makes."""
     s1 = payslip("PSL-2026-000002")
     s0 = payslip("PSL-2026-000000")
-    s0["meta"] = s0["meta"] | {"period": "2026-08", "period_label": "August 2026", "net": 40000 - 370.0, "total_payment": 39630.0}
+    s0["meta"] = s0["meta"] | {"period": "2026-08", "period_label": "August 2026"}
+    s0["net"], s0["gross"], s0["deductions"] = 39630.0, 40000.0, 370.0
     s0["table"] = table("Payslip August 2026", s0["table"]["columns"],
                         [{"item": "Basic (31 days)", "earnings": 40000.0}, {"item": "Gross", "earnings": 40000.0, "_em": True},
                          {"item": "EOBI (employee 1%)", "deductions": 370.0}, {"item": "Total deductions", "deductions": 370.0, "_em": True},
                          {"item": "Net remuneration", "earnings": 39630.0, "_em": True}],
                         totals={"earnings": 40000.0, "deductions": 370.0}, note=BOUNDARY)
-    return {"payslips": [s1, s0]}
+    light = lambda s: {"slip_id": s["slip_id"], "period": s["meta"]["period"], "month": s["meta"]["period_label"],
+                        "gross": s["gross"], "deductions": s["deductions"], "net": s["net"], "paid": s["net"], "status": s["status"]}
+    return {"payslips": [light(s1), light(s0)]}
 
 
 def advances() -> dict:
@@ -315,18 +325,23 @@ def account_book(account_id: str, redact: bool) -> dict:
 
 
 def reconciliation(cleared: set[str]) -> dict:
-    """GET /api/accounts/{id}/reconciliation?statement_date=. ASSUMED: the book balance and every book item since the
-    last reconciliation with its cleared tick; the screen does the difference arithmetic live (in paisa) while ticking."""
-    items = [{"source": "salary_payment", "source_id": "SPM-2026-000001", "date": "2026-09-30", "doc": "SPM-2026-000001",
-              "narration": "Salary Bilal Ahmed", "amount": -116930.0},
-             {"source": "ledger", "source_id": "RCP-2026-000014", "date": "2026-09-12", "doc": "RCP-2026-000014", "narration": "Rana Brothers (cheque)", "amount": 100000.0},
-             {"source": "ledger", "source_id": "RCP-2026-000014R", "date": "2026-09-15", "doc": "RCP-2026-000014R", "narration": "Cheque bounced", "amount": -100000.0},
-             {"source": "supplier_ledger", "source_id": "SUP-2026-000006", "date": "2026-09-20", "doc": "SUP-2026-000006", "narration": "Fauji Fertilizer (IBFT)", "amount": -150000.0},
-             {"source": "transfer", "source_id": "XFR-2026-000001", "date": "2026-09-05", "doc": "XFR-2026-000001", "narration": "To JazzCash business", "amount": -60000.0}]
-    for it in items:
-        it["cleared"] = it["source_id"] in cleared
-    return {"account_id": "ACC-HBL", "account": _ACCOUNTS[1], "statement_date": "2026-09-30", "book_balance": 373070.0,
-            "last": {"statement_date": "2026-08-31", "statement_balance": 0.0, "done_by": "Haji Rasheed"}, "items": items}
+    """GET /api/accounts/{id}/reconciliation?statement_date= (confirmed against the live route): only what is still
+    UNCLEARED, split by direction with unsigned amounts (`uncleared_in` / `uncleared_out`), never a unified `items`
+    list with a `cleared` flag, no `doc` (the document reference is `source_id`), and the book balance is `book`, not
+    `book_balance`. No `last` key either. The screen normalises this into the unified, signed, tickable list it
+    ticks off client-side; an item ticked (POST .../clear) simply does not come back on the next statement_date."""
+    all_items = [{"source": "salary_payment", "source_id": "SPM-2026-000001", "date": "2026-09-30", "narration": "Salary Bilal Ahmed", "amount": -116930.0},
+                 {"source": "ledger", "source_id": "RCP-2026-000014", "date": "2026-09-12", "narration": "Rana Brothers (cheque)", "amount": 100000.0},
+                 {"source": "ledger", "source_id": "RCP-2026-000014R", "date": "2026-09-15", "narration": "Cheque bounced", "amount": -100000.0},
+                 {"source": "supplier_ledger", "source_id": "SUP-2026-000006", "date": "2026-09-20", "narration": "Fauji Fertilizer (IBFT)", "amount": -150000.0},
+                 {"source": "transfer", "source_id": "XFR-2026-000001", "date": "2026-09-05", "narration": "To JazzCash business", "amount": -60000.0}]
+    still_open = [it for it in all_items if it["source_id"] not in cleared]
+    uin = [{k: v for k, v in it.items() if k != "amount"} | {"amount": it["amount"]} for it in still_open if it["amount"] > 0]
+    uout = [{k: v for k, v in it.items() if k != "amount"} | {"amount": -it["amount"]} for it in still_open if it["amount"] < 0]
+    return {"account_id": "ACC-HBL", "statement_date": "2026-09-30", "book": 373070.0,
+            "uncleared_in": uin, "uncleared_out": uout,
+            "uncleared_in_total": sum(i["amount"] for i in uin), "uncleared_out_total": sum(i["amount"] for i in uout),
+            "adjusted": None, "statement": None, "difference": None}
 
 
 def _stmt(title: str, rows: list[dict], cols: list[dict], note: str | None = None) -> dict:
@@ -446,18 +461,25 @@ def loans() -> dict:
 
 
 def periods(closed_through: str | None) -> dict:
+    """GET /api/finance/periods (confirmed against the live route): `locked_through` (not `through_date`), `closes`
+    (through_date/closed_by/closed_at/note/reopened_by/reopened_at/reopen_reason -- this part matches exactly), and
+    `table`. NOT confirmed, in fact confirmed ABSENT from the live route: `checklist` and `suggested_through`. No
+    pre-close checklist (payroll approved / depreciation run / cash counted / banks reconciled / clearing accounts
+    zero / trial balance balanced) is computed server-side yet -- close.js degrades to an empty "0/0 all done"
+    checklist, which reads as an all-clear rather than "not available". Kept here, still marked ASSUMED, as the
+    target shape for when that lands; a truthful `--fixtures off` run will not see it."""
     closes = [{"close_id": 1, "through_date": "2026-08-31", "closed_by": "Haji Rasheed", "closed_at": "2026-09-03T08:00:00Z", "note": "August",
                "reopened_by": None, "reopened_at": None, "reopen_reason": None}]
     if closed_through:
         closes.insert(0, {"close_id": 2, "through_date": closed_through, "closed_by": "Haji Rasheed", "closed_at": "2026-10-02T08:00:00Z",
                           "note": "September", "reopened_by": None, "reopened_at": None, "reopen_reason": None})
-    checklist = [{"key": "payroll", "label": "September payroll approved", "ok": True, "detail": "PAY-2026-000001"},
+    checklist = [{"key": "payroll", "label": "September payroll approved", "ok": True, "detail": "PAY-2026-000001"},   # ASSUMED: not computed live yet
                  {"key": "depreciation", "label": "Depreciation run through September", "ok": True, "detail": "Rs 40,000"},
                  {"key": "cash_count", "label": "Cash counted at month end", "ok": False, "detail": "last count 2026-09-14"},
                  {"key": "banks", "label": "Banks reconciled", "ok": False, "detail": "HBL last reconciled 2026-08-31"},
                  {"key": "clearing", "label": "Driver cash, stock on vehicles, goods not billed at zero", "ok": True, "detail": "1050, 1210, 2050 = 0"},
                  {"key": "tb", "label": "Trial balance balances", "ok": True, "detail": "debits = credits"}]
-    return {"through_date": closed_through or "2026-08-31", "closes": closes, "checklist": checklist, "suggested_through": "2026-09-30"}
+    return {"locked_through": closed_through, "closes": closes, "checklist": checklist, "suggested_through": "2026-09-30"}
 
 
 # ------------------------------------------------------------------------------------------------ routing table

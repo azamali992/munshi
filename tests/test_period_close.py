@@ -187,3 +187,35 @@ def test_money_routes_take_an_account_and_the_clerk_book_is_redacted(client):
     assert client.get(f"/api/accounts/{hbl}/book", headers=clerk).json()["redacted"] is True
     csv = client.get("/api/finance/general-journal.csv", headers=owner)
     assert csv.status_code == 200 and csv.text.startswith("date,doc,source,code,account,party,debit,credit,memo")
+
+
+def test_the_close_checklist_says_what_is_not_done_yet(clock):  # noqa: F811
+    r = _biz(MunshiRepository())
+    clock.at(2, 10)
+    bank = r.add_money_account("bank", "HBL current", opening_balance=50_000, opening_date="2026-09-01", actor="owner", approved_by="owner")
+    r.add_fixed_asset("Shehzore", "vehicle", 1_200_000, "2026-08-01", 120, funded_by="opening", actor="owner", approved_by="owner")
+    clock.at(20, 10)
+    items = {c["key"]: c for c in r.close_checklist("2026-09-15")}
+    assert items["books"]["ok"]
+    assert not items["depreciation"]["ok"] and "Shehzore" in items["depreciation"]["detail"]
+    assert not items["reconciled"]["ok"] and "HBL current" in items["reconciled"]["detail"]
+    assert not items["cash_count"]["ok"]
+    # nothing is closed yet: the owner is offered last month's end
+    st = r.period_status()
+    assert st["suggested_through"] == "2026-08-31" and [c["key"] for c in st["checklist"]][0] == "books"
+
+    r.run_depreciation("2026-09", "owner", "owner")
+    r.save_reconciliation(bank["account_id"], "2026-09-15", 50_000, "owner")
+    clock.at(14, 18)
+    r.count_cash("CASH", r.account_balance_paisa("CASH") / 100, actor="owner")
+    clock.at(20, 10)
+    assert all(c["ok"] for c in r.close_checklist("2026-09-15")), r.close_checklist("2026-09-15")
+
+
+def test_the_checklist_hides_payroll_totals_from_a_clerk(clock):  # noqa: F811
+    r = _biz(MunshiRepository())
+    clock.at(20, 10)
+    alarm = {"code": "payroll_expense", "message": "payroll expense rows for Salaries (Rs 236,923.08) differ", "amount": 1.0}
+    r.verify_books = lambda as_of=None: {"alarms": [alarm]}
+    assert "236,923" not in r.close_checklist("2026-09-15")[0]["detail"]
+    assert "236,923" in r.close_checklist("2026-09-15", redact_payroll=False)[0]["detail"]

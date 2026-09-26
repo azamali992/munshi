@@ -17,7 +17,7 @@ const METHODS = ['cash', 'bank', 'jazzcash', 'easypaisa', 'cheque'];
 const CASHLESS = ['bank', 'jazzcash', 'easypaisa', 'cheque'];
 const KIND_FOR = { cash: 'cash', bank: 'bank', cheque: 'bank', jazzcash: 'wallet', easypaisa: 'wallet' };
 const ATT_COLS = [['days_worked', 'pr.a_days', 0.5], ['unpaid_absent', 'pr.a_absent', 0.5], ['annual_leave', 'pr.a_annual', 0.5], ['casual_leave', 'pr.a_casual', 0.5],
-  ['sick_leave', 'pr.a_sick', 0.5], ['ot_hours', 'pr.a_ot', 0.25], ['holiday_ot_hours', 'pr.a_hot', 0.25], ['trips', 'pr.a_trips', 1]];
+  ['sick_leave', 'pr.a_sick', 0.5], ['ot_hours', 'pr.a_ot', 0.25], ['holiday_ot_minutes', 'pr.a_hot', 1], ['restday_ot_minutes', 'pr.a_rot', 1], ['trips', 'pr.a_trips', 1]];
 const DAY_KEYS = ['days_worked', 'unpaid_absent', 'annual_leave', 'casual_leave', 'sick_leave'];
 
 export default async function payroll(view, args = []) {
@@ -87,7 +87,7 @@ async function attendanceStep(box, period) {
       ${ATT_COLS.map(([, l]) => `<th scope="col" class="n">${esc(t(l))}</th>`).join('')}<th scope="col" class="n" title="${esc(t('pr.a_counted_hint'))}">${esc(t('pr.a_counted'))}</th></tr></thead>
       <tbody>${rows.length ? rows.map((r, i) => `<tr data-emp="${esc(r.employee_id)}"><td class="mono">${esc(r.emp_no)}</td><th scope="row" style="text-align:start"><b>${esc(r.name)}</b><br><span class="dim">${esc(r.designation || '')}</span></th>
         <td class="dim">${esc(t('pr.basis_' + (r.basis || 'monthly')))}</td>
-        ${ATT_COLS.map(([k, l, st], j) => `<td class="n"><input class="input" type="number" inputmode="decimal" min="0" max="${k.endsWith('hours') ? 200 : k === 'trips' ? 400 : dim}" step="${st}" name="${k}" value="${Number(r[k] || 0)}"
+        ${ATT_COLS.map(([k, l, st], j) => `<td class="n"><input class="input" type="number" inputmode="decimal" min="0" max="${k.endsWith('hours') ? 200 : k.endsWith('minutes') ? 24000 : k === 'trips' ? 400 : dim}" step="${st}" name="${k}" value="${Number(r[k] || 0)}"
           aria-label="${esc(t(l))}: ${esc(r.name)}" data-r="${i}" data-c="${j}" ${locked ? 'disabled' : ''}></td>`).join('')}
         <td class="n sum" data-sum></td></tr>`).join('') : `<tr><td colspan="${ATT_COLS.length + 4}" class="o-empty">${esc(t('pr.att_none'))}</td></tr>`}</tbody></table></div>
     <p class="hint">${esc(a.note || '')}</p>`;
@@ -176,7 +176,7 @@ function totalsStrip(tt) {
     <div class="o-kpi"><div class="k">${esc(t('pr.k_employer'))}</div><div class="v">${money(tt.employer)}</div><div class="s">${esc(t('pr.k_employer_s'))}</div></div>
     <div class="o-kpi"><div class="k">${esc(t('pr.k_cost'))}</div><div class="v">${money(tt.cost ?? (tt.gross + tt.employer))}</div><div class="s">${esc(t('pr.k_cost_s'))}</div></div></div>`;
 }
-const warningsList = pv => `${(pv.refusals || []).map(r => `<p class="o-refuse" role="alert"><b>${esc(t('pr.refused'))}</b> ${esc(r.text || r)}</p>`).join('')}
+const warningsList = pv => `${(pv.errors || []).map(r => `<p class="o-refuse" role="alert"><b>${esc(t('pr.refused'))}</b> ${esc(r.text || r)}</p>`).join('')}
   ${(pv.warnings || []).length ? `<ul class="o-warnlist" aria-label="${esc(t('pr.warnings'))}">${pv.warnings.map(w => `<li><span aria-hidden="true">⚠</span><span>${esc(w.text || w)}</span></li>`).join('')}</ul>` : ''}`;
 
 function previewStep({ period, pv, run, go, box }) {
@@ -204,7 +204,7 @@ function approveStep({ period, pv, run, go, box }) {
     });
     return;
   }
-  const blocked = (pv.refusals || []).length > 0;
+  const blocked = (pv.errors || []).length > 0;
   const n = pv.headcount ?? (pv.table?.rows || []).length;
   box.innerHTML = `${totalsStrip(tt)}${warningsList(pv)}
     <div class="o-card" style="display:grid;gap:8px"><b>${esc(t('pr.approve_does'))}</b>
@@ -322,11 +322,11 @@ export async function openSlip(slipId, row) {
   const m = s.meta || {};
   const lb = m.leave_balances || {};
   ctl.body.innerHTML = `<article class="o-slip" aria-label="${esc(t('pr.payslip_x', { id: slipId }))}">
-    <header class="o-slip-h"><div><h3>${esc(m.business || '')}</h3><span class="dim">${esc(t('pr.payslip_for', { month: m.period_label || monthLabel(m.period) }))}</span></div><div class="mono">${esc(m.slip_no || slipId)}</div></header>
+    <header class="o-slip-h"><div><h3>${esc(m.business_name || '')}</h3><span class="dim">${esc(t('pr.payslip_for', { month: m.period_label || monthLabel(m.period) }))}</span></div><div class="mono">${esc(m.slip_no || slipId)}</div></header>
     <div class="o-kv"><b>${esc(t('pr.c_name'))}</b><span>${esc(m.name || row?.name || '')} <span class="mono">${esc(m.emp_no || '')}</span></span><b>${esc(t('pr.f_designation'))}</b><span>${esc(m.designation || '')}</span>
       <b>${esc(t('pr.f_cnic'))}</b><span>${m.cnic_last4 ? '•••••••••' + esc(m.cnic_last4) : '—'}</span><b>${esc(t('pr.f_joined'))}</b><span>${esc(m.joined_on || '')}</span>
       <b>${esc(t('pr.c_basis'))}</b><span>${esc(t('pr.basis_' + (m.pay_basis || 'monthly')))}</span><b>${esc(t('pr.slip_days'))}</b><span>${fmtCell(m.days_worked, 'days')} · ${esc(t('pr.a_absent'))} ${fmtCell(m.unpaid_absent || 0, 'days')}</span>
-      <b>${esc(t('pr.c_method'))}</b><span>${esc(t('m.' + (m.pay_method || 'cash')))}${m.cash_allowed ? ` <span class="pill warn o-badge"><span aria-hidden="true">⚑</span> ${esc(t('pr.cash_allowed_short'))}</span>` : ''}</span><b>${esc(t('pr.c_status'))}</b><span>${badge(m.paid_status || '')}</span></div>
+      <b>${esc(t('pr.c_method'))}</b><span>${esc(t('m.' + (m.pay_method || 'cash')))}${m.cash_exemption ? ` <span class="pill warn o-badge"><span aria-hidden="true">⚑</span> ${esc(t('pr.cash_allowed_short'))}</span>` : ''}</span><b>${esc(t('pr.c_status'))}</b><span>${badge(m.paid_status || '')}</span></div>
     ${renderTable(m.boundary && s.table?.note === m.boundary ? { ...s.table, note: null } : s.table, { caption: '' })}
     <div class="o-kv"><b>${esc(t('pr.leave_bal'))}</b><span>${esc(t('pr.leave_line', { a: lb.annual ?? '—', c: lb.casual ?? '—', s: lb.sick ?? '—' }))}</span>
       <b>${esc(t('pr.ytd'))}</b><span>${esc(t('pr.ytd_line', { taxable: money(m.ytd_taxable), tax: money(m.ytd_tax) }))}</span>

@@ -396,7 +396,12 @@ def _csv_safe(v: str) -> str:
 # ---------------------------------------------------------------- periods
 @router.get("/api/finance/periods")
 def periods(c: Ctx = Depends(context("books:read"))):
-    return c.repo.period_status()
+    return c.repo.period_status(redact_payroll=not c.principal.can("payroll:read"))
+
+
+@router.get("/api/finance/periods/checklist")
+def close_checklist(through: str, c: Ctx = Depends(context("books:read"))):
+    return {"through": through, "checklist": c.repo.close_checklist(through, redact_payroll=not c.principal.can("payroll:read"))}
 
 
 @router.post("/api/finance/periods/close", status_code=201)

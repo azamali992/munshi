@@ -126,11 +126,15 @@ def test_owner_reads_everything(world):
 def test_clerk_sees_names_and_attendance_but_never_a_rupee(world):
     c, h, ids = world["c"], world["h"], world["ids"]
     emps = c.get("/api/employees", headers=h["clerk"]).json()
-    public = {"employee_id", "emp_no", "name", "designation", "role_hint", "status", "joined_on", "left_on", "phone", "aliases", "has_login"}
+    # user_id + login (role/active/must_change_pin, never a PIN) are additive: the employees screen shows a clerk
+    # the same "no login" / role badge an owner sees, with no pay in it.
+    public = {"employee_id", "emp_no", "name", "designation", "role_hint", "status", "joined_on", "left_on", "phone", "aliases", "has_login", "user_id", "login"}
     assert emps["employees"] and all(set(e) == public for e in emps["employees"])
     assert all(col["kind"] != "money" for col in emps["table"]["columns"])
     one = c.get(f"/api/employees/{ids['rafiq']}", headers=h["clerk"]).json()
     assert set(one) == public and "40000" not in c.get(f"/api/employees/{ids['rafiq']}", headers=h["clerk"]).text
+    if one["login"]:
+        assert set(one["login"]) == {"user_id", "role", "phone", "active", "must_change_pin"}
     att = c.get("/api/payroll/2026-08/attendance", headers=h["clerk"]).json()
     assert att["locked"] and all(col["kind"] != "money" for col in att["table"]["columns"])
     assert "40000" not in c.get("/api/payroll/2026-08/attendance", headers=h["clerk"]).text

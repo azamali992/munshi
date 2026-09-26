@@ -50,7 +50,7 @@ async function statement({ box }, what, mode, compare = false) {
     const q = mode === 'range' ? `start=${$('#fs').value}&end=${$('#fe').value}${compare ? `&compare=${$('#fc').checked ? 1 : 0}` : ''}` : `as_of=${$('#fa').value}`;
     const r = await api(`/api/finance/${what}?${q}`);
     const tables = r.tables?.length ? r.tables : [r.table];
-    const alarms = (r.alarms || []).map(a => `<p class="o-refuse" role="alert"><b>${esc(t('fi.alarm'))}</b> ${esc(a.text || a)}</p>`).join('');
+    const alarms = (r.alarms || []).map(a => `<p class="o-refuse" role="alert"><b>${esc(t('fi.alarm'))}</b> ${esc(a.message || a.text || a)}</p>`).join('');
     const check = what === 'balance-sheet' && r.difference !== undefined ? `<p class="o-note ${rupees(r.difference) === 0 ? 'good' : 'crit'}">${esc(rupees(r.difference) === 0 ? t('fi.bs_balances') : t('fi.bs_off', { amt: money(r.difference) }))}</p>`
       : what === 'trial-balance' && r.balanced !== undefined ? `<p class="o-note ${r.balanced ? 'good' : 'crit'}">${esc(r.balanced ? t('fi.tb_balances') : t('fi.tb_off'))}</p>` : '';
     $('#stbody').innerHTML = alarms + check + tables.map((tb, i) => renderTable(tb, { id: `st${i}` })).join('');
