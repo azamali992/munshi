@@ -223,7 +223,7 @@ function approveStep({ period, pv, run, go, box }) {
     body: `<p class="o-big">${money(tt.net)}</p><p>${esc(t('pr.approve_restate', { n, net: money(tt.net), cost: money(tt.cost ?? (tt.gross + tt.employer)), date: monthEnd(period) }))}</p>
       <p class="hint">${esc(t('pr.approve_lock_note'))}</p>`,
     onConfirm: async () => {
-      try { const r = await post(`/api/payroll/${period}/approve`, { fingerprint: pv.fingerprint }); toast(t('pr.approved_toast', { run: r.run_id })); go(period, 'pay'); }
+      try { const r = await post(`/api/payroll/${period}/approve`, { fingerprint: pv.fingerprint }); toast(t('pr.approved_toast', { run: r.run?.run_id || r.run_id })); go(period, 'pay'); }   // approve answers the register: {run: {run_id, ...}}
       catch (x) { if (x.status === 409) setTimeout(refresh, 2500); throw x; }
     },
   });
