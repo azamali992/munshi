@@ -279,3 +279,24 @@ def test_ordinary_names_and_notes_are_not_withheld():
     for s in ("Chaudhry Farms", "Malik Agro Store", "Vehari Road, Multan", "pre-Munshi paper delivery", "V-01 diesel", "godown labour",
               "Fauji Fertilizer (Multan depot)", "customer ne kaha kal tak de dega", "bill no FF-4410", "حاجی سنز"):
         assert not G.instruction_like(s), s
+
+
+def test_no_role_declares_a_tool_twice_for_a_real_model():
+    """Gemini answers 400 'Duplicate function declaration' if a role's tool list names a function twice."""
+    from munshi.llm.stub_model import StubToolCallingModel
+    from munshi.platform import MunshiPlatform
+
+    class _Real(StubToolCallingModel):           # anything but the offline stub counts as a real model
+        pass
+    import munshi.agents.specialists as S
+    import munshi.agents.specialists_money as SM
+    real = _Real(rules=[], fallback_text="")
+    orig = (S.is_real_model, SM.is_real_model)
+    S.is_real_model = SM.is_real_model = lambda m: True
+    try:
+        p = MunshiPlatform(model=real)
+        for name, bundle in p.specialists.items():
+            for role, tools in bundle.role_tools.items():
+                assert len(tools) == len(set(tools)), f"{name}/{role} declares {[t for t in tools if tools.count(t) > 1]} twice"
+    finally:
+        S.is_real_model, SM.is_real_model = orig

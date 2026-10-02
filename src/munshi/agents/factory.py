@@ -84,6 +84,9 @@ def build_specialist(name: str, title: str, model: BaseChatModel, role_tool_map:
     user's script). The guard is listed after the approval middleware so its after_model
     hook runs before the gate's. `guarded` forces the guard on or off (default: on for a real model)."""
     from munshi.domain.models import business_today
+    # one declaration per tool name per role: Gemini refuses a request that declares the same function twice
+    # (a lookup like find_employee can be both a role tool and a model-only lookup)
+    role_tool_map = {r: list({t.name: t for t in ts}.values()) for r, ts in role_tool_map.items()}
     all_tools = list({t.name: t for ts in role_tool_map.values() for t in ts}.values())
     real = is_real_model(model)
     rules = HOUSE_RULES.format(today=business_today().isoformat()) + (MODEL_RULES if real else "")
