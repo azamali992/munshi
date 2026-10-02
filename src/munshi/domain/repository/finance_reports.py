@@ -146,7 +146,9 @@ class FinanceReportsMixin(LedgerProjectionMixin):
         p_end = _prev_day(start)
         p_start = (date.fromisoformat(start) - timedelta(days=n_days)).isoformat()
         cur = self._is_lines(self._pl(start, end), redact_payroll)
-        prior = {k: v for k, _, v, _ in self._is_lines(self._pl(p_start, p_end), redact_payroll)} if compare else {}
+        prior_lines = self._is_lines(self._pl(p_start, p_end), redact_payroll) if compare else []
+        prior = {k: v for k, _, v, _ in prior_lines}
+        prior_label = {k: label for k, label, _, _ in prior_lines}
         keys_prior = set(prior)
         net_rev = next(v for k, _, v, _ in cur if k == "net_revenue")
         always = {"sales", "net_revenue", "cogs", "gross_profit", "net_profit"}
@@ -162,7 +164,7 @@ class FinanceReportsMixin(LedgerProjectionMixin):
             rows.append(row)
         for k in sorted(keys_prior - cur_keys):               # a line only the prior period had
             if prior[k]:
-                rows.insert(-1, {"line": k.split(":", 1)[-1].replace("_", " "), "amount": 0.0, "pct_of_revenue": None, "prior_period": _r(prior[k]), "change": _r(-prior[k])})
+                rows.insert(-1, {"line": prior_label[k], "amount": 0.0, "pct_of_revenue": None, "prior_period": _r(prior[k]), "change": _r(-prior[k])})
         s = self._sales_paisa(start, end)
         caveat = self._cost_fields(s)["caveat"]
         cols = [col("line", "Line"), col("amount", "Amount", "money"), col("pct_of_revenue", "% of revenue", "pct")]

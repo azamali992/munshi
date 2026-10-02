@@ -280,3 +280,13 @@ def test_clerk_sees_one_staff_costs_line_and_the_owner_the_breakdown(clock, monk
     # the digest's "today's expenses" is money spent, not the month's accrued pay
     assert repo.digest("2026-09-30")["cash"]["expenses"] == 0.0
     assert repo.expenses_paisa(*SEP) - repo.expenses_paisa(*SEP, exclude_payroll=True) == to_paisa(313_013.88)
+
+
+def test_a_line_only_the_prior_period_had_keeps_its_name():
+    """Comparing with last month: a line with nothing this month (here utilities, paid only in August) is named as last
+    month named it ("Expenses: utilities"), not by its internal key ("utilities"; salaries showed as "6100")."""
+    from munshi.domain.repository import MunshiRepository
+    r = MunshiRepository()
+    r.record_expense("utilities", 6_400, "godown electricity", "cash", "owner", "h", expense_date="2026-08-20")
+    got = [row["line"] for row in r.income_statement("2026-09-01", "2026-09-30", compare=True)["table"]["rows"]]
+    assert "Expenses: utilities" in got and "utilities" not in got
