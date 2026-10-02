@@ -298,7 +298,7 @@ function proofComposer() {
       paint();
       const fd = new FormData(); fd.append('file', p.blob, p.name);
       const r = await api('/api/attachments', { method: 'POST', body: fd });
-      Object.assign(it, { id: r.id, size: r.size || p.blob.size, status: 'ok', file: null });
+      Object.assign(it, { id: r.att_id, size: r.size_bytes || p.blob.size, status: 'ok', file: null });   // POST /api/attachments answers {att_id, size_bytes, ...}
     } catch (x) {
       it.status = 'err'; it.error = x.status === 413 ? t('mv.too_big').replace('{size}', kb(it.size || file.size)) : x.status === 429 ? t('mv.slow_down') : x.message;
       it.file = x.status === 413 || /MB|type|image/i.test(x.message) ? null : file;   // a retry cannot fix a too-big or unreadable file

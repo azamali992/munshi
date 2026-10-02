@@ -160,3 +160,19 @@ def test_the_views_and_core_files_are_untouched_by_the_money_module():
     views = (STATIC / "views.js").read_text(encoding="utf-8")
     assert views.count("money_views") == 1
     assert "payslips" not in (STATIC / "core.js").read_text(encoding="utf-8")
+
+
+def test_the_proof_composer_reads_the_id_the_upload_route_returns(tmp_path):
+    """The phone sends the uploaded proof's id with the chat message. It read `r.id`, but POST /api/attachments answers
+    `att_id` -- so every message with a proof went out as attachment_ids [null] and the chat answered 422."""
+    from fastapi.testclient import TestClient
+
+    from munshi.web.app import build_app
+    from tests.test_attachments import OWNER, login, png
+    client = TestClient(build_app(in_memory=True, demo=True, scheduler=False))
+    owner = login(client, OWNER)
+    up = client.post("/api/attachments", files={"file": ("slip.png", png(), "image/png")}, headers=owner).json()
+    js = (STATIC / "money_views.js").read_text(encoding="utf-8")
+    assert "att_id" in up and "id: r.att_id" in js
+    r = client.post("/api/chat", json={"thread_id": "main", "text": "Haji Sons ne 50000 bank se diye", "attachment_ids": [up["att_id"]]}, headers=owner)
+    assert r.status_code == 200 and r.json()["pending"]["card"]["proofs"][0]["id"] == up["att_id"]

@@ -557,7 +557,7 @@ def routes() -> list[tuple[str, str, Any]]:
 
     def attach(m, q, b, role, st):
         n = st["att"] = st.get("att", 0) + 1
-        return 201, {"id": f"ATT-FIX{n:05d}", "kind": "image/jpeg", "size": 184322, "view_url": f"/api/attachments/ATT-FIX{n:05d}/file"}
+        return 201, {"att_id": f"ATT-FIX{n:05d}", "kind": "image", "content_type": "image/jpeg", "size_bytes": 184322, "status": "pending", "url": f"/api/attachments/ATT-FIX{n:05d}/file", "thumb_url": None}
 
     def chat(m, q, b, role, st):
         st.setdefault("chat_bodies", []).append(b)
